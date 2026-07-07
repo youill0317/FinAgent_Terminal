@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "finagent-terminal"
+version = "0.1.0"
+description = "Python terminal workspace for market research."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.40",
+    "google-genai>=1.0",
+    "httpx>=0.27",
+    "openai>=1.0",
+    "pandas>=2.2",
+    "pydantic>=2.8",
+    "textual>=0.86",
+    "yfinance>=0.2",
+]
+
+[project.scripts]
+finagent = "finagent_terminal.__main__:main"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.21",
+    "pandas-stubs>=2.2",
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.12"
+pythonPlatform = "All"
+include = ["src", "tests"]
+exclude = ["**/__pycache__", "**/.venv", "**/build", "**/dist"]
+reportUnusedCallResult = "warning"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportUnusedVariable = "error"
+reportMissingParameterType = "error"
+reportPrivateUsage = "error"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "CPY001",
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D203",
+    "D213",
+    "FBT001",
+    "FBT002",
+    "FIX002",
+    "ISC001",
+    "TD002",
+    "TD003",
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D", "INP001", "PLC0415", "PLR2004", "S101", "S603"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-config",
+    "--strict-markers",
+]
+filterwarnings = ["error"]
