@@ -6,6 +6,7 @@ from textual.containers import Horizontal
 from textual.css.query import NoMatches
 from textual.widgets import Button, Footer, Input, Static, Tab, Tabs
 
+from finagent_terminal.compare import MAX_COMPARE_SYMBOLS, MIN_COMPARE_SYMBOLS
 from finagent_terminal.config import (
     FinAgentConfig,
     load_config,
@@ -15,6 +16,7 @@ from finagent_terminal.config import config_path as default_config_path
 from finagent_terminal.data.models import FreshnessState, MarketDataSnapshot
 from finagent_terminal.data.session import DataSession
 from finagent_terminal.ui.screens import WorkspaceScreen
+from finagent_terminal.ui.screens.compare_panel import render_compare_panel
 from finagent_terminal.ui.state import WORKSPACE_LABELS, WORKSPACES
 from finagent_terminal.ui.widgets import market_editor
 from finagent_terminal.ui.widgets.market_rows import market_row
@@ -120,8 +122,22 @@ class MarketsScreen(WorkspaceScreen):
             data_line,
         ]
         for group in self._config.groups:
+            symbols = tuple(entry.symbol for entry in group.symbols)
             lines.append(group.name)
             lines.extend(self._row_for_symbol(entry) for entry in group.symbols)
+            symbol_count = len(symbols)
+            if (
+                symbol_count < MIN_COMPARE_SYMBOLS
+                or symbol_count > MAX_COMPARE_SYMBOLS
+                or any(symbol in self._snapshots for symbol in symbols)
+            ):
+                lines.extend(
+                    render_compare_panel(
+                        f"Compare: {group.name}",
+                        symbols,
+                        self._snapshots,
+                    ),
+                )
         return tuple(lines)
 
     async def action_refresh(self) -> None:

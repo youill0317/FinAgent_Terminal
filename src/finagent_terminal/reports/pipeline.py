@@ -10,9 +10,14 @@ from finagent_terminal.llm.base import ProviderError, StructuredLLMProvider
 from finagent_terminal.reports.models import (
     DepthMode,
     ReportContext,
+    ReportFinalEditorOutput,
+    ReportRoleArtifact,
+    ReportRoleId,
+    ReportRoleStatus,
     ReportSectionPrompt,
     ReportSectionResult,
-    section_specs_for_depth,
+    ReportSectionSpec,
+    role_specs_for_depth,
 )
 from finagent_terminal.reports.progress import ReportProgress, new_report_progress
 
@@ -23,6 +28,7 @@ class ReportRunResult(BaseModel):
     sections: tuple[ReportSectionResult, ...]
     progress: ReportProgress
     timeline: tuple[ReportProgress, ...]
+    final_report: ReportFinalEditorOutput | None = None
 
 
 type ReportUpdate = Callable[[ReportRunResult], None]
@@ -49,56 +55,82 @@ class ReportPipeline:
         )
         timeline: list[ReportProgress] = [progress]
         sections: list[ReportSectionResult] = []
-        self._publish(sections, progress, timeline)
+        artifacts: list[ReportRoleArtifact] = []
+        final_report: ReportFinalEditorOutput | None = None
+        self._publish(sections, progress, timeline, final_report)
 
-        for index, section in enumerate(section_specs_for_depth(depth), start=1):
-            if section.requires_indicators and not context.indicator_summary.strip():
-                progress = progress.mark_skipped(
-                    section.id,
-                    "missing indicator context",
-                )
-                timeline.append(progress)
-                self._publish(sections, progress, timeline)
-                continue
-
+        for index, role in enumerate(role_specs_for_depth(depth), start=1):
+            section = ReportSectionSpec(
+                id=role.id,
+                title=role.title,
+                prompt=role.prompt,
+            )
             now = started_at + float(index)
             progress = progress.mark_running(section.id, now=now)
             timeline.append(progress)
-            self._publish(sections, progress, timeline)
-            prompt = ReportSectionPrompt(context=context, depth=depth, section=section)
+            self._publish(sections, progress, timeline, final_report)
+            prompt = ReportSectionPrompt(
+                context=context,
+                depth=depth,
+                section=section,
+                prior_artifacts=tuple(artifacts),
+            )
             try:
                 result = self.client.generate_structured_report_section(prompt)
             except ProviderError as exc:
                 progress = progress.mark_failed(section.id, str(exc), now=now + 0.5)
                 timeline.append(progress)
-                self._publish(sections, progress, timeline)
+                self._publish(sections, progress, timeline, final_report)
                 continue
             sections.append(result)
-            progress = progress.mark_complete(section.id, now=now + 0.5)
+            artifact = ReportRoleArtifact(
+                role_id=role.id,
+                title=role.title,
+                status=ReportRoleStatus.COMPLETE,
+                body=result.summary,
+                summary=result.summary,
+                key_points=result.key_points,
+                risks=result.risks,
+            )
+            artifacts.append(artifact)
+            if role.id is ReportRoleId.REPORTS_EDITOR:
+                final_report = ReportFinalEditorOutput(
+                    title=result.title,
+                    body=result.summary,
+                    disclaimer=result.disclaimer,
+                )
+            progress = progress.mark_complete(
+                section.id,
+                now=now + 0.5,
+                artifact=artifact,
+            )
             timeline.append(progress)
-            self._publish(sections, progress, timeline)
+            self._publish(sections, progress, timeline, final_report)
 
-        return _result(sections, progress, timeline)
+        return _result(sections, progress, timeline, final_report)
 
     def _publish(
         self,
         sections: list[ReportSectionResult],
         progress: ReportProgress,
         timeline: list[ReportProgress],
+        final_report: ReportFinalEditorOutput | None,
     ) -> None:
         if self.on_update is not None:
-            self.on_update(_result(sections, progress, timeline))
+            self.on_update(_result(sections, progress, timeline, final_report))
 
 
 def _result(
     sections: list[ReportSectionResult],
     progress: ReportProgress,
     timeline: list[ReportProgress],
+    final_report: ReportFinalEditorOutput | None,
 ) -> ReportRunResult:
     return ReportRunResult(
         sections=tuple(sections),
         progress=progress,
         timeline=tuple(timeline),
+        final_report=final_report,
     )
 
 

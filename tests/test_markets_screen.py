@@ -76,6 +76,29 @@ class FakeSession:
         return snapshot.freshness
 
 
+def watchlist_screen(
+    tmp_path: Path,
+    snapshots: dict[str, MarketDataSnapshot],
+) -> tuple[MarketsScreen, FakeSession]:
+    session = FakeSession(snapshots=snapshots, fetched=[])
+    config = FinAgentConfig(
+        groups=(
+            SymbolGroup.model_validate(
+                {"name": "Watchlist", "symbols": list(snapshots)},
+            ),
+        ),
+    )
+    return (
+        MarketsScreen(
+            create_app_state(),
+            config=config,
+            config_path=tmp_path / "config.json",
+            session=session,
+        ),
+        session,
+    )
+
+
 @pytest.mark.anyio
 async def test_default_presets_render_without_fetching(tmp_path: Path) -> None:
     # Given: a first-run Markets screen with no saved config.
@@ -206,12 +229,45 @@ async def test_refresh_updates_quotes_charts_and_freshness(tmp_path: Path) -> No
     assert "chart: --" not in rendered
 
 
-def make_snapshot(symbol: str, freshness: FreshnessState) -> MarketDataSnapshot:
+def test_group_compare_renders_normalized_returns_after_refresh(tmp_path: Path) -> None:
+    snapshots = {
+        "AAPL": make_snapshot(
+            "AAPL",
+            FreshnessState.FRESH,
+            prices=(100.0, 110.0, 121.0),
+        ),
+        "MSFT": make_snapshot(
+            "MSFT",
+            FreshnessState.FRESH,
+            prices=(200.0, 210.0, 220.0),
+        ),
+        "QQQ": make_snapshot("QQQ", FreshnessState.FRESH, prices=(50.0, 55.0, 60.0)),
+    }
+    screen, _session = watchlist_screen(tmp_path, snapshots)
+
+    screen.refresh_market_data()
+    rendered = "\n".join(screen.lines())
+
+    assert "Compare: Watchlist" in rendered
+    assert "Selected: AAPL, MSFT, QQQ" in rendered
+    assert "Normalized returns:" in rendered
+    assert "20.00%" in rendered
+
+
+def make_snapshot(
+    symbol: str,
+    freshness: FreshnessState,
+    *,
+    prices: tuple[float, ...] = (100.0, 110.0, 125.0),
+) -> MarketDataSnapshot:
+    assert len(prices) > 0
     fetched_at = datetime(2024, 1, 3, tzinfo=UTC)
     frame = pd.DataFrame(
-        {"Close": [100.0, 110.0, 125.0], "Volume": [1, 2, 3]},
-        index=pd.date_range("2024-01-01", periods=3, freq="D"),
+        {"Close": prices, "Volume": list(range(1, len(prices) + 1))},
+        index=pd.date_range("2024-01-01", periods=len(prices), freq="D"),
     )
+    last_price = prices[-1]
+    previous_close = 120.0 if prices == (100.0, 110.0, 125.0) else prices[-2]
     return MarketDataSnapshot(
         symbol=symbol,
         period="1mo",
@@ -220,13 +276,13 @@ def make_snapshot(symbol: str, freshness: FreshnessState) -> MarketDataSnapshot:
         freshness=freshness,
         quote=Quote(
             symbol=symbol,
-            last_price=125.0,
-            previous_close=120.0,
-            change=5.0,
-            change_percent=4.1667,
+            last_price=last_price,
+            previous_close=previous_close,
+            change=last_price - previous_close,
+            change_percent=(last_price - previous_close) / previous_close,
             currency="USD",
             market_cap=None,
-            volume=3,
+            volume=len(prices),
             day_high=None,
             day_low=None,
             fetched_at=fetched_at,

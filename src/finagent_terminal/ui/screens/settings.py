@@ -4,6 +4,7 @@ import os
 from types import MappingProxyType
 from typing import TYPE_CHECKING, ClassVar, Final, override
 
+from finagent_terminal.data.sources import source_availability_lines
 from finagent_terminal.llm.base import (
     ANTHROPIC_API_KEY,
     GEMINI_API_KEYS,
@@ -42,6 +43,7 @@ class SettingsScreen(WorkspaceScreen):
             f"Status: {config.status}",
             "Markets/Ticker/Tools: available without LLM API keys",
             *provider_availability_lines(),
+            *data_source_availability_lines(),
         )
 
 
@@ -62,3 +64,9 @@ def _availability_status(env: Mapping[str, str], keys: tuple[str, ...]) -> str:
     if any(env.get(key) for key in keys):
         return "available"
     return f"unavailable (missing {', '.join(keys)})"
+
+
+def data_source_availability_lines(
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    return source_availability_lines(env)

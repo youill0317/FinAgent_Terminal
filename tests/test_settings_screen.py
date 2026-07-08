@@ -22,7 +22,10 @@ from finagent_terminal.llm.base import (
 )
 from finagent_terminal.symbols import SymbolGroup
 from finagent_terminal.ui.screens.markets import MarketsScreen
-from finagent_terminal.ui.screens.settings import SettingsScreen
+from finagent_terminal.ui.screens.settings import (
+    SettingsScreen,
+    data_source_availability_lines,
+)
 from finagent_terminal.ui.screens.ticker import TickerScreen
 from finagent_terminal.ui.screens.tools import ToolsScreen
 from finagent_terminal.ui.state import create_app_state
@@ -102,7 +105,7 @@ def test_providers_unavailable_without_keys(
     ticker = TickerScreen(state, session)
     ticker.load_symbol("AAPL")
     tools = ToolsScreen(state, session)
-    tools.compare_manual("AAPL MSFT")
+    tools_text = "\n".join(tools.lines())
 
     # Then: provider availability is explicit, and non-report screens still work.
     assert "openai: unavailable" in settings_text
@@ -112,4 +115,28 @@ def test_providers_unavailable_without_keys(
     assert "Markets/Ticker/Tools: available without LLM API keys" in settings_text
     assert "Data: 1 symbols loaded" in "\n".join(markets.lines())
     assert "Symbol: AAPL" in "\n".join(ticker.lines())
-    assert "Normalized returns:" in "\n".join(tools.lines())
+    assert "Analysis hub" in tools_text
+    assert "Monte Carlo: simulate future close-return paths" in tools_text
+    assert "Monte Carlo: waiting for a run" in tools_text
+    assert "Normalized returns:" not in tools_text
+
+
+def test_data_source_availability_lines_have_no_secret_values() -> None:
+    env = {
+        "FRED_API_KEY": "fred-secret",
+        "FINNHUB_API_KEY": "finn-secret",
+        "FMP_API_KEY": "fmp-secret",
+        "FINAGENT_SEC_USER_AGENT": "sec-agent-secret",
+    }
+
+    text = "\n".join(data_source_availability_lines(env))
+
+    assert "FRED_API_KEY" in text
+    assert "FINNHUB_API_KEY" in text
+    assert "FMP_API_KEY" in text
+    assert "FINAGENT_SEC_USER_AGENT" in text
+    assert "available" in text
+    assert "fred-secret" not in text
+    assert "finn-secret" not in text
+    assert "fmp-secret" not in text
+    assert "sec-agent-secret" not in text

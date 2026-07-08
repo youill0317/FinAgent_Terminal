@@ -1,55 +1,50 @@
 from __future__ import annotations
 
-import re
-from typing import TYPE_CHECKING, ClassVar, Final, override
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, override
 
+from textual.containers import Horizontal
 from textual.css.query import NoMatches
 from textual.widgets import Button, Footer, Input, Static, Tab, Tabs
 
-from finagent_terminal.analytics import MissingCloseColumnError, compute_indicators
-from finagent_terminal.compare import (
-    MAX_COMPARE_SYMBOLS,
-    MIN_COMPARE_SYMBOLS,
-    CompareResult,
-    CompareSymbolLimitError,
+from finagent_terminal.analytics import (
+    MissingCloseColumnError,
+    MonteCarloConfig,
+    TooFewReturnsError,
+    monte_carlo_simulation,
 )
-from finagent_terminal.compare import compare_symbols as build_compare
 from finagent_terminal.data.session import DataSession
-from finagent_terminal.symbols import normalize_symbol
+from finagent_terminal.data.yfinance_provider import YFinanceProvider
 from finagent_terminal.ui.screens import WorkspaceScreen
 from finagent_terminal.ui.state import WORKSPACE_LABELS, WORKSPACES
-from finagent_terminal.ui.widgets.charts import render_frame_chart
-from finagent_terminal.ui.widgets.tables import (
-    render_performance_table,
-    render_tail_table,
-)
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    import pandas as pd  # noqa: PANDAS_OK
     from textual.app import ComposeResult
 
     from finagent_terminal.ui.state import AppState, WorkspaceId
 
 
-SYMBOL_SPLIT: Final = re.compile(r"[\s,]+")
+@dataclass(frozen=True, slots=True)
+class InvalidMonteCarloInputError(Exception):
+    field: str
+    value: str
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.field} must be a positive integer: {self.value}"
 
 
 class ToolsScreen(WorkspaceScreen):
     workspace: ClassVar[WorkspaceId] = "tools"
     label: ClassVar[str] = "Tools"
-    summary: ClassVar[str] = "Compare 2-6 symbols with normalized returns."
+    summary: ClassVar[str] = "Analysis hub"
 
     def __init__(self, state: AppState, session: DataSession | None = None) -> None:
-        """Create the tools screen with an optional fake data session."""
+        """Create the Tools workspace with an optional test data session."""
         super().__init__(state)
         self._session: DataSession | None = session
-        self.selected: tuple[str, ...] = ()
-        self.result: CompareResult | None = None
-        self.analytics: tuple[str, ...] = ()
-        self.skipped: tuple[str, ...] = ()
-        self.message: str | None = None
+        self._monte_carlo_lines: tuple[str, ...] = ()
+        self._message: str | None = None
 
     @override
     def compose(self) -> ComposeResult:
@@ -63,97 +58,111 @@ class ToolsScreen(WorkspaceScreen):
             id="workspace-tabs",
         )
         yield Static(self.label, classes="workspace-title")
-        yield Input(placeholder="AAPL MSFT QQQ", id="compare_symbols")
-        yield Button("Compare", id="compare_load", variant="primary")
-        yield Static("\n".join(self.lines()), id="tools_body")
+        with Horizontal():
+            yield Input(placeholder="Symbol", id="monte_carlo_symbol", value="AAPL")
+            yield Input(placeholder="Days", id="monte_carlo_days", value="30")
+            yield Input(placeholder="Paths", id="monte_carlo_paths", value="1000")
+        with Horizontal():
+            yield Input(placeholder="Seed", id="monte_carlo_seed", value="7")
+            yield Input(placeholder="Bins", id="monte_carlo_bins", value="4")
+            yield Button("Run", id="monte_carlo_run", variant="primary")
+        yield Static("\n".join(self.lines()), id="tools_body", markup=False)
         yield Footer()
-
-    def compare_manual(self, raw_symbols: str) -> None:
-        try:
-            symbols = _parse_symbols(raw_symbols, fallback=self.state.selected_symbols)
-        except ValueError:
-            self._set_error(f"Invalid compare symbols: {raw_symbols.strip()}")
-            return
-        self.compare_selected(symbols)
-
-    def compare_selected(self, symbols: tuple[str, ...]) -> None:
-        self.selected = symbols
-        self.result = None
-        self.analytics = ()
-        self.skipped = ()
-        try:
-            _require_symbol_limit(symbols)
-        except CompareSymbolLimitError as error:
-            self._set_error(str(error))
-            return
-
-        snapshots = tuple(
-            (symbol, self._data_session().get_or_fetch(symbol)) for symbol in symbols
-        )
-        skipped = [
-            symbol
-            for symbol, snapshot in snapshots
-            if snapshot.error is not None or snapshot.history is None
-        ]
-        frames = {
-            symbol: snapshot.history.frame
-            for symbol, snapshot in snapshots
-            if snapshot.error is None and snapshot.history is not None
-        }
-
-        if len(frames) < MIN_COMPARE_SYMBOLS:
-            self.skipped = tuple(skipped)
-            self._set_error("compare mode needs at least 2 loaded symbols")
-            return
-
-        result = build_compare(frames)
-        self.result = result
-        self.analytics = _analytics_lines(frames)
-        self.skipped = (*skipped, *result.skipped_symbols)
-        self.message = None
-        self._refresh_body()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "compare_symbols":
-            self.compare_manual(event.value)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id != "compare_load":
-            return
-        self.compare_manual(self.query_one("#compare_symbols", Input).value)
 
     @override
     def lines(self) -> tuple[str, ...]:
-        if self.result is None:
-            return (
-                self.summary,
-                "Compare: enter 2-6 symbols",
-                self.message or "Output: normalized returns pending",
-            )
+        lines = [
+            self.summary,
+            "Monte Carlo: simulate future close-return paths from ticker history.",
+            "Inputs: symbol, days, paths, seed, histogram bins.",
+        ]
+        if self._message is not None:
+            lines.append(self._message)
+        if len(self._monte_carlo_lines) > 0:
+            lines.extend(self._monte_carlo_lines)
+        else:
+            lines.append("Monte Carlo: waiting for a run")
+        return tuple(lines)
 
-        return (
-            f"Selected: {', '.join(self.selected)}",
-            f"Skipped: {', '.join(self.skipped) if self.skipped else 'none'}",
-            "Normalized returns:",
-            *render_tail_table(self.result.normalized_returns),
-            "Relative performance:",
-            *render_performance_table(self.result.relative_performance),
-            "Chart:",
-            *render_frame_chart(self.result.normalized_returns),
-            "Analytics:",
-            *self.analytics,
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "monte_carlo_run":
+            return
+        _ = event.stop()
+        self.run_monte_carlo_from_inputs()
+
+    def run_monte_carlo_from_inputs(self) -> None:
+        symbol = self.query_one("#monte_carlo_symbol", Input).value.strip()
+        if not symbol:
+            self._show_error("symbol is required")
+            return
+
+        try:
+            config = MonteCarloConfig(
+                days=self._positive_int("#monte_carlo_days", "days"),
+                paths=self._positive_int("#monte_carlo_paths", "paths"),
+                seed=self._optional_int("#monte_carlo_seed", "seed"),
+                bins=self._positive_int("#monte_carlo_bins", "bins"),
+            )
+        except InvalidMonteCarloInputError as error:
+            self._show_error(str(error))
+            return
+
+        self.run_monte_carlo(symbol, config)
+
+    def run_monte_carlo(self, symbol: str, config: MonteCarloConfig) -> None:
+        snapshot = self._data_session().get_or_fetch(symbol, period="1y")
+        if snapshot.error is not None:
+            self._show_error(snapshot.error.message)
+            return
+        if snapshot.history is None:
+            self._show_error(f"no close history for {snapshot.symbol}")
+            return
+
+        try:
+            result = monte_carlo_simulation(snapshot.history.frame, config)
+        except (MissingCloseColumnError, TooFewReturnsError) as error:
+            self._show_error(str(error))
+            return
+
+        self._message = None
+        self._monte_carlo_lines = (
+            "Monte Carlo result:",
+            f"Symbol: {snapshot.symbol}",
+            result.summary_line,
+            f"P10: {result.percentile_10:.2f}",
+            f"P50: {result.percentile_50:.2f}",
+            f"P90: {result.percentile_90:.2f}",
+            "Histogram: " + " | ".join(str(count) for count in result.histogram_counts),
         )
+        self._refresh_body()
 
     def _data_session(self) -> DataSession:
         if self._session is None:
-            import finagent_terminal.data.yfinance_provider as provider  # noqa: PLC0415
-
-            self._session = DataSession(provider.YFinanceProvider())
+            self._session = DataSession(YFinanceProvider())
         return self._session
 
-    def _set_error(self, message: str) -> None:
-        self.result = None
-        self.message = message
+    def _positive_int(self, selector: str, field: str) -> int:
+        value = self.query_one(selector, Input).value.strip()
+        try:
+            parsed = int(value)
+        except ValueError:
+            raise InvalidMonteCarloInputError(field=field, value=value) from None
+        if parsed <= 0:
+            raise InvalidMonteCarloInputError(field=field, value=value)
+        return parsed
+
+    def _optional_int(self, selector: str, field: str) -> int | None:
+        value = self.query_one(selector, Input).value.strip()
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            raise InvalidMonteCarloInputError(field=field, value=value) from None
+
+    def _show_error(self, message: str) -> None:
+        self._message = f"Monte Carlo error: {message}"
+        self._monte_carlo_lines = ()
         self._refresh_body()
 
     def _refresh_body(self) -> None:
@@ -161,41 +170,3 @@ class ToolsScreen(WorkspaceScreen):
             self.query_one("#tools_body", Static).update("\n".join(self.lines()))
         except NoMatches:
             return
-
-
-def _parse_symbols(raw_symbols: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
-    raw_parts = tuple(part for part in SYMBOL_SPLIT.split(raw_symbols.strip()) if part)
-    parts = fallback if len(raw_parts) == 0 else raw_parts
-    return tuple(dict.fromkeys(normalize_symbol(part) for part in parts))
-
-
-def _require_symbol_limit(symbols: tuple[str, ...]) -> None:
-    symbol_count = len(symbols)
-    if symbol_count < MIN_COMPARE_SYMBOLS or symbol_count > MAX_COMPARE_SYMBOLS:
-        raise CompareSymbolLimitError(count=symbol_count)
-
-
-def _analytics_lines(frames: Mapping[str, pd.DataFrame]) -> tuple[str, ...]:
-    rows: list[str] = []
-    for symbol, frame in frames.items():
-        try:
-            indicators = compute_indicators(frame)
-        except MissingCloseColumnError:
-            continue
-        if indicators.empty:
-            continue
-        latest = indicators.iloc[-1]
-        rows.append(
-            "; ".join(
-                (
-                    f"{symbol}: moving_average_20 {latest['moving_average_20']:.2f}",
-                    f"moving_average_50 {latest['moving_average_50']:.2f}",
-                    f"volatility_20 {latest['volatility_20']:.2f}",
-                    f"drawdown {latest['drawdown']:.2%}",
-                    f"rsi_14 {latest['rsi_14']:.2f}",
-                    f"macd {latest['macd']:.2f}",
-                    f"macd_signal {latest['macd_signal']:.2f}",
-                ),
-            ),
-        )
-    return tuple(rows) if rows else ("(no data)",)

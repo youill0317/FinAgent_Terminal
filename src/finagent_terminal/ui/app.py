@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, assert_never
 from textual.app import App
 
 from finagent_terminal.ui.screens.markets import MarketsScreen
+from finagent_terminal.ui.screens.news import NewsScreen
 from finagent_terminal.ui.screens.reports import ReportsScreen
 from finagent_terminal.ui.screens.settings import SettingsScreen
 from finagent_terminal.ui.screens.ticker import TickerScreen
@@ -29,9 +30,10 @@ class FinAgentApp(App[None]):
         ("q", "quit", "Quit"),
         ("1", "workspace('markets')", "Markets"),
         ("2", "workspace('ticker')", "Ticker"),
-        ("3", "workspace('tools')", "Tools"),
-        ("4", "workspace('reports')", "Reports"),
-        ("5", "workspace('settings')", "Settings"),
+        ("3", "workspace('news')", "News"),
+        ("4", "workspace('tools')", "Tools"),
+        ("5", "workspace('reports')", "Reports"),
+        ("6", "workspace('settings')", "Settings"),
     ]
 
     def __init__(self, state: AppState | None = None) -> None:
@@ -57,6 +59,9 @@ class FinAgentApp(App[None]):
                 return
             case "ticker":
                 await self.push_screen(TickerScreen(self.state))
+                return
+            case "news":
+                await self.push_screen(NewsScreen(self.state))
                 return
             case "tools":
                 await self.push_screen(ToolsScreen(self.state))

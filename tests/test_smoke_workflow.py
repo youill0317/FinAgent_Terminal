@@ -35,9 +35,42 @@ def test_smoke_workflow_runs_with_fake_integrations(
     output = capsys.readouterr().out
     assert status == 0
     assert "SMOKE markets: Data:" in output
+    assert "SMOKE markets compare: Compare: Smoke" in output
     assert "SMOKE ticker: Symbol: AAPL" in output
-    assert "SMOKE tools: Normalized returns:" in output
-    assert "SMOKE reports: Completed: 5/5" in output
+    assert "SMOKE ticker compare: Compare: AAPL vs SPY, QQQ, DIA" in output
+    assert "SMOKE news: Market news" in output
+    assert "SMOKE tools: Analysis hub" in output
+    assert "SMOKE tools monte carlo: 20 paths over 5 days" in output
+    assert "SMOKE tools: Compare:" not in output
+    assert "SMOKE tools: Normalized returns:" not in output
+    assert "SMOKE reports: Completed: 7/7" in output
+    assert "Exported:" in output
     assert "SMOKE settings: Providers:" in output
     report_paths = tuple((tmp_path / "reports").glob("*.md"))
     assert report_paths != ()
+
+def test_smoke_workflow_missing_fake_data_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("FINAGENT_FAKE_DATA", raising=False)
+    monkeypatch.setenv("FINAGENT_FAKE_LLM", "1")
+
+    status = main(["--smoke"])
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert "--smoke requires FINAGENT_FAKE_DATA=1" in captured.err
+
+def test_smoke_workflow_missing_fake_llm_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("FINAGENT_FAKE_DATA", "1")
+    monkeypatch.delenv("FINAGENT_FAKE_LLM", raising=False)
+
+    status = main(["--smoke"])
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert "--smoke requires FINAGENT_FAKE_LLM=1" in captured.err

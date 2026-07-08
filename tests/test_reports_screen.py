@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING
 import pytest
 from textual.widgets import Input, Static
 
-from finagent_terminal.ui.screens.reports import ReportsScreen
+from finagent_terminal.ui.screens.reports import ReportScreenSessions, ReportsScreen
 from finagent_terminal.ui.state import create_app_state
+from tests import test_report_source_context as source_context_tests
 from tests.report_screen_fixtures import (
     FakeSession,
     MutableClock,
@@ -15,6 +16,7 @@ from tests.report_screen_fixtures import (
     aapl_snapshot,
     client_factory,
     failing_client_factory,
+    report_source_session,
 )
 
 if TYPE_CHECKING:
@@ -28,7 +30,7 @@ if TYPE_CHECKING:
 async def test_reports_screen_generates_preview_and_exports(tmp_path: Path) -> None:
     screen = ReportsScreen(
         create_app_state(),
-        data_session=FakeSession(aapl_snapshot()),
+        sessions=report_sessions(),
         client_factory=client_factory,
         export_dir=tmp_path,
     )
@@ -43,16 +45,17 @@ async def test_reports_screen_generates_preview_and_exports(tmp_path: Path) -> N
             progress_text = str(
                 app.screen.query_one("#report_progress", Static).render(),
             )
-            if "Completed: 5/5" in progress_text:
+            if "Completed: 7/7" in progress_text:
                 break
 
         progress_text = str(app.screen.query_one("#report_progress", Static).render())
         preview_text = str(app.screen.query_one("#report_preview", Static).render())
         assert "Provider/model: openai/fake-model" in progress_text
-        assert "Completed: 5/5" in progress_text
+        assert "Completed: 7/7" in progress_text
         assert "Latest error: none" in progress_text
-        assert "## Overview" in preview_text
-        assert "## Bull Case" in preview_text
+        assert "## Reports Editor" in preview_text
+        assert "AAPL Reports Editor generated from supplied context." in preview_text
+        assert "## Technical Analyst" not in preview_text
 
         _ = await pilot.click("#export_report")
         await pilot.pause()
@@ -76,7 +79,7 @@ async def test_reports_screen_updates_partial_preview_while_running(
 
     screen = ReportsScreen(
         create_app_state(),
-        data_session=FakeSession(aapl_snapshot()),
+        sessions=report_sessions(),
         client_factory=stepwise_client_factory,
         export_dir=tmp_path,
         clock=clock.now,
@@ -88,7 +91,7 @@ async def test_reports_screen_updates_partial_preview_while_running(
         clock.current = 1.2
         for _ in range(20):
             await pilot.pause()
-            if client.has_started("overview"):
+            if client.has_started("technical_analyst"):
                 break
         clock.current = 1.2
         for _ in range(20):
@@ -101,36 +104,41 @@ async def test_reports_screen_updates_partial_preview_while_running(
 
         progress_text = str(app.screen.query_one("#report_progress", Static).render())
         preview_text = str(app.screen.query_one("#report_preview", Static).render())
-        assert "Active: overview" in progress_text
-        assert "Overview: running" in progress_text
-        assert "Completed: 0/5" in progress_text
+        assert "Active: technical_analyst" in progress_text
+        assert "Technical Analyst: running" in progress_text
+        assert "Completed: 0/7" in progress_text
         assert "Elapsed: 1.2s" in progress_text
-        assert "## Overview" not in preview_text
+        assert "## Technical Analyst" not in preview_text
 
-        client.release("overview")
+        client.release("technical_analyst")
         for _ in range(20):
             await pilot.pause()
             preview_text = str(app.screen.query_one("#report_preview", Static).render())
-            if "## Overview" in preview_text and client.has_started("risk_notes"):
+            if (
+                "## Technical Analyst" in preview_text
+                and client.has_started("fundamentals_analyst")
+            ):
                 break
 
         progress_text = str(app.screen.query_one("#report_progress", Static).render())
         preview_text = str(app.screen.query_one("#report_preview", Static).render())
-        assert "Active: risk_notes" in progress_text
-        assert "Risk Notes: running" in progress_text
-        assert "Completed: 1/5" in progress_text
-        assert "## Overview" in preview_text
-        assert "## Risk Notes" not in preview_text
-        client.release("risk_notes")
-        client.release("technical_indicators")
-        client.release("bull_case")
-        client.release("bear_case")
+        assert "Active: fundamentals_analyst" in progress_text
+        assert "Fundamentals Analyst: running" in progress_text
+        assert "Completed: 1/7" in progress_text
+        assert "## Technical Analyst" in preview_text
+        assert "## Fundamentals Analyst" not in preview_text
+        client.release("fundamentals_analyst")
+        client.release("news_sentiment_analyst")
+        client.release("bullish_researcher")
+        client.release("bearish_researcher")
+        client.release("debate_refinement")
+        client.release("reports_editor")
         for _ in range(20):
             await pilot.pause()
             progress_text = str(
                 app.screen.query_one("#report_progress", Static).render(),
             )
-            if "Completed: 5/5" in progress_text:
+            if "Completed: 7/7" in progress_text:
                 break
 
 
@@ -149,7 +157,7 @@ async def test_reports_screen_preserves_progress_after_navigation(
 
     first = ReportsScreen(
         shared_state,
-        data_session=FakeSession(aapl_snapshot()),
+        sessions=report_sessions(),
         client_factory=stepwise_client_factory,
         export_dir=tmp_path,
     )
@@ -159,12 +167,12 @@ async def test_reports_screen_preserves_progress_after_navigation(
         _ = await pilot.click("#start_report")
         for _ in range(20):
             await pilot.pause()
-            if client.has_started("overview"):
+            if client.has_started("technical_analyst"):
                 break
         await app.pop_screen()
         second = ReportsScreen(
             shared_state,
-            data_session=FakeSession(aapl_snapshot()),
+            sessions=report_sessions(),
             client_factory=stepwise_client_factory,
             export_dir=tmp_path,
         )
@@ -172,28 +180,30 @@ async def test_reports_screen_preserves_progress_after_navigation(
         await pilot.pause()
 
         progress_text = str(app.screen.query_one("#report_progress", Static).render())
-        assert "Active: overview" in progress_text
-        assert "Overview: running" in progress_text
+        assert "Active: technical_analyst" in progress_text
+        assert "Technical Analyst: running" in progress_text
 
-        client.release("overview")
-        client.release("risk_notes")
-        client.release("technical_indicators")
-        client.release("bull_case")
-        client.release("bear_case")
+        client.release("technical_analyst")
+        client.release("fundamentals_analyst")
+        client.release("news_sentiment_analyst")
+        client.release("bullish_researcher")
+        client.release("bearish_researcher")
+        client.release("debate_refinement")
+        client.release("reports_editor")
         for _ in range(20):
             await pilot.pause()
             progress_text = str(
                 app.screen.query_one("#report_progress", Static).render(),
             )
-            if "Completed: 5/5" in progress_text:
+            if "Completed: 7/7" in progress_text:
                 break
 
 
 @pytest.mark.anyio
-async def test_reports_screen_failed_section_visible(tmp_path: Path) -> None:
+async def test_reports_screen_failed_role_visible(tmp_path: Path) -> None:
     screen = ReportsScreen(
         create_app_state(),
-        data_session=FakeSession(aapl_snapshot()),
+        sessions=report_sessions(),
         client_factory=failing_client_factory,
         export_dir=tmp_path,
     )
@@ -206,14 +216,36 @@ async def test_reports_screen_failed_section_visible(tmp_path: Path) -> None:
             progress_text = str(
                 app.screen.query_one("#report_progress", Static).render(),
             )
-            if "Bull Case: failed" in progress_text:
+            if "Bullish Researcher: failed" in progress_text:
                 break
 
         progress_text = str(app.screen.query_one("#report_progress", Static).render())
         preview_text = str(app.screen.query_one("#report_preview", Static).render())
-        assert "Bull Case: failed" in progress_text
-        assert "Latest error: fake provider failed: fake failure for Bull Case" in (
-            progress_text
+        assert "Bullish Researcher: failed" in progress_text
+        assert "Bearish Researcher: complete" in progress_text
+        assert "Reports Editor: complete" in progress_text
+        assert (
+            "Latest error: fake provider failed: fake failure for Bullish Researcher"
+            in progress_text
         )
-        assert "## Bull Case" not in preview_text
-        assert "## Bear Case" in preview_text
+        assert "## Reports Editor" in preview_text
+        assert "## Bullish Researcher" not in preview_text
+
+
+def report_sessions() -> ReportScreenSessions:
+    return ReportScreenSessions(
+        data=FakeSession(aapl_snapshot()),
+        source=report_source_session(),
+    )
+
+
+def test_report_source_context() -> None:
+    source_context_tests.test_report_source_context()
+
+
+def test_reports_independent_from_news() -> None:
+    source_context_tests.test_reports_independent_from_news()
+
+
+def test_all_sources_unavailable() -> None:
+    source_context_tests.test_all_sources_unavailable()

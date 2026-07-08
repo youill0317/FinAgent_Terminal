@@ -2,49 +2,40 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import override
 
-from finagent_terminal.data.models import (
-    FreshnessState,
-    MarketDataSnapshot,
-    OhlcvFrame,
-)
+import pandas as pd  # noqa: PANDAS_OK
+import pytest
+from textual.app import App
+from textual.css.query import NoMatches
+from textual.widgets import Button, Input, Static
+
+from finagent_terminal.data.models import FreshnessState, MarketDataSnapshot, OhlcvFrame
 from finagent_terminal.data.session import DataSession
 from finagent_terminal.ui.screens.tools import ToolsScreen
 from finagent_terminal.ui.state import create_app_state
-from tests.test_compare import fixture_frame
 
 FETCHED_AT = datetime(2024, 1, 5, 12, tzinfo=UTC)
-PRICES = {
-    "AAPL": [100.0, 110.0, 121.0],
-    "MSFT": [200.0, 210.0, 220.0],
-    "QQQ": [50.0, 55.0, 60.0],
-}
+
+
+class ToolsHarness(App[None]):
+    def __init__(self, screen: ToolsScreen) -> None:
+        super().__init__()
+        self.tools_screen: ToolsScreen = screen
+
+    async def on_mount(self) -> None:
+        await self.push_screen(self.tools_screen)
 
 
 @dataclass(frozen=True, slots=True)
-class SymbolUnavailableError(Exception):
-    symbol: str
-
-    @override
-    def __str__(self) -> str:
-        return f"{self.symbol} unavailable"
-
-
-@dataclass(frozen=True, slots=True)
-class CompareProvider:
-    failed_symbol: str | None = None
+class ToolsProvider:
+    frame: pd.DataFrame
 
     def fetch(
         self,
         symbol: str,
-        period: str = "1mo",
+        period: str = "1y",
         interval: str = "1d",
     ) -> MarketDataSnapshot:
-        if symbol == self.failed_symbol:
-            raise SymbolUnavailableError(symbol)
-        prices = PRICES[symbol]
-        frame = fixture_frame(prices)
         return MarketDataSnapshot(
             symbol=symbol,
             period=period,
@@ -55,53 +46,95 @@ class CompareProvider:
                 symbol=symbol,
                 period=period,
                 interval=interval,
-                frame=frame,
-                rows=len(frame),
+                frame=self.frame,
+                rows=len(self.frame),
                 fetched_at=FETCHED_AT,
             ),
         )
 
 
-def test_tools_compare_renders_normalized_returns_from_manual_symbols() -> None:
-    screen = ToolsScreen(create_app_state(), DataSession(CompareProvider()))
+@pytest.mark.anyio
+async def test_tools_no_compare_ui() -> None:
+    screen = ToolsScreen(create_app_state())
 
-    screen.compare_manual("aapl, msft qqq")
+    async with ToolsHarness(screen).run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        rendered = str(screen.query_one("#tools_body", Static).render())
 
-    rendered = "\n".join(screen.lines())
-    assert "Selected: AAPL, MSFT, QQQ" in rendered
-    assert "Normalized returns:" in rendered
-    assert "AAPL" in rendered
-    assert "121.00" in rendered
-    assert "QQQ" in rendered
-    assert "20.00%" in rendered
-    assert "Analytics:" in rendered
-    assert "moving_average_20" in rendered
-    assert "moving_average_50" in rendered
-    assert "volatility_20" in rendered
-    assert "drawdown" in rendered
-    assert "rsi_14" in rendered
-    assert "macd" in rendered
-    assert "macd_signal" in rendered
+        assert "Compare: enter 2-6 symbols" not in rendered
+        assert "normalized returns" not in rendered.lower()
+        with pytest.raises(NoMatches):
+            _ = screen.query_one("#compare_symbols", Input)
 
 
-def test_tools_compare_shows_clear_message_for_more_than_six_symbols() -> None:
-    screen = ToolsScreen(create_app_state(), DataSession(CompareProvider()))
+@pytest.mark.anyio
+async def test_tools_monte_carlo_success_renders_hub_inputs_and_result() -> None:
+    frame = _frame({"Close": [100.0, 102.0, 99.0, 105.0, 108.0, 106.0]})
+    screen = ToolsScreen(create_app_state(), DataSession(ToolsProvider(frame)))
 
-    screen.compare_manual("AAPL MSFT QQQ DIA SPY NVDA AMD")
+    async with ToolsHarness(screen).run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        screen.query_one("#monte_carlo_symbol", Input).value = "aapl"
+        screen.query_one("#monte_carlo_days", Input).value = "5"
+        screen.query_one("#monte_carlo_paths", Input).value = "20"
+        screen.query_one("#monte_carlo_seed", Input).value = "7"
+        _ = screen.query_one("#monte_carlo_run", Button).press()
+        await pilot.pause()
 
-    rendered = "\n".join(screen.lines())
-    assert "compare mode requires 2 to 6 symbols" in rendered
-    assert "Normalized returns:" not in rendered
+        rendered = str(screen.query_one("#tools_body", Static).render())
+        assert "Analysis hub" in rendered
+        assert "Monte Carlo" in rendered
+        assert "Symbol: AAPL" in rendered
+        assert "P10: 98.15" in rendered
+        assert "P50: 104.40" in rendered
+        assert "P90: 116.80" in rendered
+        assert "Histogram: 3 | 8 | 6 | 3" in rendered
 
 
-def test_tools_compare_keeps_output_when_one_symbol_fails() -> None:
-    screen = ToolsScreen(create_app_state(), DataSession(CompareProvider("QQQ")))
+@pytest.mark.anyio
+async def test_tools_monte_carlo_missing_close_error_has_no_traceback() -> None:
+    screen = ToolsScreen(
+        create_app_state(),
+        DataSession(ToolsProvider(_frame({"Open": [100.0, 101.0, 102.0]}))),
+    )
 
-    screen.compare_manual("AAPL MSFT QQQ")
+    async with ToolsHarness(screen).run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        screen.query_one("#monte_carlo_symbol", Input).value = "AAPL"
+        screen.query_one("#monte_carlo_days", Input).value = "5"
+        screen.query_one("#monte_carlo_paths", Input).value = "20"
+        screen.query_one("#monte_carlo_seed", Input).value = "7"
+        _ = screen.query_one("#monte_carlo_run", Button).press()
+        await pilot.pause()
 
-    rendered = "\n".join(screen.lines())
-    assert "Selected: AAPL, MSFT, QQQ" in rendered
-    assert "Skipped: QQQ" in rendered
-    assert "AAPL" in rendered
-    assert "MSFT" in rendered
-    assert "QQQ: moving_average_20" not in rendered
+        rendered = str(screen.query_one("#tools_body", Static).render())
+        assert "Monte Carlo error: missing close column: Close" in rendered
+        assert "Traceback" not in rendered
+
+
+@pytest.mark.anyio
+async def test_tools_monte_carlo_too_few_returns_error_has_no_traceback() -> None:
+    screen = ToolsScreen(
+        create_app_state(),
+        DataSession(ToolsProvider(_frame({"Close": [100.0, None, 100.0]}))),
+    )
+
+    async with ToolsHarness(screen).run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        screen.query_one("#monte_carlo_symbol", Input).value = "AAPL"
+        screen.query_one("#monte_carlo_days", Input).value = "5"
+        screen.query_one("#monte_carlo_paths", Input).value = "20"
+        screen.query_one("#monte_carlo_seed", Input).value = "7"
+        _ = screen.query_one("#monte_carlo_run", Button).press()
+        await pilot.pause()
+
+        rendered = str(screen.query_one("#tools_body", Static).render())
+        assert "Monte Carlo error: need at least 2 returns; got 1" in rendered
+        assert "Traceback" not in rendered
+
+
+def _frame(columns: dict[str, list[float | None]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        columns,
+        index=pd.date_range("2024-01-01", periods=len(next(iter(columns.values())))),
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
@@ -15,9 +16,14 @@ from finagent_terminal.reports.models import (
 )
 from finagent_terminal.reports.pipeline import ReportPipeline
 from finagent_terminal.reports.progress import ReportProgress, new_report_progress
+from finagent_terminal.reports.source_context import (
+    ReportSourceContext,
+    fetch_report_source_context,
+)
 
 if TYPE_CHECKING:
     from finagent_terminal.data.models import MarketDataSnapshot
+    from finagent_terminal.data.sources import SourceSession
     from finagent_terminal.reports.pipeline import ReportRunResult
     from finagent_terminal.ui.state import AppState
 
@@ -68,6 +74,7 @@ class ReportJob:
     request: ReportRequest
     session: ReportDataSession
     client_factory: ReportClientFactory
+    source_session: SourceSession | None = None
     started_at: float = 0.0
     on_update: ReportUpdate | None = None
 
@@ -75,15 +82,23 @@ class ReportJob:
 _REPORT_STATES: dict[int, ReportScreenState] = {}
 
 
-def build_report_context(symbol: str, snapshot: MarketDataSnapshot) -> ReportContext:
+def build_report_context(
+    symbol: str,
+    snapshot: MarketDataSnapshot,
+    source_context: ReportSourceContext | None = None,
+) -> ReportContext:
     warnings: list[str] = []
     if snapshot.error is not None:
         warnings.append(snapshot.error.message)
+    if source_context is not None:
+        warnings.extend(source_context.warnings)
     return ReportContext(
         symbol=symbol,
         market_summary=_market_summary(snapshot),
         indicator_summary=_indicator_summary(snapshot),
         warnings=tuple(warnings),
+        source_notes=() if source_context is None else source_context.notes,
+        source_citations=() if source_context is None else source_context.citations,
     )
 
 
@@ -108,7 +123,9 @@ def set_report_state_for(
 def run_screen_report(job: ReportJob) -> ScreenReportResult:
     request = job.request
     snapshot = job.session.get_or_fetch(request.symbol)
-    context = build_report_context(request.symbol, snapshot)
+    with _source_session_for(job) as source_session:
+        source_context = fetch_report_source_context(source_session, request.symbol)
+    context = build_report_context(request.symbol, snapshot, source_context)
     result = ReportPipeline(
         client=_client_or_failure(request, job.client_factory),
         provider=request.provider.value,
@@ -122,12 +139,36 @@ def run_screen_report(job: ReportJob) -> ScreenReportResult:
     return ScreenReportResult(context=context, result=result)
 
 
+@contextmanager
+def _source_session_for(job: ReportJob) -> Generator[SourceSession, None, None]:
+    if job.source_session is not None:
+        yield job.source_session
+        return
+    from finagent_terminal.data.sources import SourceSession  # noqa: PLC0415
+
+    with SourceSession() as source_session:
+        yield source_session
+
+
 def _default_progress() -> ReportProgress:
     return new_report_progress(
         provider=ProviderName.OPENAI.value,
         model="gpt-4o-mini",
         depth=DepthMode.STANDARD,
     )
+
+
+def started_report_progress(
+    request: ReportRequest,
+    started_at: float,
+) -> ReportProgress:
+    progress = new_report_progress(
+        provider=request.provider.value,
+        model=request.model,
+        depth=request.depth,
+        started_at=started_at,
+    )
+    return progress.mark_running(progress.sections[0].id, now=started_at)
 
 
 def _publish(

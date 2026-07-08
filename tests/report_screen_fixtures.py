@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from threading import Event
 from typing import TYPE_CHECKING
 
+import httpx
 import pandas as pd  # noqa: PANDAS_OK
 from textual.app import App
 
@@ -15,9 +16,12 @@ from finagent_terminal.data.models import (
     Profile,
     Quote,
 )
+from finagent_terminal.data.sources import SourceSession
 from finagent_terminal.llm import FakeLLMClient, LLMSelection
 from finagent_terminal.llm.base import ProviderCallError
 from finagent_terminal.reports.models import ReportSectionPrompt, ReportSectionResult
+from tests.source_routing_fixtures import SEC_SAMPLE, macro_response, success_response
+from tests.vendor_source_fixtures import FINNHUB_SAMPLE, FMP_SAMPLE
 
 if TYPE_CHECKING:
     from finagent_terminal.llm.base import StructuredLLMProvider
@@ -68,7 +72,27 @@ def failing_client_factory(
     selection: LLMSelection | None = None,
 ) -> StructuredLLMProvider:
     _ = selection
-    return FakeLLMClient(mode="fail_section")
+    return FailingBullishClient()
+
+
+@dataclass(frozen=True, slots=True)
+class FailingBullishClient:
+    def generate_structured_report_section(
+        self,
+        prompt: ReportSectionPrompt,
+    ) -> ReportSectionResult:
+        if prompt.section.id == "bullish_researcher":
+            raise ProviderCallError(
+                provider="fake",
+                message=f"fake failure for {prompt.section.title}",
+            )
+        return ReportSectionResult(
+            section_id=prompt.section.id,
+            title=prompt.section.title,
+            summary=f"{prompt.context.symbol} {prompt.section.title} generated.",
+            key_points=(prompt.context.market_summary,),
+            risks=("No additional supplied-context risks.",),
+        )
 
 
 class StepwiseLLMClient:
@@ -144,5 +168,33 @@ def aapl_snapshot() -> MarketDataSnapshot:
             None,
             None,
             fetched_at,
+        ),
+    )
+
+
+def report_source_response(
+    request: httpx.Request,
+    requests: list[httpx.Request],
+) -> httpx.Response:
+    if request.url.host in {
+        "api.fiscaldata.treasury.gov",
+        "api.stlouisfed.org",
+    }:
+        return macro_response(request, requests)
+    return success_response(request, requests, sec_has_aapl=True)
+
+
+def report_source_session() -> SourceSession:
+    return SourceSession(
+        env={
+            "FINAGENT_SEC_USER_AGENT": SEC_SAMPLE,
+            "FMP_API_KEY": FMP_SAMPLE,
+            "FINNHUB_API_KEY": FINNHUB_SAMPLE,
+            "FRED_API_KEY": "fred-test-secret",
+        },
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: report_source_response(request, []),
+            ),
         ),
     )

@@ -9,13 +9,14 @@ from typing import TYPE_CHECKING, Final, Literal
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-WorkspaceId = Literal["markets", "ticker", "tools", "reports", "settings"]
+WorkspaceId = Literal["markets", "ticker", "news", "tools", "reports", "settings"]
 ConfigStatus = Literal["defaults", "loaded"]
 ReportJobStatus = Literal["not_started", "running", "complete", "failed"]
 
 WORKSPACES: Final[tuple[WorkspaceId, ...]] = (
     "markets",
     "ticker",
+    "news",
     "tools",
     "reports",
     "settings",
@@ -23,6 +24,7 @@ WORKSPACES: Final[tuple[WorkspaceId, ...]] = (
 WORKSPACE_LABELS: Final[tuple[str, ...]] = (
     "Markets",
     "Ticker",
+    "News",
     "Tools",
     "Reports",
     "Settings",
@@ -31,6 +33,7 @@ WORKSPACE_BY_TAB_ID: Final[Mapping[str, WorkspaceId]] = MappingProxyType(
     {
         "markets": "markets",
         "ticker": "ticker",
+        "news": "news",
         "tools": "tools",
         "reports": "reports",
         "settings": "settings",

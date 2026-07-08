@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
+import httpx
 import pandas as pd  # noqa: PANDAS_OK
 
 from finagent_terminal import __version__
+from finagent_terminal.analytics import MonteCarloConfig
 from finagent_terminal.app import FinAgentApp
 from finagent_terminal.config import FinAgentConfig, app_home, config_path
 from finagent_terminal.data.models import (
@@ -18,6 +20,7 @@ from finagent_terminal.data.models import (
     Quote,
 )
 from finagent_terminal.data.session import DataSession
+from finagent_terminal.data.sources import SourceSession
 from finagent_terminal.llm import ProviderName, create_llm_client
 from finagent_terminal.reports.export import (
     ReportExport,
@@ -31,6 +34,7 @@ from finagent_terminal.reports.state import (
 )
 from finagent_terminal.symbols import SymbolGroup
 from finagent_terminal.ui.screens.markets import MarketsScreen
+from finagent_terminal.ui.screens.news import NewsScreen
 from finagent_terminal.ui.screens.settings import SettingsScreen
 from finagent_terminal.ui.screens.ticker import TickerScreen
 from finagent_terminal.ui.screens.tools import ToolsScreen
@@ -125,6 +129,10 @@ def _run_smoke() -> int:
 
     state = create_app_state()
     session = DataSession(_SmokeProvider())
+    source_session = SourceSession(
+        env={},
+        http_client=httpx.Client(transport=httpx.MockTransport(_smoke_source_failure)),
+    )
     config = FinAgentConfig(
         groups=(
             SymbolGroup.model_validate(
@@ -142,8 +150,13 @@ def _run_smoke() -> int:
     markets.refresh_market_data()
     ticker = TickerScreen(state, session)
     ticker.load_symbol("AAPL")
+    news = NewsScreen(state, source_session)
+    news.refresh_news("AAPL")
     tools = ToolsScreen(state, session)
-    tools.compare_manual("AAPL MSFT QQQ")
+    tools.run_monte_carlo(
+        "AAPL",
+        MonteCarloConfig(days=5, paths=20, seed=7, bins=4),
+    )
     report = run_screen_report(
         ReportJob(
             request=ReportRequest(
@@ -154,6 +167,7 @@ def _run_smoke() -> int:
             ),
             session=session,
             client_factory=create_llm_client,
+            source_session=source_session,
             started_at=0.0,
         ),
     )
@@ -162,6 +176,16 @@ def _run_smoke() -> int:
         app_home() / "reports",
     )
     settings = SettingsScreen(state)
+    markets_compare_line = next(
+        line for line in markets.lines() if line.startswith("Compare:")
+    )
+    ticker_compare_line = next(
+        line for line in ticker.lines() if line.startswith("Compare:")
+    )
+    news_market_line = next(line for line in news.lines() if line == "Market news")
+    tools_result_line = next(
+        line for line in tools.lines() if line.startswith("20 paths over 5 days")
+    )
     reports_line = (
         "SMOKE reports: "
         f"Completed: {report.result.progress.completed_count}/"
@@ -172,8 +196,12 @@ def _run_smoke() -> int:
         "\n".join(
             (
                 f"SMOKE markets: {markets.lines()[2]}",
+                f"SMOKE markets compare: {markets_compare_line}",
                 f"SMOKE ticker: {ticker.lines()[0]}",
-                f"SMOKE tools: {tools.lines()[2]}",
+                f"SMOKE ticker compare: {ticker_compare_line}",
+                f"SMOKE news: {news_market_line}",
+                f"SMOKE tools: {tools.lines()[0]}",
+                f"SMOKE tools monte carlo: {tools_result_line}",
                 reports_line,
                 f"SMOKE settings: {settings.lines()[4]}",
             ),
@@ -181,6 +209,14 @@ def _run_smoke() -> int:
         + "\n",
     )
     return 0
+
+
+def _smoke_source_failure(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        503,
+        json={"error": "smoke source unavailable"},
+        request=request,
+    )
 
 
 if __name__ == "__main__":

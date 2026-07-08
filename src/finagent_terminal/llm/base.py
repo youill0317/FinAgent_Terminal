@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from finagent_terminal.reports.models import (
     REPORT_DISCLAIMER,
+    ReportRoleId,
     ReportSectionPrompt,
     ReportSectionResult,
 )
@@ -97,7 +98,10 @@ class FakeLLMClient:
         self,
         prompt: ReportSectionPrompt,
     ) -> ReportSectionResult:
-        if self.mode == "fail_section" and prompt.section.id == "bull_case":
+        if self.mode == "fail_section" and prompt.section.id in (
+            ReportRoleId.BULLISH_RESEARCHER.value,
+            "bull_case",
+        ):
             raise ProviderCallError(
                 provider="fake",
                 message=f"fake failure for {prompt.section.title}",

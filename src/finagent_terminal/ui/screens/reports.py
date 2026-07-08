@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, ClassVar, override
@@ -21,7 +21,6 @@ from finagent_terminal.reports.export import (
     write_markdown_report,
 )
 from finagent_terminal.reports.models import DepthMode
-from finagent_terminal.reports.progress import ReportProgress, new_report_progress
 from finagent_terminal.reports.state import (
     ReportClientFactory,
     ReportDataSession,
@@ -32,6 +31,7 @@ from finagent_terminal.reports.state import (
     report_state_for,
     run_screen_report,
     set_report_state_for,
+    started_report_progress,
 )
 from finagent_terminal.ui.screens import WorkspaceScreen
 from finagent_terminal.ui.state import WORKSPACE_LABELS, WORKSPACES
@@ -42,7 +42,14 @@ if TYPE_CHECKING:
 
     from textual.app import ComposeResult
 
+    from finagent_terminal.data.sources import SourceSession
     from finagent_terminal.ui.state import AppState, WorkspaceId
+
+
+@dataclass(frozen=True, slots=True)
+class ReportScreenSessions:
+    data: ReportDataSession | None = None
+    source: SourceSession | None = None
 
 
 class ReportsScreen(WorkspaceScreen):
@@ -54,14 +61,16 @@ class ReportsScreen(WorkspaceScreen):
         self,
         state: AppState,
         *,
-        data_session: ReportDataSession | None = None,
+        sessions: ReportScreenSessions | None = None,
         client_factory: ReportClientFactory = create_llm_client,
         export_dir: Path | None = None,
         clock: Callable[[], float] = monotonic,
     ) -> None:
         """Create the Reports workspace."""
         super().__init__(state)
-        self._data_session: ReportDataSession | None = data_session
+        report_sessions = ReportScreenSessions() if sessions is None else sessions
+        self._data_session: ReportDataSession | None = report_sessions.data
+        self._source_session: SourceSession | None = report_sessions.source
         self._client_factory: ReportClientFactory = client_factory
         self._export_dir: Path = (
             app_home() / "reports" if export_dir is None else export_dir
@@ -116,7 +125,7 @@ class ReportsScreen(WorkspaceScreen):
             return
         self._set_report_state(
             ReportScreenState(
-                progress=_started_progress(request, self._clock()),
+                progress=started_report_progress(request, self._clock()),
                 export_status="No report exported.",
                 running=True,
             ),
@@ -135,6 +144,7 @@ class ReportsScreen(WorkspaceScreen):
                 request=request,
                 session=self._session(),
                 client_factory=self._client_factory,
+                source_session=self._source_session,
                 started_at=self._report_state.progress.started_at,
                 on_update=self._queue_report_update,
             ),
@@ -261,13 +271,3 @@ class ReportsScreen(WorkspaceScreen):
 
     def _set_report_state(self, report_state: ReportScreenState) -> None:
         self._report_state = set_report_state_for(self.state, report_state)
-
-
-def _started_progress(request: ReportRequest, started_at: float) -> ReportProgress:
-    progress = new_report_progress(
-        provider=request.provider.value,
-        model=request.model,
-        depth=request.depth,
-        started_at=started_at,
-    )
-    return progress.mark_running(progress.sections[0].id, now=started_at)

@@ -1,22 +1,31 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, override
+from typing import TYPE_CHECKING, ClassVar, Final, override
 
 from textual.css.query import NoMatches
 from textual.widgets import Button, Footer, Input, Static, Tab, Tabs
 
-from finagent_terminal.analytics import MissingCloseColumnError, compute_indicators
+from finagent_terminal.analytics import (
+    MissingCloseColumnError,
+    compute_indicators,
+    compute_risk_metrics,
+)
+from finagent_terminal.compare import MAX_COMPARE_SYMBOLS, MIN_COMPARE_SYMBOLS
 from finagent_terminal.data.session import DataSession
 from finagent_terminal.ui.screens import WorkspaceScreen
+from finagent_terminal.ui.screens.compare_panel import render_compare_panel
 from finagent_terminal.ui.state import WORKSPACE_LABELS, WORKSPACES
 from finagent_terminal.ui.widgets.charts import render_series_chart
 from finagent_terminal.ui.widgets.tables import render_key_value_rows, render_tail_table
 
 if TYPE_CHECKING:
+    import pandas as pd  # noqa: PANDAS_OK
     from textual.app import ComposeResult
 
     from finagent_terminal.data.models import MarketDataSnapshot
     from finagent_terminal.ui.state import AppState, WorkspaceId
+
+DEFAULT_RISK_BENCHMARK: Final = "SPY"
 
 
 class TickerScreen(WorkspaceScreen):
@@ -29,6 +38,8 @@ class TickerScreen(WorkspaceScreen):
         super().__init__(state)
         self._session: DataSession | None = session
         self.snapshot: MarketDataSnapshot | None = None
+        self.compare_symbols: tuple[str, ...] = ()
+        self.compare_snapshots: dict[str, MarketDataSnapshot] = {}
         self.message: str | None = None
 
     @override
@@ -53,11 +64,34 @@ class TickerScreen(WorkspaceScreen):
             snapshot = self._data_session().get_or_fetch(raw_symbol)
         except ValueError:
             self.snapshot = None
+            self.compare_symbols = ()
+            self.compare_snapshots = {}
             self.message = f"Invalid symbol: {raw_symbol.strip()}"
             self._refresh_body()
             return
 
         self.snapshot = snapshot
+        self.compare_symbols = self._compare_symbols(snapshot.symbol)
+        self.compare_snapshots = {snapshot.symbol: snapshot}
+        can_prefetch_compare = False
+        if snapshot.error is None and snapshot.history is not None:
+            try:
+                can_prefetch_compare = (
+                    compute_risk_metrics(snapshot.history.frame).volatility is not None
+                )
+            except MissingCloseColumnError:
+                can_prefetch_compare = False
+        if (
+            MIN_COMPARE_SYMBOLS <= len(self.compare_symbols) <= MAX_COMPARE_SYMBOLS
+            and snapshot.error is None
+            and can_prefetch_compare
+        ):
+            self.compare_snapshots.update(
+                {
+                    symbol: self._data_session().get_or_fetch(symbol)
+                    for symbol in self.compare_symbols[1:]
+                },
+            )
         self.message = None
         self._refresh_body()
 
@@ -96,8 +130,15 @@ class TickerScreen(WorkspaceScreen):
             self._price_chart(),
             "Metrics:",
             *render_key_value_rows(self._metric_rows()),
+            "Risk Metrics:",
+            *self._risk_metric_lines(),
             "Indicators:",
             *self._indicator_lines(),
+            *render_compare_panel(
+                self._compare_title(),
+                self.compare_symbols,
+                self.compare_snapshots,
+            ),
         )
 
     def _data_session(self) -> DataSession:
@@ -116,7 +157,10 @@ class TickerScreen(WorkspaceScreen):
     def _price_chart(self) -> str:
         if self.snapshot is None or self.snapshot.history is None:
             return "(no data)"
-        return render_series_chart(self.snapshot.history.frame["Close"])
+        try:
+            return render_series_chart(self.snapshot.history.frame["Close"])
+        except KeyError:
+            return "(missing close data)"
 
     def _metric_rows(self) -> tuple[tuple[str, str], ...]:
         if self.snapshot is None or self.snapshot.quote is None:
@@ -133,6 +177,39 @@ class TickerScreen(WorkspaceScreen):
             ("Sector", _format_text(profile.sector if profile else None)),
         )
 
+    def _risk_metric_lines(self) -> tuple[str, ...]:
+        if self.snapshot is None or self.snapshot.history is None:
+            return ("(no data)",)
+        benchmark_warning: str | None = None
+        try:
+            metrics = compute_risk_metrics(self.snapshot.history.frame)
+            if metrics.volatility is not None:
+                benchmark_frame, benchmark_warning = self._benchmark_frame()
+                metrics = compute_risk_metrics(
+                    self.snapshot.history.frame,
+                    benchmark_frame,
+                )
+        except MissingCloseColumnError:
+            return ("(missing close data)",)
+        rows = (
+            ("Volatility", _format_percent(metrics.volatility)),
+            ("Max Drawdown", _format_percent(metrics.max_drawdown)),
+            ("Sharpe", _format_decimal(metrics.sharpe)),
+            ("Sortino", _format_decimal(metrics.sortino)),
+            ("Historical VaR 95", _format_percent(metrics.historical_var_95)),
+            (f"Beta vs {DEFAULT_RISK_BENCHMARK}", _format_decimal(metrics.beta)),
+            (f"Alpha vs {DEFAULT_RISK_BENCHMARK}", _format_percent(metrics.alpha)),
+        )
+        if benchmark_warning is None:
+            return render_key_value_rows(rows)
+        return render_key_value_rows((*rows, ("Benchmark", benchmark_warning)))
+
+    def _benchmark_frame(self) -> tuple[pd.DataFrame | None, str | None]:
+        benchmark = self._data_session().get_or_fetch(DEFAULT_RISK_BENCHMARK)
+        if benchmark.error is not None or benchmark.history is None:
+            return None, f"{DEFAULT_RISK_BENCHMARK} unavailable"
+        return benchmark.history.frame, None
+
     def _indicator_lines(self) -> tuple[str, ...]:
         if self.snapshot is None or self.snapshot.history is None:
             return ("(no data)",)
@@ -144,6 +221,19 @@ class TickerScreen(WorkspaceScreen):
             return ("(no data)",)
         latest = indicators.tail(1).T.rename(columns={indicators.index[-1]: "latest"})
         return render_tail_table(latest, rows=len(latest))
+
+    def _compare_symbols(self, symbol: str) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((symbol, *self.state.selected_symbols)))
+
+    def _compare_title(self) -> str:
+        if self.snapshot is None:
+            return "Compare: ticker vs peers"
+        peers = tuple(
+            symbol for symbol in self.compare_symbols if symbol != self.snapshot.symbol
+        )
+        if len(peers) == 0:
+            return f"Compare: {self.snapshot.symbol} vs peers"
+        return f"Compare: {self.snapshot.symbol} vs {', '.join(peers)}"
 
 
 def _format_money(value: float | None, currency: str | None) -> str:
@@ -157,6 +247,12 @@ def _format_percent(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value:.2%}"
+
+
+def _format_decimal(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.2f}"
 
 
 def _format_int(value: int | None) -> str:

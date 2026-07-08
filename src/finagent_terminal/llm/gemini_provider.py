@@ -102,10 +102,15 @@ class GeminiTransport:
                     json=payload,
                 )
                 _ = response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise ProviderCallError(
+                provider=ProviderName.GEMINI.value,
+                message=f"HTTP {exc.response.status_code}",
+            ) from exc
         except httpx.HTTPError as exc:
             raise ProviderCallError(
                 provider=ProviderName.GEMINI.value,
-                message=str(exc),
+                message=f"HTTP request failed ({exc.__class__.__name__})",
             ) from exc
 
         return parse_gemini_response_text(response.text)
