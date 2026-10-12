@@ -202,7 +202,7 @@ def test_sdmx_picks_matching_rows_from_a_multi_series_csv() -> None:
         return httpx.Response(
             200,
             content=(
-                "﻿DATAFLOW,REF_AREA,FREQ,TIME_PERIOD,OBS_VALUE\n"
+                "\ufeffDATAFLOW,REF_AREA,FREQ,TIME_PERIOD,OBS_VALUE\n"
                 "X,USA,M,2026-08,100.3\n"
                 "X,KOR,M,2026-08,100.6\n"
                 "X,KOR,M,2026-09,\n"

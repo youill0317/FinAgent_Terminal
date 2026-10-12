@@ -387,7 +387,7 @@ class SdmxSeries:
 
 
 def parse_sdmx_csv(text: str) -> list[dict[str, str]]:
-    reader = csv.reader(io.StringIO(text.lstrip("﻿")))
+    reader = csv.reader(io.StringIO(text.lstrip("\ufeff")))
     header = next(reader, None)
     if header is None or "OBS_VALUE" not in header or "TIME_PERIOD" not in header:
         raise SourceError("SDMX 응답에 TIME_PERIOD/OBS_VALUE 열이 없습니다")
