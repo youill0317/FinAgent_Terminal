@@ -3,30 +3,24 @@ requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "finagent-terminal"
-version = "0.1.0"
-description = "Python terminal workspace for market research."
+name = "finagent"
+version = "0.2.0"
+description = "Local macro dashboard on public data only (FRED, Treasury, NY Fed, BoK ECOS, ECB, BIS, OECD)."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=0.40",
-    "google-genai>=1.0",
+    "fastapi>=0.115",
     "httpx>=0.27",
-    "numpy>=2.0",
-    "openai>=1.0",
-    "pandas>=2.2",
     "pydantic>=2.8",
-    "textual>=0.86",
-    "yfinance>=0.2",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
-finagent = "finagent_terminal.__main__:main"
+finagent = "finagent.cli:main"
 
 [dependency-groups]
 dev = [
     "basedpyright>=1.21",
-    "pandas-stubs>=2.2",
     "pytest>=8",
     "ruff>=0.8",
 ]
@@ -51,6 +45,12 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
+    # User-facing Korean messages are written inline at the raise site, and
+    # labels use the typographic minus sign.
+    "EM101",
+    "EM102",
+    "RUF001",
+    "TRY003",
     "COM812",
     "CPY001",
     "D100",
