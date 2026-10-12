@@ -56,6 +56,10 @@ SOURCE_NAME_ALLOWLIST: Final = {
     "src/finagent_terminal/data/sec_sources.py",
     "src/finagent_terminal/data/source_routing.py",
     "src/finagent_terminal/data/sources.py",
+    "src/finagent_terminal/macro/dashboard.py",
+    "src/finagent_terminal/macro/http.py",
+    "src/finagent_terminal/macro/models.py",
+    "src/finagent_terminal/macro/sources.py",
     "src/finagent_terminal/reports/source_context.py",
     "src/finagent_terminal/ui/screens/news.py",
 }
