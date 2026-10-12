@@ -8,3 +8,4 @@ __pycache__/
 .codegraph
 .codegraph/
 .serena/
+.env
