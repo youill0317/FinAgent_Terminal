@@ -20,6 +20,7 @@ from finagent.models import (
     RegimeCell,
     SourceSummary,
     Spread,
+    ViewOption,
 )
 from finagent.sources import (
     FredSeries,
@@ -57,17 +58,41 @@ SOURCE_NAMES: Final[tuple[tuple[SourceId, str], ...]] = (
 type Outcome = Series | SourceError
 
 
-async def build_dashboard(
+async def build_dashboard(  # noqa: PLR0913
     ctx: FetchContext,
     now: datetime,
     *,
     demo: bool = False,
+    deep: frozenset[str] = catalog.ALL_VIEWS,
+    cache: dict[Fetch, Series] | None = None,
+    previous: Dashboard | None = None,
 ) -> Dashboard:
+    """Fetch what the view needs and assemble the dashboard.
+
+    ``deep`` names the panels shown in full (plus ``curve`` for the yield
+    curve chart); other panels show only their core rows. Series already in
+    ``cache`` are not fetched again, and new ones are added to it. With
+    ``previous`` its calendar and FOMC projections are reused instead of
+    fetched, so changing the view only fetches the newly shown series.
+    """
     started = time.perf_counter()
     today = now.date()
-    fetches = _all_fetches()
-    results = await asyncio.gather(*(_run(fetch, ctx, today) for fetch in fetches))
-    outcomes: dict[Fetch, Outcome] = dict(zip(fetches, results, strict=True))
+    specs = [(spec, catalog.shown(spec, deep)) for spec in catalog.PANELS]
+    fetches = _all_fetches(
+        [indicator for _, indicators in specs for indicator in indicators],
+        curve=catalog.CURVE_VIEW in deep,
+    )
+    known = {} if cache is None else cache
+    todo = [fetch for fetch in fetches if fetch not in known]
+    results = await asyncio.gather(*(_run(fetch, ctx, today) for fetch in todo))
+    fetched: dict[Fetch, Outcome] = dict(zip(todo, results, strict=True))
+    if cache is not None:
+        cache.update(
+            {f: r for f, r in fetched.items() if not isinstance(r, SourceError)}
+        )
+    outcomes: dict[Fetch, Outcome] = {
+        fetch: fetched[fetch] if fetch in fetched else known[fetch] for fetch in fetches
+    }
 
     panels = tuple(
         Panel(
@@ -75,14 +100,18 @@ async def build_dashboard(
             key=spec.key,
             title=spec.title,
             note=spec.note,
-            rows=tuple(_row(indicator, outcomes) for indicator in spec.indicators),
+            rows=tuple(_row(indicator, outcomes) for indicator in indicators),
         )
-        for spec in catalog.PANELS
+        for spec, indicators in specs
+        if indicators
     )
     rows = {row.id: row for panel in panels for row in panel.rows}
-    calendar, projections = await asyncio.gather(
-        _calendar(ctx, today), _projections(ctx, today, rows)
-    )
+    if previous is None:
+        calendar, projections = await asyncio.gather(
+            _calendar(ctx, today), _projections(ctx, today, rows)
+        )
+    else:
+        calendar, projections = previous.calendar, previous.projections
     return Dashboard(
         version=__version__,
         generated_at=now.isoformat(timespec="seconds"),
@@ -91,27 +120,40 @@ async def build_dashboard(
         sources=_summaries(outcomes),
         tape=catalog.TAPE,
         regime=_regime(rows),
-        curve=_curve(outcomes),
+        curve=_curve(outcomes) if catalog.CURVE_VIEW in deep else None,
         spread=_spread(outcomes),
         projections=projections,
         panels=panels,
         calendar=calendar,
+        deep=tuple(view.id for view in catalog.VIEWS if view.id in deep),
+        views=tuple(
+            ViewOption(
+                id=view.id,
+                key=view.key,
+                title=view.title,
+                core=view.core,
+                extra=view.extra,
+            )
+            for view in catalog.VIEWS
+        ),
     )
 
 
-def _all_fetches() -> tuple[Fetch, ...]:
+def _all_fetches(
+    indicators: Iterable[catalog.Indicator], *, curve: bool
+) -> tuple[Fetch, ...]:
     seen: dict[Fetch, None] = {}
-    for spec in catalog.PANELS:
-        for indicator in spec.indicators:
-            parts = (
-                indicator.fetch.parts()
-                if isinstance(indicator.fetch, Ratio)
-                else (indicator.fetch,)
-            )
-            for part in parts:
-                seen[part] = None
-    for _, series_id in catalog.CURVE_TENORS:
-        seen[FredSeries(series_id, catalog.CURVE_YEARS)] = None
+    for indicator in indicators:
+        parts = (
+            indicator.fetch.parts()
+            if isinstance(indicator.fetch, Ratio)
+            else (indicator.fetch,)
+        )
+        for part in parts:
+            seen[part] = None
+    if curve:
+        for _, series_id in catalog.CURVE_TENORS:
+            seen[FredSeries(series_id, catalog.CURVE_YEARS)] = None
     seen[catalog.SPREAD_SERIES] = None
     seen[catalog.RECESSION_SERIES] = None
     return tuple(seen)

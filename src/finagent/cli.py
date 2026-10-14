@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
-from finagent import __version__
+from finagent import __version__, catalog
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
 
@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 HOST: Final = "127.0.0.1"  # local only; the dashboard is never exposed on the network
 DEFAULT_PORT: Final = 8765
 DEFAULT_ENV_FILE: Final = Path(".env")
+# Kept next to .env in the folder the app is started from.
+DEFAULT_SETTINGS_FILE: Final = Path("finagent.settings.json")
 BROWSER_DELAY_SECONDS: Final = 1.0
 
 
@@ -31,6 +33,7 @@ class Options(argparse.Namespace):
     demo: bool = False
     check: bool = False
     env_file: Path | None = None
+    settings: Path | None = None
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -60,14 +63,22 @@ def resolve_env(env_file: Path | None, environ: Mapping[str, str]) -> dict[str, 
     return {**from_file, **environ}
 
 
-def build_service(*, demo: bool, env: Mapping[str, str]) -> DashboardService:
+def resolve_settings(settings: Path | None) -> Path:
+    """The view settings file; by default next to .env in the current folder."""
+    return (settings if settings is not None else DEFAULT_SETTINGS_FILE).absolute()
+
+
+def build_service(
+    *, demo: bool, env: Mapping[str, str], settings_path: Path | None = None
+) -> DashboardService:
     if not demo:
-        return DashboardService(env)
+        return DashboardService(env, settings_path=settings_path)
     transport = demo_transport(local_now().date())
     return DashboardService(
         DEMO_KEYS,
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         demo=True,
+        settings_path=settings_path,
     )
 
 
@@ -94,13 +105,19 @@ def parse_args(argv: Sequence[str] | None) -> Options:
         type=Path,
         help="FRED_API_KEY, ECOS_API_KEY를 읽을 파일 (기본: 현재 폴더의 .env)",
     )
+    _ = parser.add_argument(
+        "--settings",
+        type=Path,
+        help="보기 설정 파일 (기본: 현재 폴더의 finagent.settings.json)",
+    )
     return parser.parse_args(argv, namespace=Options())
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     env = resolve_env(args.env_file, os.environ)
-    service = build_service(demo=args.demo, env=env)
+    settings_path = resolve_settings(args.settings)
+    service = build_service(demo=args.demo, env=env, settings_path=settings_path)
 
     if args.check:
         return run_check(service)
@@ -111,6 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     url = f"http://{HOST}:{args.port}/"
     print(f"FinAgent {__version__}: {url}  (종료: Ctrl+C)")  # noqa: T201
+    print(f"보기 설정: {settings_path}")  # noqa: T201
     if not args.no_browser:
         threading.Timer(BROWSER_DELAY_SECONDS, webbrowser.open, args=(url,)).start()
     uvicorn.run(create_app(service), host=HOST, port=args.port, log_level="warning")
@@ -118,7 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def run_check(service: DashboardService) -> int:
-    dashboard = asyncio.run(service.get())
+    dashboard = asyncio.run(service.get(deep=catalog.ALL_VIEWS))
     print(check_report(dashboard))  # noqa: T201
     return 0 if all(source.state == "ok" for source in dashboard.sources) else 1
 

@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING, Annotated
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, Response
+from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from finagent.models import Dashboard
     from finagent.service import DashboardService
 
 WEB = files("finagent") / "web"
@@ -18,6 +20,10 @@ STATIC_TYPES = {
     "app.css": "text/css; charset=utf-8",
     "app.js": "text/javascript; charset=utf-8",
 }
+
+
+class ViewBody(BaseModel):
+    deep: list[str]
 
 
 def create_app(service: DashboardService, *, warm: bool = True) -> FastAPI:
@@ -47,11 +53,18 @@ def create_app(service: DashboardService, *, warm: bool = True) -> FastAPI:
     async def dashboard(  # pyright: ignore[reportUnusedFunction]
         refresh: Annotated[bool, Query()] = False,
     ) -> Response:
-        dashboard = await service.get(refresh=refresh)
-        return Response(
-            dashboard.model_dump_json(),
-            media_type="application/json",
-            headers={"Cache-Control": "no-store"},
-        )
+        return _json(await service.get(refresh=refresh))
+
+    @app.put("/api/settings")
+    async def settings(body: ViewBody) -> Response:  # pyright: ignore[reportUnusedFunction]
+        return _json(await service.set_view(frozenset(body.deep)))
 
     return app
+
+
+def _json(dashboard: Dashboard) -> Response:
+    return Response(
+        dashboard.model_dump_json(),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )

@@ -1046,3 +1046,112 @@ SEP_ROWS: Final = (
 # Vintages published within this window; SEP releases come every quarter.
 SEP_LOOKBACK_DAYS: Final = 400
 SEP_MAX_YEARS: Final = 4
+
+
+# ---------------------------------------------------------------- default view
+
+# Indicators shown by default: the macro inputs a single-company analysis needs
+# (economic indicators, global monetary policy, economic cycle, market
+# sentiment), plus every row the tape, regime row and SEP table read.
+# Everything else in a panel appears only when that panel's deep view is on.
+CORE: Final = frozenset(
+    {
+        # Economic indicators: GDP, CPI/PPI, jobs, retail sales, industrial
+        # production; the Philadelphia Fed survey stands in for a PMI.
+        "us_gdp",
+        "us_gdp_yoy",
+        "us_indpro",
+        "us_retail",
+        "us_philly",
+        "us_payrolls",
+        "us_unrate",
+        "us_cpi",
+        "us_core_cpi",
+        "us_pce",
+        "us_core_pce",
+        "us_ppi",
+        "kr_gdp",
+        "kr_cpi",
+        "kr_ppi",
+        "kr_exports",
+        "kr_unrate",
+        # Monetary policy at the Fed, BOK, ECB, BOJ and PBOC; major economies.
+        "us_fftu",
+        "us_fftl",
+        "us_10y",
+        "kr_base",
+        "kr_ktb10",
+        "ecb_dfr",
+        "ea_hicp",
+        "ea_unrate",
+        "boj_rate",
+        "pboc_rate",
+        "us_dollar",
+        "kr_usdkrw",
+        # Economic cycle: household and corporate debt, money supply, turning
+        # points.
+        "us_m2",
+        "kr_m2",
+        "kr_household_credit",
+        "us_hh_debt",
+        "kr_hh_debt",
+        "kr_private_credit",
+        "cn_private_credit",
+        "us_ci_loans",
+        "us_sahm",
+        "us_10y2y",
+        "us_10y3m",
+        "kr_leading",
+        "us_cli",
+        "cn_cli",
+        # Market sentiment.
+        "us_sp500",
+        "us_nasdaq",
+        "kr_kospi",
+        "kr_kosdaq",
+        "us_vix",
+        "us_hy_oas",
+        "us_nfci",
+        "us_umich",
+        "kr_csi",
+        "wti",
+    }
+)
+
+CURVE_VIEW: Final = "curve"
+
+
+@dataclass(frozen=True, slots=True)
+class ViewSpec:
+    """One switch in the settings: a panel's deep rows, or the curve chart."""
+
+    id: str
+    key: str
+    title: str
+    core: int
+    extra: int
+
+
+VIEWS: Final = (
+    *(
+        ViewSpec(
+            spec.id,
+            spec.key,
+            spec.title,
+            core=sum(indicator.id in CORE for indicator in spec.indicators),
+            extra=sum(indicator.id not in CORE for indicator in spec.indicators),
+        )
+        for spec in PANELS
+    ),
+    ViewSpec(CURVE_VIEW, "YC", "미 국채 수익률 곡선", core=0, extra=len(CURVE_TENORS)),
+)
+ALL_VIEWS: Final = frozenset(view.id for view in VIEWS)
+# The default: every panel shows its core rows only.
+CORE_VIEW: Final[frozenset[str]] = frozenset()
+
+
+def shown(spec: PanelSpec, deep: frozenset[str]) -> tuple[Indicator, ...]:
+    """The rows a panel shows: all of them with its deep view on, else the core."""
+    if spec.id in deep:
+        return spec.indicators
+    return tuple(indicator for indicator in spec.indicators if indicator.id in CORE)
