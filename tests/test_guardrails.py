@@ -12,6 +12,8 @@ from finagent.fetch import SOURCE_LANES
 ROOT: Final = Path(__file__).resolve().parents[1]
 SRC: Final = ROOT / "src" / "finagent"
 SOURCES_MODULE: Final = SRC / "sources.py"
+# The one module allowed to write a file: the saved view (panel ids only).
+SETTINGS_MODULE: Final = SRC / "settings.py"
 
 PERSISTENCE_TERMS: Final = (
     r"\bsqlite\b",
@@ -74,7 +76,15 @@ def _hits(pattern: re.Pattern[str], paths: list[Path]) -> list[str]:
 
 
 def test_source_never_persists_fetched_data() -> None:
-    assert _hits(PERSISTENCE_PATTERN, _python_files()) == []
+    others = [path for path in _python_files() if path != SETTINGS_MODULE]
+
+    assert _hits(PERSISTENCE_PATTERN, others) == []
+
+
+def test_settings_module_never_sees_fetched_data() -> None:
+    imports = re.compile(r"^\s*(?:import|from)\s+finagent\.(?!catalog\b)")
+
+    assert _hits(imports, [SETTINGS_MODULE]) == []
 
 
 def test_forbidden_packages_are_not_declared_or_imported() -> None:

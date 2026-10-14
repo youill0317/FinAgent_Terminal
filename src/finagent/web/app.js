@@ -136,6 +136,7 @@ function renderStatus(d) {
 }
 function renderNotices(d) {
   const out = [];
+  if (d.settings_error) out.push(`<div class="notice err">${esc(d.settings_error)}</div>`);
   if (d.demo) out.push('<div class="notice">데모 모드: 수치는 모두 예시 값입니다. 실제 데이터는 <code>finagent</code>를 키와 함께 실행하세요.</div>');
   d.sources.filter((s) => s.state === "missing_key").forEach((s) => {
     const k = KEY_HELP[s.id];
@@ -266,18 +267,6 @@ function calendarPanel(d) {
   return `<article class="pn" id="calendar"><div class="pn-h"><b><span>CAL</span>앞으로 7일 미국 발표</b><small>FRED releases/dates</small></div><div class="pn-b">${body}</div></article>`;
 }
 // ---------------------------------------------------------------- view settings
-const VIEW_KEY = "finagent.deep";
-function readDeep() {
-  try {
-    const v = JSON.parse(localStorage.getItem(VIEW_KEY) || "[]");
-    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
-  } catch (e) { return []; }
-}
-function saveDeep(list) {
-  try { localStorage.setItem(VIEW_KEY, JSON.stringify(list)); } catch (e) { /* view still applies for this tab */ }
-}
-let deep = readDeep();
-
 function viewLabel(d) {
   if (!d.deep.length) return "핵심";
   if (d.deep.length === d.views.length) return "전체";
@@ -285,8 +274,8 @@ function viewLabel(d) {
 }
 function setDeep(list) {
   const next = [...new Set(list)].sort();
-  if (next.join(",") === [...deep].sort().join(",")) return;
-  deep = next; saveDeep(deep); load(false);
+  if (!data || next.join(",") === [...data.deep].sort().join(",")) return;
+  load(false, next);
 }
 const dlg = $("settings");
 function checkedViews() { return [...dlg.querySelectorAll("#viewOpts input:checked")].map((i) => i.value); }
@@ -308,6 +297,7 @@ function openSettings() {
       + `<span class="k">${esc(v.key)}</span><span>${esc(v.title)}</span><small>${note}</small></label></li>`;
   }).join("");
   summarize();
+  $("viewFile").textContent = data.settings_file ? `설정은 ${data.settings_file} 파일에 저장됩니다.` : "설정은 앱이 켜져 있는 동안만 유지됩니다.";
   dlg.returnValue = "";
   dlg.showModal();
 }
@@ -323,7 +313,7 @@ $("settingsBtn").addEventListener("click", openSettings);
 $("panels").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-view]");
   if (!b) return;
-  const id = b.dataset.view;
+  const id = b.dataset.view, deep = data ? data.deep : [];
   setDeep(deep.includes(id) ? deep.filter((x) => x !== id) : [...deep, id]);
 });
 
@@ -335,20 +325,21 @@ function render(d) {
 
 // ---------------------------------------------------------------- load / refresh
 const btn = $("refreshBtn"), toast = $("toast");
-let busy = false, queued = false, toastTimer;
+let busy = false, queuedView = null, toastTimer;
 function say(msg) { toast.textContent = msg; toast.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.hidden = true; }, 2800); }
 
-async function load(refresh) {
-  if (busy) { if (!refresh) queued = true; return; }
+// view: a list of panel ids to switch to and save; otherwise the saved view.
+async function load(refresh, view) {
+  if (busy) { if (view) queuedView = view; return; }
   const before = data ? data.deep.join(",") : null;
   busy = true; btn.disabled = true;
   if (refresh && data) {
     document.querySelectorAll("#status .src").forEach((s) => { s.dataset.s = "loading"; });
   }
   try {
-    const q = new URLSearchParams({deep: deep.join(",")});
-    if (refresh) q.set("refresh", "true");
-    const res = await fetch(`/api/dashboard?${q}`, {cache: "no-store"});
+    const res = view
+      ? await fetch("/api/settings", {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify({deep: view}), cache: "no-store"})
+      : await fetch(`/api/dashboard${refresh ? "?refresh=true" : ""}`, {cache: "no-store"});
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const d = await res.json();
     render(d);
@@ -366,7 +357,7 @@ async function load(refresh) {
     if (data) renderStatus(data);
   } finally {
     busy = false; btn.disabled = false;
-    if (queued) { queued = false; load(false); }
+    if (queuedView) { const v = queuedView; queuedView = null; load(false, v); }
   }
 }
 

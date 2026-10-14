@@ -309,13 +309,20 @@ def test_server_routes() -> None:
             refreshed = await client.get("/api/dashboard", params={"refresh": "true"})
             assert refreshed.status_code == 200
             assert refreshed.headers["cache-control"] == "no-store"
-            deep = await client.get(
-                "/api/dashboard", params={"deep": "housing,curve,../etc"}
+            changed = await client.put(
+                "/api/settings", json={"deep": ["curve", "housing", "../etc"]}
             )
-            assert Dashboard.model_validate_json(deep.text).deep == (
+            assert Dashboard.model_validate_json(changed.text).deep == (
                 "housing",
                 "curve",
             )
+            again = await client.get("/api/dashboard")
+            assert Dashboard.model_validate_json(again.text).deep == (
+                "housing",
+                "curve",
+            )
+            bad = await client.put("/api/settings", json={"deep": "housing"})
+            assert bad.status_code == 422
 
     asyncio.run(scenario())
 

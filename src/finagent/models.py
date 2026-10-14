@@ -132,3 +132,5 @@ class Dashboard(Frozen):
     calendar: tuple[CalendarEntry, ...]
     deep: tuple[str, ...]
     views: tuple[ViewOption, ...]
+    settings_file: str | None = None
+    settings_error: str | None = None

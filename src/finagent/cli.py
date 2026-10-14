@@ -13,6 +13,7 @@ import httpx
 from finagent import __version__, catalog
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
+from finagent.settings import default_path
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -31,6 +32,7 @@ class Options(argparse.Namespace):
     demo: bool = False
     check: bool = False
     env_file: Path | None = None
+    settings: Path | None = None
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -60,14 +62,17 @@ def resolve_env(env_file: Path | None, environ: Mapping[str, str]) -> dict[str, 
     return {**from_file, **environ}
 
 
-def build_service(*, demo: bool, env: Mapping[str, str]) -> DashboardService:
+def build_service(
+    *, demo: bool, env: Mapping[str, str], settings_path: Path | None = None
+) -> DashboardService:
     if not demo:
-        return DashboardService(env)
+        return DashboardService(env, settings_path=settings_path)
     transport = demo_transport(local_now().date())
     return DashboardService(
         DEMO_KEYS,
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         demo=True,
+        settings_path=settings_path,
     )
 
 
@@ -94,13 +99,19 @@ def parse_args(argv: Sequence[str] | None) -> Options:
         type=Path,
         help="FRED_API_KEY, ECOS_API_KEY를 읽을 파일 (기본: 현재 폴더의 .env)",
     )
+    _ = parser.add_argument(
+        "--settings",
+        type=Path,
+        help="보기 설정 파일 (기본: ~/.config/finagent/settings.json)",
+    )
     return parser.parse_args(argv, namespace=Options())
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     env = resolve_env(args.env_file, os.environ)
-    service = build_service(demo=args.demo, env=env)
+    settings_path = args.settings or default_path(os.environ, Path.home())
+    service = build_service(demo=args.demo, env=env, settings_path=settings_path)
 
     if args.check:
         return run_check(service)
@@ -111,6 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     url = f"http://{HOST}:{args.port}/"
     print(f"FinAgent {__version__}: {url}  (종료: Ctrl+C)")  # noqa: T201
+    print(f"보기 설정: {settings_path}")  # noqa: T201
     if not args.no_browser:
         threading.Timer(BROWSER_DELAY_SECONDS, webbrowser.open, args=(url,)).start()
     uvicorn.run(create_app(service), host=HOST, port=args.port, log_level="warning")
