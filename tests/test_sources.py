@@ -17,6 +17,7 @@ from finagent.sources import (
     SdmxSeries,
     ecos_period,
     fred_release_dates,
+    fred_vintages,
 )
 
 if TYPE_CHECKING:
@@ -251,6 +252,71 @@ def test_release_dates_are_limited_to_the_window() -> None:
     )
 
     assert releases == ((date(2026, 10, 14), "Consumer Price Index"),)
+
+
+def test_vintages_pick_the_current_and_the_replaced_projection() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        rows = [
+            ("2026-06-17", "2026-09-16", "2026-01-01", "3.9"),
+            ("2026-06-17", "2026-09-16", "2027-01-01", "3.6"),
+            ("2026-09-17", "9999-12-31", "2026-01-01", "3.6"),
+            ("2026-09-17", "9999-12-31", "2027-01-01", "3.4"),
+            ("2026-09-17", "9999-12-31", "2028-01-01", "3.1"),
+            ("2025-10-12", "9999-12-31", "2025-01-01", "4.4"),
+        ]
+        return json_response(
+            {
+                "observations": [
+                    {"realtime_start": a, "realtime_end": b, "date": c, "value": v}
+                    for a, b, c, v in rows
+                ]
+            }
+        )
+
+    latest, prior = run(
+        handler, lambda ctx: fred_vintages(ctx, "FEDTARMD", date(2025, 10, 12))
+    )
+
+    assert latest.published == date(2026, 9, 17)
+    assert latest.series == (
+        (date(2025, 1, 1), 4.4),
+        (date(2026, 1, 1), 3.6),
+        (date(2027, 1, 1), 3.4),
+        (date(2028, 1, 1), 3.1),
+    )
+    assert prior is not None
+    assert prior.published == date(2026, 6, 17)
+    assert dict(prior.series)[date(2027, 1, 1)] == 3.6
+    assert date(2028, 1, 1) not in dict(prior.series)
+    params = seen[0].url.params
+    assert params["realtime_start"] == "2025-10-12"
+    assert params["realtime_end"] == "9999-12-31"
+
+
+def test_vintages_without_an_earlier_release() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return json_response(
+            {
+                "observations": [
+                    {
+                        "realtime_start": "2026-09-17",
+                        "realtime_end": "9999-12-31",
+                        "date": "2026-09-17",
+                        "value": "3.0",
+                    }
+                ]
+            }
+        )
+
+    latest, prior = run(
+        handler, lambda ctx: fred_vintages(ctx, "FEDTARMDLR", date(2025, 10, 12))
+    )
+
+    assert latest.series == ((date(2026, 9, 17), 3.0),)
+    assert prior is None
 
 
 def test_server_errors_are_retried_once() -> None:

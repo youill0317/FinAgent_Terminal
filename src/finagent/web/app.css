@@ -122,6 +122,12 @@ table.t td.dt{color:var(--muted);font-size:10.5px}
 table.t td.sp{width:72px;padding-right:2px}
 table.t td.miss{color:var(--muted);font-size:11px;text-align:right}
 table.t td.err{color:var(--down);font-size:11px;text-align:right}
+table.t.sep td.n{min-width:150px}
+table.t.sep td.cur{color:var(--amber);font-weight:500;font-size:13px}
+table.t.sep td.pj{font-size:13px}
+table.t.sep td small{display:block;font-size:10.5px}
+table.t.sep td small.new{color:var(--cyan)}
+table.t.sep th.cur{color:var(--muted)}
 .spark{position:relative;width:70px;margin-left:auto}
 .spark svg{display:block;width:70px;height:20px;overflow:visible}
 tr.fresh td{animation:flash 1s ease-out}

@@ -86,6 +86,29 @@ class CalendarEntry(Frozen):
     source: str
 
 
+class ProjectionCell(Frozen):
+    value: float | None = None
+    prev: float | None = None
+
+
+class ProjectionRow(Frozen):
+    label: str
+    code: str
+    current: float | None
+    current_note: str
+    current_dec: int
+    years: tuple[ProjectionCell, ...]
+    longer_run: ProjectionCell | None
+
+
+class Projections(Frozen):
+    published: str
+    prior_published: str | None
+    years: tuple[str, ...]
+    rows: tuple[ProjectionRow, ...]
+    message: str | None = None
+
+
 class Dashboard(Frozen):
     version: str
     generated_at: str
@@ -96,5 +119,6 @@ class Dashboard(Frozen):
     regime: tuple[RegimeCell, ...]
     curve: Curve | None
     spread: Spread | None
+    projections: Projections | None
     panels: tuple[Panel, ...]
     calendar: tuple[CalendarEntry, ...]

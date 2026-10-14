@@ -195,6 +195,32 @@ function renderSpread(d) {
     xIdx: ticks, xFmt: (l) => labels.length <= 24 ? l.slice(2).replace("-", ".") : l.slice(0, 4),
     tip: (i) => `<b style="color:var(--amber)">${esc(labels[i])}</b><br>${v[i] > 0 ? "+" : ""}${v[i].toFixed(2)}%p${v[i] < 0 ? " · 역전" : ""}`});
 }
+function sepCell(c) {
+  if (!c || c.value === null) return `<td class="pj flat">—</td>`;
+  let note;
+  if (c.prev === null) note = `<small class="new">신규</small>`;
+  else {
+    const diff = c.value - c.prev;
+    note = Math.abs(diff) < 0.05 ? `<small class="flat">— 0</small>`
+      : `<small class="${diff > 0 ? "up" : "down"}">${diff > 0 ? "▲" : "▼"} ${num(Math.abs(diff), 1)}</small>`;
+  }
+  return `<td class="pj">${num(c.value, 1)}${note}</td>`;
+}
+function renderSep(d) {
+  const p = d.projections, host = $("sepPanel");
+  const head = (small) => `<div class="pn-h"><b><span>SEP</span>FOMC 경제전망 요약</b><small>${small}</small></div>`;
+  if (!p) { host.innerHTML = head("FRED") + `<div class="pn-b"><div class="cal-empty">FRED 키가 있어야 표시됩니다.</div></div>`; return; }
+  if (!p.rows.length) { host.innerHTML = head("FRED") + `<div class="pn-b"><div class="cal-empty">받지 못했습니다. ${esc(p.message || "")}</div></div>`; return; }
+  const since = p.prior_published ? ` · 아래 작은 숫자는 ${esc(p.prior_published)} 발표 대비` : "";
+  const hasLr = p.rows.some((r) => r.longer_run);
+  host.innerHTML = head(`${esc(p.published)} 발표${since}`)
+    + `<div class="tw"><table class="t sep"><thead><tr><th>지표</th><th class="cur">현재</th>${p.years.map((y) => `<th>${esc(y)}</th>`).join("")}${hasLr ? "<th>장기</th>" : ""}</tr></thead><tbody>`
+    + p.rows.map((r) => `<tr><td class="n"><div>${esc(r.label)}</div><code>${esc(r.code)}</code></td>`
+      + `<td class="cur">${r.current === null ? "—" : num(r.current, r.current_dec)}<small class="flat">${esc(r.current_note)}</small></td>`
+      + r.years.map(sepCell).join("") + (hasLr ? (r.longer_run ? sepCell(r.longer_run) : `<td class="pj flat">—</td>`) : "") + `</tr>`).join("")
+    + `</tbody></table></div>`
+    + (p.message ? `<div class="note" style="padding:4px 8px">일부를 받지 못했습니다. ${esc(p.message)}</div>` : "");
+}
 function renderPanels(d) {
   const host = $("panels");
   host.innerHTML = d.panels.map((p) => `<article class="pn" id="${esc(p.id)}">
@@ -230,7 +256,7 @@ function calendarPanel(d) {
 function render(d) {
   data = d;
   renderStatus(d); renderNotices(d); renderTape(d); renderRegime(d);
-  renderCurve(d); renderSpread(d); renderPanels(d);
+  renderCurve(d); renderSpread(d); renderSep(d); renderPanels(d);
 }
 
 // ---------------------------------------------------------------- load / refresh

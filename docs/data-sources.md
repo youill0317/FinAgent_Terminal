@@ -52,7 +52,11 @@ API를 실제로 호출해 본 것은 아닙니다.
 | 글로벌 정책금리 · 환율 | 2 | DEXCHUS, DTWEXEMEGS |
 | 원자재 | 8 | DCOILWTICO, DCOILBRENTEU, DHHNGSP, PCOPPUSDM, PALUMUSDM, PIORECRUSDM, PWHEAMTUSDM, PALLFNFINDEXM |
 
-수익률 곡선용 DGS1MO~DGS30(11개)과 경기침체 음영용 USREC도 받습니다. 엔드포인트는 `series/observations`, `releases/dates` 두 개를 씁니다.
+수익률 곡선용 DGS1MO~DGS30(11개)과 경기침체 음영용 USREC도 받습니다.
+
+FOMC 경제전망 패널은 FEDTARMD, GDPC1MD, UNRATEMD, PCECTPIMD, JCXFEMD(목표 연도별
+중앙값)와 FEDTARMDLR, GDPC1MDLR, UNRATEMDLR, PCECTPIMDLR(장기 중앙값) 9개를
+`realtime_start`/`realtime_end`로 받아 최신 발표와 직전 발표를 비교합니다. 엔드포인트는 `series/observations`, `releases/dates` 두 개를 씁니다.
 
 - ICE 시계열(BAMLH0A0HYM2, BAMLC0A0CM)은 FRED가 최근 3년치만 제공합니다.
 - 2025년 10월 CPS 계열(UNRATE 등)은 셧다운으로 결측(".")입니다. 파서가 "."을 결측으로 처리합니다(`sources.parse_number`).
@@ -151,7 +155,6 @@ API를 실제로 호출해 본 것은 아닙니다.
 | ID | 이름 | 참고 |
 |---|---|---|
 | STLENI | 세인트루이스 연은 경제뉴스지수 | 나우캐스트 |
-| FEDTARMD, UNRATEMD, PCECTPIMD | FOMC 경제전망 중앙값 | 미래 연도 관측값이 섞여 있어 최신값 처리를 따로 해야 함 |
 | GDPPOT, NROU | CBO 잠재 GDP, 자연실업률 | 미래 구간 포함 |
 | EXPINF1YR, RECPROUSM156N | 클리블랜드 연은 기대인플레, 경기침체 확률 | 모델 추정 |
 | DJIA | 다우존스 | S&P DJI © |

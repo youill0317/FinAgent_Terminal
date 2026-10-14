@@ -214,6 +214,7 @@ PANELS: Final = (
         "BEA · Census · FRB · 지역 연은",
         (
             fred("us_gdp", "실질 GDP (전기비 연율)", "A191RL1Q225SBEA", "Q", PCT1),
+            fred("us_gdp_yoy", "실질 GDP YoY", "A191RO1Q156NBEA", "Q", PCT1),
             fred("us_gdpnow", "GDPNow (애틀랜타 연은)", "GDPNOW", "Q", PCT1),
             fred("us_indpro", "산업생산 YoY", "INDPRO", "M", PCT1, "yoy"),
             fred("us_tcu", "설비가동률", "TCU", "M", PCT1),
@@ -387,6 +388,7 @@ PANELS: Final = (
         "FRB · NY Fed · Treasury",
         (
             fred("us_fftu", "연방기금 목표 상단", "DFEDTARU", "D", PCT2),
+            fred("us_fftl", "연방기금 목표 하단", "DFEDTARL", "D", PCT2),
             fred("us_iorb", "지급준비금 이자율 IORB", "IORB", "D", PCT2),
             nyfed("us_effr", "실효 연방기금금리", "unsecured/effr"),
             nyfed("us_obfr", "오버나이트 은행 자금금리 OBFR", "unsecured/obfr"),
@@ -1008,3 +1010,39 @@ CALENDAR_RELEASES: Final = (
     ("Chicago Fed National Financial Conditions", "NFCI", "Chicago Fed"),
 )
 CALENDAR_DAYS: Final = 7
+
+
+@dataclass(frozen=True, slots=True)
+class SepRow:
+    """One FOMC Summary of Economic Projections median and what to compare it to.
+
+    ``series_id`` is dated by target year; ``longer_run_id`` holds the
+    longer-run median. ``current`` lists dashboard row ids whose latest values
+    are averaged (the federal funds target range is shown as its midpoint).
+    """
+
+    label: str
+    series_id: str
+    longer_run_id: str | None
+    current: tuple[str, ...]
+    current_note: str
+    current_dec: int = 1
+
+
+SEP_ROWS: Final = (
+    SepRow(
+        "연방기금금리",
+        "FEDTARMD",
+        "FEDTARMDLR",
+        ("us_fftl", "us_fftu"),
+        "목표 범위 중간값",
+        current_dec=2,
+    ),
+    SepRow("실질 GDP 성장률", "GDPC1MD", "GDPC1MDLR", ("us_gdp_yoy",), "최근 분기 YoY"),
+    SepRow("실업률", "UNRATEMD", "UNRATEMDLR", ("us_unrate",), "최근 월"),
+    SepRow("PCE 물가", "PCECTPIMD", "PCECTPIMDLR", ("us_pce",), "최근 월 YoY"),
+    SepRow("근원 PCE 물가", "JCXFEMD", None, ("us_core_pce",), "최근 월 YoY"),
+)
+# Vintages published within this window; SEP releases come every quarter.
+SEP_LOOKBACK_DAYS: Final = 400
+SEP_MAX_YEARS: Final = 4

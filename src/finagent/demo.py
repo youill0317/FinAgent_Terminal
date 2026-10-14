@@ -106,6 +106,10 @@ FRED: Final[dict[str, Walk]] = {
     "DCOILBRENTEU": _w("D", (4, 85), (1, 74), (0, 67.9), vol=1.2),
     "DHHNGSP": _w("D", (4, 2.5), (1, 3.2), (0, 3.0), vol=0.15),
     "PCOPPUSDM": _w("M", (4, 8500), (0, 9840), vol=150),
+    "A191RO1Q156NBEA": _w("Q", (4, 1.9), (2, 2.9), (1, 2.0), (0, 2.1), vol=0.2),
+    "DFEDTARL": _step(
+        "D", (4, 5.25), (2.0, 4.75), (1.8, 4.25), (0.9, 4.0), (0.35, 3.75), (0.08, 3.5)
+    ),
     "GDPNOW": _w("Q", (4, 2.0), (2, 2.8), (1, 1.5), (0, 2.4), vol=0.5),
     "TCU": _w("M", (4, 79.8), (2, 78.5), (0, 77.6), vol=0.2),
     "NEWORDER": _w("M", (4, 72000), (0, 74500), vol=500),
@@ -353,6 +357,23 @@ OECD_DEMO: Final[dict[tuple[str, str], Walk]] = {
     ("CCICP", "DEU"): _w("M", (4, 97.0), (0, 98.0), vol=0.1),
 }
 
+# FOMC SEP medians by years after the latest release year: (latest, prior).
+# The September SEP adds a year, so the prior vintage is one year shorter.
+SEP_DAYS_AGO: Final = (27, 118)
+DEMO_SEP: Final[dict[str, tuple[tuple[float, ...], tuple[float, ...]]]] = {
+    "FEDTARMD": ((3.6, 3.4, 3.1, 3.1), (3.9, 3.6, 3.4)),
+    "GDPC1MD": ((1.6, 1.8, 1.9, 1.8), (1.4, 1.6, 1.8)),
+    "UNRATEMD": ((4.5, 4.4, 4.3, 4.2), (4.5, 4.5, 4.4)),
+    "PCECTPIMD": ((3.0, 2.6, 2.1, 2.0), (3.0, 2.4, 2.1)),
+    "JCXFEMD": ((3.1, 2.6, 2.1, 2.0), (3.1, 2.4, 2.1)),
+}
+DEMO_SEP_LONGER_RUN: Final[dict[str, tuple[float, float]]] = {
+    "FEDTARMDLR": (3.0, 3.0),
+    "GDPC1MDLR": (1.8, 1.8),
+    "UNRATEMDLR": (4.2, 4.2),
+    "PCECTPIMDLR": (2.0, 2.0),
+}
+
 DEMO_RELEASES: Final = (
     (1, "Producer Price Index"),
     (2, "Consumer Price Index"),
@@ -484,6 +505,8 @@ def _fred(request: httpx.Request, today: date) -> httpx.Response:
             }
         )
     series_id = _param(request, "series_id")
+    if _param(request, "realtime_start"):
+        return _fred_vintages(series_id, today)
     start = _start(request, "observation_start", 4, today)
     if series_id == "USREC":
         points = [
@@ -498,6 +521,46 @@ def _fred(request: httpx.Request, today: date) -> httpx.Response:
         {
             "observations": [
                 {"date": day.isoformat(), "value": f"{value}"} for day, value in points
+            ]
+        }
+    )
+
+
+def _fred_vintages(series_id: str, today: date) -> httpx.Response:
+    latest, prior = (today - timedelta(days=days) for days in SEP_DAYS_AGO)
+    prior_end = (latest - timedelta(days=1)).isoformat()
+    rows: list[tuple[str, str, date, float]] = []
+    if series_id in DEMO_SEP:
+        new, old = DEMO_SEP[series_id]
+        base = latest.year
+        # A past target year stays in every vintage and must not become a column.
+        rows.append((prior.isoformat(), "9999-12-31", date(base - 1, 1, 1), new[0]))
+        rows += [
+            (latest.isoformat(), "9999-12-31", date(base + offset, 1, 1), value)
+            for offset, value in enumerate(new)
+        ]
+        rows += [
+            (prior.isoformat(), prior_end, date(base + offset, 1, 1), value)
+            for offset, value in enumerate(old)
+        ]
+    elif series_id in DEMO_SEP_LONGER_RUN:
+        new_lr, old_lr = DEMO_SEP_LONGER_RUN[series_id]
+        rows = [
+            (prior.isoformat(), "9999-12-31", prior, old_lr),
+            (latest.isoformat(), "9999-12-31", latest, new_lr),
+        ]
+    else:
+        return httpx.Response(400, content=b'{"error_message":"Bad Request"}')
+    return _json(
+        {
+            "observations": [
+                {
+                    "realtime_start": start,
+                    "realtime_end": end,
+                    "date": day.isoformat(),
+                    "value": f"{value}",
+                }
+                for start, end, day, value in rows
             ]
         }
     )
