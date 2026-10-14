@@ -321,6 +321,7 @@ function render(d) {
   data = d;
   renderStatus(d); renderNotices(d); renderTape(d); renderRegime(d);
   renderCurve(d); renderSpread(d); renderSep(d); renderPanels(d);
+  document.dispatchEvent(new CustomEvent("finagent:data", {detail: d}));
 }
 
 // ---------------------------------------------------------------- load / refresh
@@ -351,6 +352,7 @@ async function load(refresh, view) {
       document.querySelectorAll("#panels tbody tr").forEach((r) => { r.classList.remove("fresh"); void r.offsetWidth; r.classList.add("fresh"); });
       const ok = d.sources.reduce((a, s) => a + s.ok, 0), total = d.sources.reduce((a, s) => a + s.total, 0);
       say(`${ok}/${total}개 시리즈 갱신 · ${d.elapsed_seconds.toFixed(1)}s`);
+      document.dispatchEvent(new CustomEvent("finagent:refreshed", {detail: d}));
     }
   } catch (err) {
     $("notices").innerHTML = `<div class="notice err">대시보드 서버에 연결하지 못했습니다 (${esc(err.message)}). 터미널에서 finagent가 실행 중인지 확인하세요.</div>`;

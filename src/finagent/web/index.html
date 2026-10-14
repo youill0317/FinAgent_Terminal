@@ -12,6 +12,7 @@
     <span class="logo">FINAGENT</span>
     <div class="line" aria-hidden="true">MACRO US KR EA GLOBAL <span class="go">GO</span><span class="cur"></span></div>
     <div class="clocks" id="clocks"></div>
+    <button class="rf ghost" id="aiBtn" type="button" aria-controls="analysis" aria-expanded="false">AI 분석 <kbd>A</kbd></button>
     <button class="rf ghost" id="settingsBtn" type="button" aria-haspopup="dialog">설정 <kbd>S</kbd></button>
     <button class="rf" id="refreshBtn" type="button">새로고침 <kbd>R</kbd></button>
   </div>
@@ -36,6 +37,30 @@
   <div id="notices"></div>
 
   <div class="tape" id="tape"></div>
+
+  <section class="pn ai" id="analysis" aria-labelledby="aiTitle" hidden>
+    <div class="pn-h"><b id="aiTitle"><span>AI</span>매크로 분석 · 선택 기능</b><div class="hr"><small id="aiSnap">수동 실행 · 대화는 메모리에만</small><button class="x" id="aiClose" type="button" aria-label="닫기">✕</button></div></div>
+    <div class="pn-b">
+      <div class="ai-bar">
+        <label>공급자 <select id="aiProvider"></select></label>
+        <label>모델 <input id="aiModel" spellcheck="false" autocomplete="off"></label>
+        <span class="ai-st" id="aiStatus"></span>
+        <div class="seg" id="aiScope" role="group" aria-label="새 대화의 범위"><button type="button" data-scope="view" aria-pressed="true">지금 보기</button><button type="button" data-scope="all">전체 매크로</button></div>
+      </div>
+      <div class="chips" id="aiPresets" role="group" aria-label="프리셋"></div>
+      <label class="ai-pick" id="aiPick" hidden>지표 <select id="aiIndicator"></select></label>
+      <textarea id="aiInput" rows="3" placeholder="무엇을 분석할까요? 화면의 지표와 도구로 받은 공개 데이터만 근거로 답합니다."></textarea>
+      <div class="ai-act">
+        <button class="rf" id="aiRun" type="button">실행 <kbd>Ctrl+Enter</kbd></button>
+        <button class="rf ghost" id="aiStop" type="button" hidden>멈춤</button>
+        <button class="rf ghost" id="aiNew" type="button">새 대화</button>
+        <small id="aiConv"></small>
+      </div>
+      <div class="notice" id="aiStale" hidden></div>
+      <div class="ai-log" id="aiLog" aria-live="polite"></div>
+      <details class="ai-recv" id="aiRecv" hidden><summary>받은 데이터</summary><ul></ul></details>
+    </div>
+  </section>
 
   <h2 class="sec" id="overview">국면 요약 · 공개 규칙 기준</h2>
   <section class="regime" id="regime"></section>
@@ -95,5 +120,6 @@
 </dialog>
 <div class="toast" id="toast" role="status" hidden></div>
 <script src="/static/app.js"></script>
+<script src="/static/analysis.js"></script>
 </body>
 </html>

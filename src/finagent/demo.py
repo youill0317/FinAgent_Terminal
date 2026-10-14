@@ -491,6 +491,8 @@ def _json(payload: object) -> httpx.Response:
 
 
 def _fred(request: httpx.Request, today: date) -> httpx.Response:
+    if request.url.path.endswith("/series/search"):
+        return _fred_search(_param(request, "search_text"))
     if request.url.path.endswith("/releases/dates"):
         return _json(
             {
@@ -521,6 +523,27 @@ def _fred(request: httpx.Request, today: date) -> httpx.Response:
         {
             "observations": [
                 {"date": day.isoformat(), "value": f"{value}"} for day, value in points
+            ]
+        }
+    )
+
+
+def _fred_search(text: str) -> httpx.Response:
+    words = text.upper().split()
+    hits = [sid for sid in FRED if any(word in sid for word in words)] or list(FRED)[:5]
+    return _json(
+        {
+            "seriess": [
+                {
+                    "id": sid,
+                    "title": f"{sid} (demo)",
+                    "frequency_short": FRED[sid].freq,
+                    "units_short": "demo",
+                    "observation_start": "2000-01-01",
+                    "observation_end": "2026-01-01",
+                    "notes": "",
+                }
+                for sid in hits[:15]
             ]
         }
     )
@@ -602,6 +625,30 @@ def _nyfed(request: httpx.Request, today: date) -> httpx.Response:
 
 def _ecos(request: httpx.Request, today: date) -> httpx.Response:
     parts = request.url.path.strip("/").split("/")
+    if parts[1] == "StatisticTableList":
+        stats = sorted({key.split("/")[0] for key in ECOS})
+        rows = [
+            {"STAT_CODE": stat, "STAT_NAME": f"{stat} (demo)", "CYCLE": "M"}
+            for stat in stats
+        ]
+        return _json(
+            {"StatisticTableList": {"list_total_count": len(rows), "row": rows}}
+        )
+    if parts[1] == "StatisticItemList":
+        stat = parts[7]
+        rows = [
+            {
+                "STAT_CODE": stat,
+                "ITEM_CODE": key.split("/")[1],
+                "ITEM_NAME": f"{key} (demo)",
+                "CYCLE": walk.freq,
+            }
+            for key, walk in ECOS.items()
+            if key.split("/")[0] == stat
+        ]
+        return _json(
+            {"StatisticItemList": {"list_total_count": len(rows), "row": rows}}
+        )
     # api/StatisticSearch/{key}/json/kr/{from}/{to}/{stat}/{cycle}/{start}/{end}/{item1}
     stat, cycle, start_text, item1 = parts[7], parts[8], parts[9], parts[11]
     walk = ECOS.get(f"{stat}/{item1}")
@@ -626,8 +673,55 @@ def _csv_period(day: date, freq: Freq) -> str:
     return day.isoformat() if freq in {"D", "W"} else day.strftime("%Y-%m")
 
 
+SDMX_NS: Final = "http://www.sdmx.org/resources/sdmxml/schemas/v2_1"
+STRUCTURE_NS: Final = " ".join(
+    f'xmlns:{prefix}="{SDMX_NS}/{name}"'
+    for prefix, name in (("m", "message"), ("s", "structure"), ("c", "common"))
+)
+
+
+def _structure(flows: list[str], keys: list[str]) -> httpx.Response:
+    """A small SDMX-ML structure message: dataflows, or one flow's dimensions."""
+    parts = [f"<m:Structure {STRUCTURE_NS}><m:Structures><s:Dataflows>"]
+    for flow in flows:
+        parts.append(f'<s:Dataflow id="{flow}" agencyID="DEMO" version="1.0">')
+        parts.append(f'<c:Name xml:lang="en">{flow} (demo)</c:Name></s:Dataflow>')
+    parts.append("</s:Dataflows>")
+    if keys:
+        split = [key.split(".") for key in keys]
+        width = max(len(dims) for dims in split)
+        parts.append("<s:Codelists>")
+        for position in range(width):
+            codes = sorted({dims[position] for dims in split if len(dims) > position})
+            parts.append(f'<s:Codelist id="CL_D{position + 1}">')
+            for code in codes:
+                parts.append(f'<s:Code id="{code}"><c:Name xml:lang="en">{code}')
+                parts.append("</c:Name></s:Code>")
+            parts.append("</s:Codelist>")
+        parts.append("</s:Codelists><s:DataStructures><s:DimensionList>")
+        for position in range(1, width + 1):
+            parts.append(f'<s:Dimension id="D{position}" position="{position}">')
+            parts.append("<s:LocalRepresentation><s:Enumeration>")
+            parts.append(f'<Ref id="CL_D{position}" class="Codelist"/>')
+            parts.append("</s:Enumeration></s:LocalRepresentation></s:Dimension>")
+        parts.append("</s:DimensionList></s:DataStructures>")
+    parts.append("</m:Structures></m:Structure>")
+    return httpx.Response(200, content="".join(parts).encode())
+
+
+def _sdmx_structure(path: str) -> httpx.Response:
+    tail = path.split("/dataflow/", 1)[-1].split("/")
+    flows = sorted({key.split("/")[0] for key in SDMX})
+    if len(tail) < 2:  # noqa: PLR2004 - "{agency}" only: list every flow
+        return _structure(flows, [])
+    keys = [key.split("/")[1] for key in SDMX if key.split("/")[0] == tail[1]]
+    return _structure([tail[1]], keys)
+
+
 def _sdmx(request: httpx.Request, today: date) -> httpx.Response:
     path = unquote(request.url.path)
+    if "/dataflow" in path:
+        return _sdmx_structure(path)
     marker = "/service/data/" if "/service/data/" in path else "/api/v1/data/"
     flow_key = path.split(marker, 1)[-1]
     walk = SDMX.get(flow_key)
@@ -643,6 +737,11 @@ def _sdmx(request: httpx.Request, today: date) -> httpx.Response:
 
 
 def _oecd(request: httpx.Request, today: date) -> httpx.Response:
+    if "/dataflow" in request.url.path:
+        tail = unquote(request.url.path).split("/dataflow/", 1)[-1].split("/")
+        if len(tail) < 2:  # noqa: PLR2004 - agency only: list every flow
+            return _structure(["DSD_STES@DF_CLI"], [])
+        return _structure([tail[1]], ["USA.M.LI", "KOR.M.BCICP"])
     start = _start(request, "startPeriod", 4, today)
     key = unquote(request.url.path).rsplit("/", 1)[-1].split(".")
     areas, measures = key[0].split("+"), key[2].split("+")

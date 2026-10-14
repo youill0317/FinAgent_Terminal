@@ -1,0 +1,7 @@
+FRED	시리즈 ID. 예: DGS5, CPIAUCSL
+ECOS	통계표/주기/항목1[/항목2]. 주기는 D·M·Q·A. 예: 817Y002/D/010200000
+ECB	데이터셋/키. 예: EXR/D.KRW.EUR.SP00.A
+BIS	데이터셋/키. 예: WS_CBPOL/M.US
+OECD	기관,데이터셋/키. 예: OECD.SDD.STES,DSD_STES@DF_CLI/USA.M.LI...AA...H
+TREASURY	엔드포인트|값 필드[|필터]. 예: v2/accounting/od/debt_to_penny|tot_pub_debt_out_amt
+NYFED	경로. 예: secured/sofr, unsecured/effr

@@ -11,7 +11,8 @@ from finagent.fetch import RETRY_DELAY_SECONDS, FetchContext, new_client
 from finagent.settings import load_view, save_view
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import AsyncGenerator, Callable, Mapping
+    from datetime import date
     from pathlib import Path
 
     import httpx
@@ -44,6 +45,7 @@ class DashboardService:
         "_pending",
         "_pending_deep",
         "_pending_refresh",
+        "_refreshes",
         "_retry_delay",
         "_settings_error",
         "_settings_path",
@@ -72,6 +74,7 @@ class DashboardService:
         self._clock = clock
         self._demo = demo
         self._cache: dict[Fetch, Series] = {}
+        self._refreshes = 0
         self._snapshot: Dashboard | None = None
         self._pending: asyncio.Task[Dashboard] | None = None
         self._pending_deep: frozenset[str] = catalog.CORE_VIEW
@@ -85,6 +88,29 @@ class DashboardService:
     @property
     def view(self) -> frozenset[str]:
         return self._view
+
+    @property
+    def series_cache(self) -> dict[Fetch, Series]:
+        """Series fetched so far (memory only); analysis tools add to it."""
+        return self._cache
+
+    @property
+    def demo(self) -> bool:
+        return self._demo
+
+    @property
+    def refreshes(self) -> int:
+        """How many refreshes have started; tells whether data moved on."""
+        return self._refreshes
+
+    def today(self) -> date:
+        return self._clock().date()
+
+    @contextlib.asynccontextmanager
+    async def fetch_context(self) -> AsyncGenerator[FetchContext]:
+        """A client and fetch context for one analysis run's tool calls."""
+        async with self._client_factory() as client:
+            yield FetchContext(client, self._env, retry_delay=self._retry_delay)
 
     async def set_view(self, deep: frozenset[str]) -> Dashboard:
         """Switch to ``deep``, save it, and return the dashboard for it."""
@@ -132,6 +158,7 @@ class DashboardService:
             return snapshot
         if refresh:
             self._cache.clear()
+            self._refreshes += 1
         self._pending_deep = deep
         self._pending_refresh = refresh
         self._pending = asyncio.ensure_future(

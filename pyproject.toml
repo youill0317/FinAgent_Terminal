@@ -15,11 +15,22 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.optional-dependencies]
+# AI analysis is optional; install only the routes you use.
+claude-sub = ["claude-agent-sdk>=0.2.166"]
+claude-api = ["anthropic>=1.13.0"]
+codex-sub = ["openai-codex>=0.162.1"]
+openai = ["openai>=3.30.0"]
+gemini = ["google-genai>=2.30.1"]
+llm = ["finagent[claude-sub,claude-api,codex-sub,openai,gemini]"]
+
 [project.scripts]
 finagent = "finagent.cli:main"
 
 [dependency-groups]
 dev = [
+    # The adapters are type-checked and tested against the real SDKs.
+    "finagent[llm]",
     "basedpyright>=1.21",
     "pytest>=8",
     "ruff>=0.8",
