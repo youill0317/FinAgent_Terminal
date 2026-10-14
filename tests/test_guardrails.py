@@ -34,19 +34,25 @@ FORBIDDEN_PACKAGES: Final = (
     "textual",
     "pandas",
     "numpy",
-    "openai",
-    "anthropic",
-    "google.genai",
-    "google-genai",
     "finnhub",
     "fmp",
     "langgraph",
 )
+PROVIDERS: Final = SRC / "analysis" / "providers"
+# Each optional AI package is imported by its own adapter and nowhere else.
+PROVIDER_PACKAGES: Final = {
+    "anthropic": PROVIDERS / "claude_api.py",
+    "openai": PROVIDERS / "openai_api.py",
+    "google": PROVIDERS / "gemini_api.py",
+}
+AI_PACKAGES: Final = ("anthropic", "openai", "google-genai")
 KEY_NAME: Final = r"\b(?:fred|ecos)[a-z0-9_]*(?:key|token|secret)?\s*=\s*"
 KEY_VALUE: Final = r"['\"][A-Za-z0-9+/=?:&._-]{20,}['\"]"
 HARDCODED_KEY_PATTERNS: Final = (
     re.compile(KEY_NAME + KEY_VALUE, re.IGNORECASE),
     re.compile(r"\b(?:api_key|apikey|token)=[A-Za-z0-9+/=?:&._-]{20,}"),
+    re.compile(r"sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"AIza[A-Za-z0-9_-]{30,}"),
 )
 PUBLIC_HOSTS: Final = frozenset(
     {
@@ -94,6 +100,25 @@ def test_forbidden_packages_are_not_declared_or_imported() -> None:
 
     assert _hits(declared, [ROOT / "pyproject.toml"]) == []
     assert _hits(imported, _python_files()) == []
+
+
+def test_ai_packages_stay_in_their_adapters() -> None:
+    for package, home in PROVIDER_PACKAGES.items():
+        imported = re.compile(rf"^\s*(?:import|from)\s+{re.escape(package)}\b")
+        others = [path for path in _python_files() if path != home]
+
+        assert _hits(imported, others) == [], package
+        assert _hits(imported, [home]) != [], package
+
+
+def test_ai_packages_are_optional_extras() -> None:
+    text = (ROOT / "pyproject.toml").read_text("utf-8")
+    runtime = text.split("[project.optional-dependencies]")[0]
+    runtime = runtime.split("dependencies = [", 1)[1].split("]", 1)[0]
+
+    for package in AI_PACKAGES:
+        assert package not in runtime
+        assert f'"{package}>=' in text
 
 
 def test_no_hardcoded_keys() -> None:

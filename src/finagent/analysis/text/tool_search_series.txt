@@ -1,0 +1,1 @@
+받을 시계열의 코드를 찾는다. source가 catalog면 대시보드 지표 176개에서, FRED·ECOS·ECB·BIS·OECD면 그 출처의 목록에서 찾는다. ECOS는 dataset에 통계표 코드를 주면 그 표의 항목을, ECB·BIS·OECD는 dataset에 데이터셋을 주면 키의 차원과 코드값을 돌려준다.

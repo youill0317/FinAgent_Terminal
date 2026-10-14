@@ -11,12 +11,14 @@ from typing import TYPE_CHECKING, Final
 import httpx
 
 from finagent import __version__, catalog
+from finagent.analysis.service import AnalysisService
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from finagent.analysis.providers.base import ProviderStatus
     from finagent.models import Dashboard
 
 HOST: Final = "127.0.0.1"  # local only; the dashboard is never exposed on the network
@@ -103,7 +105,7 @@ def parse_args(argv: Sequence[str] | None) -> Options:
     _ = parser.add_argument(
         "--env-file",
         type=Path,
-        help="FRED_API_KEY, ECOS_API_KEY를 읽을 파일 (기본: 현재 폴더의 .env)",
+        help="API 키를 읽을 파일 (기본: 현재 폴더의 .env)",
     )
     _ = parser.add_argument(
         "--settings",
@@ -119,8 +121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings_path = resolve_settings(args.settings)
     service = build_service(demo=args.demo, env=env, settings_path=settings_path)
 
+    analysis = AnalysisService(service, env, settings_path=settings_path)
     if args.check:
-        return run_check(service)
+        return run_check(service, analysis)
 
     import uvicorn  # noqa: PLC0415 - only needed when serving
 
@@ -131,14 +134,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"보기 설정: {settings_path}")  # noqa: T201
     if not args.no_browser:
         threading.Timer(BROWSER_DELAY_SECONDS, webbrowser.open, args=(url,)).start()
-    uvicorn.run(create_app(service), host=HOST, port=args.port, log_level="warning")
+    app = create_app(service, analysis=analysis)
+    uvicorn.run(app, host=HOST, port=args.port, log_level="warning")
     return 0
 
 
-def run_check(service: DashboardService) -> int:
+def run_check(
+    service: DashboardService, analysis: AnalysisService | None = None
+) -> int:
+    """Print source states and, when given, AI provider states.
+
+    The exit code only reflects the data sources; providers are optional.
+    """
     dashboard = asyncio.run(service.get(deep=catalog.ALL_VIEWS))
     print(check_report(dashboard))  # noqa: T201
+    if analysis is not None:
+        print(provider_report(asyncio.run(analysis.statuses())))  # noqa: T201
     return 0 if all(source.state == "ok" for source in dashboard.sources) else 1
+
+
+def provider_report(statuses: Mapping[str, ProviderStatus]) -> str:
+    lines = ["AI 공급자 (선택 기능):"]
+    for provider_id, status in statuses.items():
+        note = f"  {status.message}" if status.message else ""
+        lines.append(f"  {provider_id:<11}{status.kind:<14}{note}")
+    return "\n".join(lines)
 
 
 def check_report(dashboard: Dashboard) -> str:

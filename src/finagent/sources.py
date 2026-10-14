@@ -10,6 +10,7 @@ import csv
 import io
 import math
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import TYPE_CHECKING, ClassVar, Final
@@ -33,14 +34,23 @@ type Series = tuple[Point, ...]
 
 FRED_OBSERVATIONS_URL: Final = "https://api.stlouisfed.org/fred/series/observations"
 FRED_RELEASE_DATES_URL: Final = "https://api.stlouisfed.org/fred/releases/dates"
+FRED_SEARCH_URL: Final = "https://api.stlouisfed.org/fred/series/search"
 FISCAL_BASE_URL: Final = (
     "https://api.fiscaldata.treasury.gov/services/api/fiscal_service"
 )
 NYFED_BASE_URL: Final = "https://markets.newyorkfed.org/api/rates"
 ECOS_BASE_URL: Final = "https://ecos.bok.or.kr/api/StatisticSearch"
+ECOS_TABLE_LIST_URL: Final = "https://ecos.bok.or.kr/api/StatisticTableList"
+ECOS_ITEM_LIST_URL: Final = "https://ecos.bok.or.kr/api/StatisticItemList"
 ECB_BASE_URL: Final = "https://data-api.ecb.europa.eu/service/data"
 BIS_BASE_URL: Final = "https://stats.bis.org/api/v1/data"
 OECD_BASE_URL: Final = "https://sdmx.oecd.org/public/rest/data"
+# SDMX structure queries: ``{root}/dataflow/{agency}`` and one flow with its codes.
+SDMX_STRUCTURE_ROOTS: Final[dict[str, tuple[str, str]]] = {
+    "ECB": ("https://data-api.ecb.europa.eu/service/dataflow", "ECB"),
+    "BIS": ("https://stats.bis.org/api/v1/dataflow", "BIS"),
+    "OECD": ("https://sdmx.oecd.org/public/rest/dataflow", "all"),
+}
 
 ECOS_MAX_ROWS: Final = 10000
 FISCAL_PAGE_SIZE: Final = 10000
@@ -483,3 +493,226 @@ def combine_ratio(numerator: Series, denominator: Series) -> Series:
         for day, value in numerator
         if day in lookup and lookup[day] != 0
     )
+
+
+# ---------------------------------------------------------------- search for tools
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesInfo:
+    """One search hit: ``code`` is what ``get_series`` takes for that source."""
+
+    code: str
+    name: str
+    freq: str = ""
+    unit: str = ""
+    start: str = ""
+    end: str = ""
+    note: str = ""
+
+
+class _FredSearchHit(_Model):
+    id: str
+    title: str
+    frequency_short: str = ""
+    units_short: str = ""
+    observation_start: str = ""
+    observation_end: str = ""
+    notes: str = ""
+
+
+class _FredSearch(_Model):
+    seriess: tuple[_FredSearchHit, ...] = ()
+
+
+async def fred_search(ctx: FetchContext, text: str, limit: int) -> list[SeriesInfo]:
+    """FRED's own series search, most popular first."""
+    params = {
+        "search_text": text,
+        "api_key": ctx.key(FRED_KEY_ENV),
+        "file_type": "json",
+        "limit": str(limit),
+        "order_by": "popularity",
+        "sort_order": "desc",
+    }
+    raw = await ctx.text("FRED", FRED_SEARCH_URL, params)
+    try:
+        payload = _FredSearch.model_validate_json(raw)
+    except ValidationError as error:
+        raise SourceError("FRED 검색: 응답 형식 오류") from error
+    return [
+        SeriesInfo(
+            code=hit.id,
+            name=hit.title,
+            freq=hit.frequency_short,
+            unit=hit.units_short,
+            start=hit.observation_start,
+            end=hit.observation_end,
+            note=_copyright_note(hit.notes),
+        )
+        for hit in payload.seriess
+    ]
+
+
+def _copyright_note(notes: str) -> str:
+    match = re.search(r"(Copyright[^.\n]*|©[^.\n]*)", notes)
+    return match.group(1).strip() if match else ""
+
+
+class _EcosListRow(_Model):
+    STAT_CODE: str = ""
+    STAT_NAME: str = ""
+    CYCLE: str | None = None
+    SRCH_YN: str | None = None
+    ITEM_CODE: str | None = None
+    ITEM_NAME: str | None = None
+    GRP_NAME: str | None = None
+    START_TIME: str | None = None
+    END_TIME: str | None = None
+    UNIT_NAME: str | None = None
+
+
+class _EcosList(_Model):
+    row: tuple[_EcosListRow, ...] = ()
+
+
+class _EcosListPayload(_Model):
+    StatisticTableList: _EcosList | None = None
+    StatisticItemList: _EcosList | None = None
+    RESULT: _EcosResult | None = None
+
+
+async def ecos_tables(ctx: FetchContext) -> list[SeriesInfo]:
+    """Every searchable ECOS statistics table (code, name, cycle)."""
+    url = "/".join(
+        [ECOS_TABLE_LIST_URL, ctx.key(ECOS_KEY_ENV), "json", "kr", "1", "10000"]
+    )
+    rows = await _ecos_list(ctx, url, "통계표 목록")
+    return [
+        SeriesInfo(code=row.STAT_CODE, name=row.STAT_NAME, freq=row.CYCLE or "")
+        for row in rows
+        if row.SRCH_YN != "N" and row.STAT_CODE
+    ]
+
+
+async def ecos_items(ctx: FetchContext, stat: str) -> list[SeriesInfo]:
+    """The items of one ECOS table. ``code`` is ``stat/cycle/item``."""
+    url = "/".join(
+        [
+            ECOS_ITEM_LIST_URL,
+            ctx.key(ECOS_KEY_ENV),
+            "json",
+            "kr",
+            "1",
+            "10000",
+            stat,
+        ]
+    )
+    rows = await _ecos_list(ctx, url, f"{stat} 항목 목록")
+    return [
+        SeriesInfo(
+            code=f"{stat}/{row.CYCLE or ''}/{row.ITEM_CODE or ''}",
+            name=" · ".join(part for part in (row.GRP_NAME, row.ITEM_NAME) if part),
+            freq=row.CYCLE or "",
+            unit=row.UNIT_NAME or "",
+            start=row.START_TIME or "",
+            end=row.END_TIME or "",
+        )
+        for row in rows
+        if row.ITEM_CODE
+    ]
+
+
+async def _ecos_list(
+    ctx: FetchContext, url: str, what: str
+) -> tuple[_EcosListRow, ...]:
+    raw = await ctx.text("ECOS", url)
+    try:
+        payload = _EcosListPayload.model_validate_json(raw)
+    except ValidationError as error:
+        raise SourceError(f"ECOS {what}: 응답 형식 오류") from error
+    if payload.RESULT is not None:
+        raise SourceError(
+            f"ECOS {what}: {payload.RESULT.CODE} {payload.RESULT.MESSAGE}"
+        )
+    body = payload.StatisticTableList or payload.StatisticItemList
+    return body.row if body is not None else ()
+
+
+async def sdmx_dataflows(ctx: FetchContext, provider: SourceId) -> list[SeriesInfo]:
+    """The datasets (dataflows) one SDMX provider publishes."""
+    root, agency = SDMX_STRUCTURE_ROOTS[provider]
+    raw = await ctx.text(provider, f"{root}/{agency}")
+    tree = parse_structure_xml(raw, provider)
+    flows: list[SeriesInfo] = []
+    for node in tree.iter():
+        if _local(node.tag) != "Dataflow" or "id" not in node.attrib:
+            continue
+        flow_id = node.attrib["id"]
+        if provider == "OECD":
+            flow_id = f"{node.attrib.get('agencyID', '')},{flow_id}"
+        flows.append(SeriesInfo(code=flow_id, name=_english_name(node)))
+    return flows
+
+
+async def sdmx_dimensions(
+    ctx: FetchContext, provider: SourceId, flow: str
+) -> list[SeriesInfo]:
+    """One dataflow's key dimensions in order, each with its allowed codes."""
+    root, agency = SDMX_STRUCTURE_ROOTS[provider]
+    if provider == "OECD" and "," in flow:
+        agency, flow = flow.split(",", 1)
+    raw = await ctx.text(
+        provider, f"{root}/{agency}/{flow}/latest", {"references": "all"}
+    )
+    tree = parse_structure_xml(raw, provider)
+    codelists: dict[str, list[tuple[str, str]]] = {}
+    for node in tree.iter():
+        if _local(node.tag) == "Codelist" and "id" in node.attrib:
+            codelists[node.attrib["id"]] = [
+                (code.attrib.get("id", ""), _english_name(code))
+                for code in node
+                if _local(code.tag) == "Code"
+            ]
+    out: list[SeriesInfo] = []
+    for node in tree.iter():
+        if _local(node.tag) != "Dimension" or "id" not in node.attrib:
+            continue
+        refs = [
+            ref.attrib.get("id", "")
+            for ref in node.iter()
+            if _local(ref.tag) == "Ref" and ref.attrib.get("class") == "Codelist"
+        ]
+        codes = codelists.get(refs[0], []) if refs else []
+        listed = ", ".join(f"{code}={name}" for code, name in codes[:60])
+        more = f" … 외 {len(codes) - 60}개" if len(codes) > 60 else ""  # noqa: PLR2004
+        out.append(
+            SeriesInfo(
+                code=node.attrib["id"],
+                name=f"위치 {node.attrib.get('position', '?')}",
+                note=listed + more,
+            )
+        )
+    return out
+
+
+def parse_structure_xml(text: str, provider: SourceId) -> ET.Element:
+    """Parse an SDMX structure message. Documents with a DTD are refused."""
+    if "<!DOCTYPE" in text[:2000].upper():
+        raise SourceError(f"{provider} 구조 응답에 DTD가 있어 읽지 않습니다")
+    try:
+        return ET.fromstring(text)  # noqa: S314 - no DTD, from the seven public hosts
+    except ET.ParseError as error:
+        raise SourceError(f"{provider} 구조 응답 형식 오류") from error
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _english_name(node: ET.Element) -> str:
+    names = [child for child in node if _local(child.tag) == "Name"]
+    for child in names:
+        if child.attrib.get("{http://www.w3.org/XML/1998/namespace}lang") == "en":
+            return (child.text or "").strip()
+    return (names[0].text or "").strip() if names else ""
