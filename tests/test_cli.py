@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from finagent import __version__
-from finagent.cli import main, read_env_file, resolve_env, run_check
+from finagent.cli import main, read_env_file, resolve_env, resolve_settings, run_check
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
 
@@ -56,6 +56,24 @@ def test_default_env_file_is_optional(
 def test_explicit_env_file_must_exist(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="env 파일을 찾을 수 없습니다"):
         _ = resolve_env(tmp_path / "missing.env", {})
+
+
+def test_settings_file_lives_in_the_current_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_settings(None) == tmp_path / "finagent.settings.json"
+    assert resolve_settings(tmp_path / "x.json") == tmp_path / "x.json"
+
+
+def test_check_never_writes_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["--demo", "--check"]) == 0
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_check_exit_codes(

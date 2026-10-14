@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from finagent import catalog
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
-from finagent.settings import default_path, load_view, save_view
+from finagent.settings import load_view, save_view
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def service(path: Path) -> DashboardService:
@@ -91,10 +94,3 @@ def test_save_view_orders_ids_like_the_settings_list(tmp_path: Path) -> None:
     save_view(path, frozenset({"curve", "growth"}))
 
     assert json.loads(path.read_text("utf-8"))["deep"] == ["growth", "curve"]
-
-
-def test_default_path_follows_the_platform_config_folder(tmp_path: Path) -> None:
-    path = default_path({"XDG_CONFIG_HOME": str(tmp_path)}, Path("/home/u"))
-
-    assert path.name == "settings.json"
-    assert path.parent.name == "finagent"

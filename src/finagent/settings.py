@@ -7,25 +7,14 @@ A missing or unreadable file means the default view (core rows only).
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
 from finagent import catalog
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from pathlib import Path
 
 SETTINGS_VERSION: Final = 1
-
-
-def default_path(environ: Mapping[str, str], home: Path) -> Path:
-    """APPDATA/finagent on Windows, else XDG_CONFIG_HOME (or ~/.config)/finagent."""
-    if os.name == "nt":
-        base = Path(environ.get("APPDATA") or home / "AppData" / "Roaming")
-    else:
-        base = Path(environ.get("XDG_CONFIG_HOME") or home / ".config")
-    return base / "finagent" / "settings.json"
 
 
 def load_view(path: Path) -> tuple[frozenset[str], str | None]:

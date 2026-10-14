@@ -13,7 +13,6 @@ import httpx
 from finagent import __version__, catalog
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
-from finagent.settings import default_path
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -23,6 +22,8 @@ if TYPE_CHECKING:
 HOST: Final = "127.0.0.1"  # local only; the dashboard is never exposed on the network
 DEFAULT_PORT: Final = 8765
 DEFAULT_ENV_FILE: Final = Path(".env")
+# Kept next to .env in the folder the app is started from.
+DEFAULT_SETTINGS_FILE: Final = Path("finagent.settings.json")
 BROWSER_DELAY_SECONDS: Final = 1.0
 
 
@@ -60,6 +61,11 @@ def resolve_env(env_file: Path | None, environ: Mapping[str, str]) -> dict[str, 
         raise SystemExit(f"env 파일을 찾을 수 없습니다: {path}")
     from_file = read_env_file(path) if path.is_file() else {}
     return {**from_file, **environ}
+
+
+def resolve_settings(settings: Path | None) -> Path:
+    """The view settings file; by default next to .env in the current folder."""
+    return (settings if settings is not None else DEFAULT_SETTINGS_FILE).absolute()
 
 
 def build_service(
@@ -102,7 +108,7 @@ def parse_args(argv: Sequence[str] | None) -> Options:
     _ = parser.add_argument(
         "--settings",
         type=Path,
-        help="보기 설정 파일 (기본: ~/.config/finagent/settings.json)",
+        help="보기 설정 파일 (기본: 현재 폴더의 finagent.settings.json)",
     )
     return parser.parse_args(argv, namespace=Options())
 
@@ -110,7 +116,7 @@ def parse_args(argv: Sequence[str] | None) -> Options:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     env = resolve_env(args.env_file, os.environ)
-    settings_path = args.settings or default_path(os.environ, Path.home())
+    settings_path = resolve_settings(args.settings)
     service = build_service(demo=args.demo, env=env, settings_path=settings_path)
 
     if args.check:

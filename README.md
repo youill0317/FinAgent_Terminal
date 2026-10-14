@@ -24,6 +24,7 @@ uv sync
 - 한국은행 ECOS: <https://ecos.bok.or.kr/api/#/AuthKeyApply>
 
 키는 환경변수로 넣거나, 실행하는 폴더의 `.env` 파일에 적습니다.
+이 폴더에 두는 파일은 `.env`(키, 앱은 읽기만 함)와 `finagent.settings.json`(보기 설정, 아래 참고) 두 개입니다.
 `.env`는 `.gitignore`에 들어 있고 앱은 이 파일을 읽기만 합니다.
 같은 키가 양쪽에 있으면 환경변수가 우선합니다.
 
@@ -57,8 +58,9 @@ uv run finagent --check      # 서버 없이 한 번 받아와서 출처별 상�
 - 미 국채 수익률 곡선 차트와 기본 화면에 없는 미국 주택 패널도 설정에서 켭니다.
 - 설정을 바꾸면 새로 보이는 시계열만 받아옵니다. 이미 받은 것은 다시 받지 않습니다.
 - 고른 보기는 설정 파일에 저장되고, 다음에 앱을 켜면 그대로 열립니다.
-  - 기본 위치: `~/.config/finagent/settings.json` (Windows는 `%APPDATA%\finagent\settings.json`, `XDG_CONFIG_HOME`이 있으면 그 아래)
+  - 기본 위치: `.env`와 같은 곳, 즉 앱을 실행하는 폴더의 `finagent.settings.json`. 앱을 켜면 터미널에 경로가 표시됩니다.
   - 다른 파일을 쓰려면 `--settings PATH`
+  - `.gitignore`에 들어 있어 커밋되지 않습니다.
   - 파일이 없으면 기본 보기(핵심)로 시작하고, 보기를 처음 바꿀 때 만들어집니다.
   - 파일을 읽지 못하면 기본 보기로 시작하고 화면에 알려줍니다.
 
