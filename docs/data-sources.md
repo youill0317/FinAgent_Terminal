@@ -13,7 +13,7 @@ API를 실제로 호출해 본 것은 아닙니다.
 | ✔ | 공식 페이지 검색 결과나 공개 코드 여러 곳에서 코드가 확인됨 |
 | △ | 한 곳에서만 확인됐거나 확인된 패턴으로 조합한 코드 |
 | ? | 기억에 의존한 코드. 붙이기 전에 반드시 확인 |
-| © | 원 출처에 저작권이 있음. 개인 열람용으로 © 표시 |
+| © | 원 출처에 저작권이 있음 |
 
 ✔ 표시도 실제 응답으로 확인한 것은 아닙니다. 지표를 추가한 뒤에는
 `uv run finagent --check`로 받아지는지 확인하세요.
@@ -22,35 +22,40 @@ API를 실제로 호출해 본 것은 아닙니다.
 
 ## 한눈에 보기
 
-| 출처 | 사용중 | 미사용 중 쓸 만한 것 (대표) | 확인된 문제 |
-|---|---|---|---|
-| FRED | 시계열 51개, 엔드포인트 2개 | 설비가동률, 핵심연령 고용률, 근원물가 대안, SLOOS, H.8 은행신용, 주택 세트 | ICE 하이일드 스프레드는 3년치만 제공 |
-| 미 재무부 | 데이터셋 2개 | 일간 TGA, 월간 재정수지, 이자비용, 국채 입찰 결과 | 없음 |
-| 뉴욕 연은 | 금리 2개 | 금리 5종 일괄 조회, ON RRP, SOMA 보유, 레포·SRF | 없음 |
-| 한국은행 ECOS | 9개 (모두 코드 확인됨) | 선행지수, GDP 성장률, 근원 CPI, 회사채·CD, 외환보유액, 경상수지, 가계신용, M2 | 없음 |
-| ECB | 4개 | €STR, AAA 국채금리, 근원 HICP, M3, CISS, 실업률 | **ICP 데이터셋 중단 → HICP로 교체 필요** |
-| BIS | 2개 | 정책금리 국가 확장, 실효환율, 신용갭, 부채/GDP, 주택가격 | 없음 |
-| OECD | 1개 (CLI 3개국) | 기업·소비자 신뢰지수, CLI 국가 확장, CPI, 실업률 | 없음 |
+| 출처 | 사용중 | 미사용 중 쓸 만한 것 (대표) |
+|---|---|---|
+| FRED | 94개 + 곡선·침체 12개 | H.8·G.19 세부, JOLTS 채용·해고, 생산성, 신규 사업자, 주별 지역 데이터 |
+| 미 재무부 | 4개 | 일간 TGA·세수, 월간 재정수지 세부, 이자비용, 국채 입찰 결과 |
+| 뉴욕 연은 | 4개 | ON RRP 결과, SOMA 보유, 레포·SRF, 프라이머리 딜러 |
+| 한국은행 ECOS | 26개 | 국고채 곡선, 대출·수신금리, 전산업생산, 소매판매, 주택가격, 기대인플레 |
+| ECB | 16개 | GDP, 경상수지, 정부부채, 주택가격, 은행 대출태도, 다른 통화 환율 |
+| BIS | 17개 | 부채상환비율, 글로벌 유동성, 장기 CPI |
+| OECD | 13개 | 국가별 CPI·실업률·금리, 분기 GDP, 상품무역 |
 
 ---
 
 ## 1. FRED (세인트루이스 연은)
 
-### 사용중: 51개
+### 사용중: 94개
 
-| 분류 | 개수 | 시리즈 |
+| 패널 | 개수 | 코드 |
 |---|---|---|
-| 국민계정 | 3 | A191RL1Q225SBEA, PCEC96, MTSDS133FMS |
-| 생산·경기 | 5 | INDPRO, RSAFS, HOUST, CFNAIMA3, USREC |
-| 고용 | 7 | PAYEMS, UNRATE, SAHMREALTIME, ICSA, CCSA, JTSJOL, CES0500000003 |
-| 물가·원자재 | 10 | CPIAUCSL, CPILFESL, PCEPILFE, PPIFIS, T5YIE, T5YIFR, DCOILWTICO, DCOILBRENTEU, DHHNGSP, PCOPPUSDM |
-| 금리·금융·유동성 | 26 | DFEDTARU, DGS1MO~DGS30 (11개), T10Y3M, T10Y2Y, DFII10, MORTGAGE30US ©, NFCI, BAMLH0A0HYM2 ©, BAA10Y ©, VIXCLS ©, DTWEXBGS, WALCL, WRESBAL, RRPONTSYD, WTREGEN, M2SL |
+| 미국 성장 | 13 | A191RL1Q225SBEA, GDPNOW, INDPRO, TCU, RSAFS, PCEC96, NEWORDER, DGORDER, ISRATIO, TOTALSA, CFNAIMA3, GACDFSA066MSFRBPHI, GACDINA066MNFRBNY |
+| 미국 소득 · 가계 | 5 | W875RX1, PSAVERT, UMCSENT ©, TOTALSL, DRCCLACBS |
+| 미국 고용 | 14 | PAYEMS, UNRATE, U6RATE, SAHMREALTIME, CIVPART, LNS11300060, LNS12300060, ICSA, CCSA, JTSJOL, JTSQUR, CES0500000003, ECIALLCIV, ULCNFB |
+| 미국 물가 | 15 | CPIAUCSL, CPILFESL, PCEPI, PCEPILFE, MEDCPIM158SFRBCLE, STICKCPIM159SFRBATL, PCETRIM12M159SFRBDAL, CUSR0000SAH1, CUSR0000SASLE, CUSR0000SACL1E, PPIFIS, T5YIE, T10YIE, T5YIFR, MICH © |
+| 정책금리 · 국채 · 단기자금 | 7 | DFEDTARU, IORB, DGS2, DGS10, T10Y3M, T10Y2Y, DFII10 |
+| 신용 · 금융여건 | 10 | NFCI, STLFSI4, BAMLH0A0HYM2 ©, BAMLC0A0CM ©, BAA10Y ©, HQMCB10YR, DRTSCILM, TOTBKCR, BUSLOANS, DTWEXBGS |
+| 주식 · 변동성 | 3 | SP500 ©, NASDAQCOM ©, VIXCLS © |
+| 연준 대차대조표 · 재정 | 9 | WALCL, TREAST, WSHOMCB, WRESBAL, RRPONTSYD, WTREGEN, M2SL, GFDEGDQ188S, MTSDS133FMS |
+| 미국 주택 | 8 | HOUST, PERMIT, HSN1F, MSACSR, USSTHPI, CSUSHPISA ©, MORTGAGE30US ©, DRSFRMACBS |
+| 글로벌 정책금리 · 환율 | 2 | DEXCHUS, DTWEXEMEGS |
+| 원자재 | 8 | DCOILWTICO, DCOILBRENTEU, DHHNGSP, PCOPPUSDM, PALUMUSDM, PIORECRUSDM, PWHEAMTUSDM, PALLFNFINDEXM |
 
-엔드포인트는 `series/observations`, `releases/dates` 두 개를 씁니다.
+수익률 곡선용 DGS1MO~DGS30(11개)과 경기침체 음영용 USREC도 받습니다. 엔드포인트는 `series/observations`, `releases/dates` 두 개를 씁니다.
 
-- BAMLH0A0HYM2 (ICE ©): FRED가 최근 3년치만 제공합니다. 공공 자료 대안은 HQMCB10YR(재무부 고등급 회사채 금리)과 NFCICREDIT입니다.
-- BAA10Y (Moody's ©): 재배포 제한 문구가 붙어 있습니다.
-- 2025년 10월 CPS 계열(UNRATE 등)은 셧다운으로 결측("."이 들어 있음)입니다. 파서가 "."을 결측으로 처리하는 것을 확인했습니다(`sources.parse_number`).
+- ICE 시계열(BAMLH0A0HYM2, BAMLC0A0CM)은 FRED가 최근 3년치만 제공합니다.
+- 2025년 10월 CPS 계열(UNRATE 등)은 셧다운으로 결측(".")입니다. 파서가 "."을 결측으로 처리합니다(`sources.parse_number`).
 
 ### 미사용: 대시보드에 쓸 만한 것
 
@@ -59,20 +64,15 @@ API를 실제로 호출해 본 것은 아닙니다.
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
 | DFEDTARL | 연방기금 목표 하단 | D | ? |
-| IORB | 지급준비금 이자율 | D | ✔ |
 | SOFR, EFFR | SOFR, 실효 연방기금금리 (지금은 뉴욕 연은에서 직접 받음) | D | ✔ |
 | DPRIME | 프라임 대출금리 | D | ? |
 | DTB3 | 3개월 T-bill | D | ? |
 | DFII5 | 5년 TIPS 금리 | D | ? |
-| T10YIE | 10년 BEI | D | ? |
-| HQMCB10YR | 10년 고등급 회사채 스팟금리 (재무부) | M | ? |
 
 **연준 대차대조표 (H.4.1)**
 
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| TREAST | 보유 국채 | W | ? |
-| WSHOMCB | 보유 MBS | W | ✔ |
 | WLRRAL | 역레포 부채 | W | ? |
 | WCURCIR | 화폐발행 | W | ? |
 | WLCFLPCL | 재할인창구 대출 | W | ? |
@@ -82,16 +82,11 @@ API를 실제로 호출해 본 것은 아닙니다.
 
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| TOTBKCR | 상업은행 총신용 | W | ✔ |
 | TOTLL | 대출·리스 | W | ? |
-| BUSLOANS | 기업(C&I) 대출 | M | ? |
 | CONSUMER | 소비자 대출 | W | ? |
 | DPSACBW027SBOG | 상업은행 예금 | W | ? |
-| TOTALSL, REVOLSL, NONREVSL | 소비자신용 총액·리볼빙·비리볼빙 | M | ? |
-| DRCCLACBS | 신용카드 연체율 | Q | ✔ |
-| DRSFRMACBS | 주택담보대출 연체율 | Q | ? |
+| REVOLSL, NONREVSL | 소비자신용 총액·리볼빙·비리볼빙 | M | ? |
 | DRBLACBS | 기업대출 연체율 | Q | ? |
-| DRTSCILM | 대·중기업 C&I 대출기준 강화 순비율 | Q | ✔ |
 | DRTSCIS | 소기업 C&I 대출기준 강화 순비율 | Q | ✔ |
 | DRTSCLCC | 신용카드 대출기준 강화 순비율 | Q | ? |
 
@@ -99,7 +94,6 @@ API를 실제로 호출해 본 것은 아닙니다.
 
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| STLFSI4 | 세인트루이스 연은 금융스트레스지수 | W | ✔ |
 | ANFCI, NFCICREDIT | 조정 NFCI, NFCI 신용 하위지수 | W | ? |
 | KCFSI | 캔자스시티 연은 금융스트레스지수 | M | ? |
 | M1SL, M2V | M1, M2 유통속도 | M/Q | ? |
@@ -109,35 +103,27 @@ API를 실제로 호출해 본 것은 아닙니다.
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
 | DEXKOUS | 원/달러 (뉴욕 정오) | D | ✔ |
-| DEXJPUS, DEXUSEU, DEXCHUS, DEXUSUK | 엔·유로·위안·파운드 | D | ? |
-| DTWEXAFEGS, DTWEXEMEGS | 달러지수 (선진국 / 신흥국 대비) | D | ? |
+| DEXJPUS, DEXUSEU, DEXUSUK | 엔·유로·파운드 | D | ? |
+| DTWEXAFEGS | 달러지수 (선진국 / 신흥국 대비) | D | ? |
 
 **고용**
 
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| CIVPART | 경제활동참가율 | M | ✔ |
-| LNS11300060 | 핵심연령(25~54세) 참가율 | M | ✔ |
-| LNS12300060 | 핵심연령 고용률 | M | ✔ |
-| U6RATE | U-6 실업률 | M | ✔ |
 | IC4WSA | 신규 실업수당 4주 평균 | W | ? |
-| JTSQUR, JTSHIR, JTSLDR | JOLTS 자발적 이직률·채용률·해고율 | M | ? |
+| JTSHIR, JTSLDR | JOLTS 자발적 이직률·채용률·해고율 | M | ? |
 | AWHAETP | 평균 주간 근로시간 | M | ? |
 | TEMPHELPS | 임시직 고용 | M | ? |
 | MANEMP | 제조업 고용 | M | ? |
-| ECIALLCIV | 고용비용지수(ECI) | Q | ✔ |
-| ULCNFB, OPHNFB | 단위노동비용, 노동생산성 | Q | ? |
+| OPHNFB | 단위노동비용, 노동생산성 | Q | ? |
 
 **국민계정·소득·재정·대외**
 
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
 | GDPC1 | 실질 GDP 수준 | Q | ? |
-| W875RX1 | 이전소득 제외 실질 개인소득 (NBER 경기판단 지표) | M | ? |
 | DSPIC96 | 실질 가처분소득 | M | ? |
-| PSAVERT | 개인 저축률 | M | ? |
 | CP | 세후 기업이익 | Q | ? |
-| GFDEGDQ188S | 연방부채/GDP | Q | ? |
 | TDSP | 가계 원리금상환/가처분소득 | Q | ? |
 | BOPGSTB | 상품·서비스 무역수지 | M | ✔ |
 | IEABC | 경상수지 | Q | ? |
@@ -146,52 +132,32 @@ API를 실제로 호출해 본 것은 아닙니다.
 
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| TCU | 설비가동률 | M | ? |
 | IPMAN | 제조업 산업생산 | M | ? |
-| NEWORDER | 핵심 자본재 수주 (항공기 제외) | M | ✔ |
-| DGORDER | 내구재 수주 | M | ? |
-| ISRATIO | 재고/판매 비율 | M | ✔ |
 | RRSFS | 실질 소매판매 | M | ? |
-| TOTALSA | 자동차 판매 | M | ? |
 | TTLCONS | 건설지출 | M | ? |
 | BABATOTALSAUS | 신규 사업자 신청 | M | ? |
-| PERMIT | 건축허가 | M | ? |
-| HSN1F | 신규 단독주택 판매 | M | ? |
-| MSACSR | 신규주택 재고 개월수 | M | ? |
-| USSTHPI, HPIPONM226S | FHFA 주택가격지수 (Case-Shiller 공공 대안) | Q/M | ? |
-| GACDFSA066MSFRBPHI | 필라델피아 연은 제조업 현황 | M | ? |
-| GACDINA066MNFRBNY | 뉴욕 연은 Empire State 제조업 | M | ? |
+| HPIPONM226S | FHFA 주택가격지수 (Case-Shiller 공공 대안) | Q/M | ? |
 
 **물가 세부**
 
 | ID | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| MEDCPIM158SFRBCLE | 중위 CPI (클리블랜드 연은) | M | ✔ |
 | TRMMEANCPIM158SFRBCLE | 16% 절사평균 CPI | M | ? |
-| STICKCPIM159SFRBATL | 경직적 가격 CPI (애틀랜타 연은) | M | ✔ |
-| PCETRIM12M159SFRBDAL | 절사평균 PCE (댈러스 연은) | M | ✔ |
-| PCEPI | PCE 물가 헤드라인 | M | ? |
-| CUSR0000SAH1 | CPI 주거비 | M | ? |
-| CUSR0000SASLE | CPI 에너지 제외 서비스 | M | ? |
-| CUSR0000SACL1E | CPI 식품·에너지 제외 상품 | M | ? |
 | IR | 수입물가 | M | ? |
 | GASREGW | 휘발유 소매가 (EIA) | W | ? |
-| PALLFNFINDEXM | IMF 전체 원자재가격지수 | M | ✔ |
-| PWHEAMTUSDM, PIORECRUSDM, PALUMUSDM | 밀, 철광석, 알루미늄 (IMF) | M | ? |
 
-### 미사용: 정책상 제외 또는 © 주의
+### 미사용: 전망 · 모델 · 민간 지수
 
-| ID | 이름 | 이유 |
+| ID | 이름 | 참고 |
 |---|---|---|
-| GDPNOW, STLENI | GDPNow, 경제뉴스지수 | 나우캐스트 (제외) |
-| FEDTARMD 등 | FOMC 경제전망 중앙값 | 전망 (제외) |
-| GDPPOT, NROU | CBO 잠재 GDP, 자연실업률 | 전망 구간 포함 (제외) |
-| EXPINF1YR, RECPROUSM156N | 모델 기대인플레, 경기침체 확률 | 모델 추정 (제외 권장) |
-| SP500, DJIA, NASDAQCOM | 주가지수 | 주가지수 (제외), © |
-| UMCSENT, MICH | 미시간대 소비자심리, 기대인플레 | © (넣는다면 © 표시) |
-| CSUSHPINSA | Case-Shiller | © (FHFA로 대체 권장) |
-| EXHOSLUSM495S | 기존주택 판매 | NAR © |
-| BAMLC0A0CM, BAMLC0A4CBBB | ICE IG·BBB 스프레드 | ICE ©, 3년치만 |
+| STLENI | 세인트루이스 연은 경제뉴스지수 | 나우캐스트 |
+| FEDTARMD, UNRATEMD, PCECTPIMD | FOMC 경제전망 중앙값 | 미래 연도 관측값이 섞여 있어 최신값 처리를 따로 해야 함 |
+| GDPPOT, NROU | CBO 잠재 GDP, 자연실업률 | 미래 구간 포함 |
+| EXPINF1YR, RECPROUSM156N | 클리블랜드 연은 기대인플레, 경기침체 확률 | 모델 추정 |
+| DJIA | 다우존스 | S&P DJI © |
+| CSUSHPINSA | Case-Shiller (원계열) | 계절조정 CSUSHPISA를 사용중 |
+| EXHOSLUSM495S | 기존주택 판매 | NAR ©, 최근 1년치만 |
+| BAMLC0A4CBBB | ICE BBB 스프레드 | ICE ©, 3년치만 |
 | AAA10Y, DAAA, DBAA | Moody's 회사채 | Moody's © |
 
 ### 쓰지 않는 엔드포인트
@@ -206,16 +172,11 @@ API를 실제로 호출해 본 것은 아닙니다.
 
 ## 2. 미 재무부 Fiscal Data (키 없음)
 
-### 사용중
+### 사용중: 4개
 
-| 엔드포인트 | 필드 | 주기 |
+| 패널 | 개수 | 코드 |
 |---|---|---|
-| `v2/accounting/od/debt_to_penny` | `tot_pub_debt_out_amt` | D |
-| `v2/accounting/od/avg_interest_rates` | `avg_interest_rate_amt` (Total Marketable) | M |
-
-같은 응답에 이미 들어 있는 필드도 있습니다.
-- `debt_to_penny`: 민간 보유분 `debt_held_public_amt`, 정부 내 보유분 `intragov_hold_amt`
-- `avg_interest_rates`: `security_desc`를 Bills, Notes, Bonds, TIPS로 바꾸면 종류별 금리를 받을 수 있습니다.
+| 연준 대차대조표 · 재정 | 4 | debt_to_penny, debt_held_public, avg_interest_rates, avg_interest_rates/bills |
 
 ### 미사용: 쓸 만한 것
 
@@ -231,7 +192,7 @@ API를 실제로 호출해 본 것은 아닙니다.
 | `v1/accounting/od/buybacks_operations` | 국채 바이백 | 수시 | ✔ |
 | `v1/debt/mspd/mspd_table_1` | 시장성·비시장성 부채 구성 (단기채 비중) | M | ? |
 
-### 미사용: 가치 낮음
+### 미사용: 나머지
 
 - `rates_of_exchange`: 재무부 보고용 분기 환율이라 시장 환율이 아닙니다.
 - `gold_reserve`: 장부가로 고정돼 있어 의미가 없습니다.
@@ -245,14 +206,11 @@ home.treasury.gov에서 XML로 제공합니다. 지금은 FRED의 DGS 시리즈�
 
 ## 3. 뉴욕 연은 Markets API (키 없음)
 
-### 사용중
+### 사용중: 4개
 
-| 엔드포인트 | 내용 |
-|---|---|
-| `/api/rates/unsecured/effr` | EFFR |
-| `/api/rates/secured/sofr` | SOFR |
-
-같은 응답에 거래량과 1·25·75·99 퍼센타일도 들어 있습니다.
+| 패널 | 개수 | 코드 |
+|---|---|---|
+| 정책금리 · 국채 · 단기자금 | 4 | EFFR, OBFR, SOFR, TGCR |
 
 ### 미사용: 쓸 만한 것
 
@@ -267,38 +225,26 @@ home.treasury.gov에서 XML로 제공합니다. 지금은 FRED의 DGS 시리즈�
 | `/api/soma/summary.json` | SOMA 보유 요약 (국채·MBS, QT 진행) | W | △ |
 | `/api/pd/...` | 프라이머리 딜러 국채 포지션 | W | △ |
 
-### 미사용: 가치 낮음 또는 회색지대
+### 미사용: 나머지
 
 - 증권대차, 중앙은행 통화스왑(평시에는 거의 0), 가이드시트, 딜러 시장점유율은 가치가 낮습니다.
 - newyorkfed.org에서 파일로만 제공하는 지표가 있습니다(Markets API 아님).
-  - GSCPI(공급망 압력지수), ACM 기간프리미엄: 모델 추정치라 회색지대입니다.
-  - 경기침체 확률, Staff Nowcast, R-star: 전망이나 모델이라 제외합니다.
+  - GSCPI(공급망 압력지수), ACM 기간프리미엄, 경기침체 확률, Staff Nowcast, R-star가 있습니다.
+  - API가 아니라 엑셀·CSV 파일이라 파서를 따로 만들어야 합니다.
 
 ---
 
 ## 4. 한국은행 ECOS
 
-### 사용중: 9개 (코드 모두 확인됨)
+### 사용중: 26개
 
-| 통계표 / 항목 | 주기 | 이름 | 확인 |
-|---|---|---|---|
-| 722Y001 / 0101000 | D | 기준금리 | ✔ |
-| 817Y002 / 010200000 | D | 국고채 3년 | ✔ |
-| 817Y002 / 010210000 | D | 국고채 10년 | ✔ |
-| 731Y001 / 0000001 | D | 원/달러 매매기준율 | ✔ |
-| 901Y009 / 0 | M | 소비자물가지수 (지수, YoY는 앱에서 계산) | ✔ |
-| 901Y118 / T002 | M | 통관 수출금액 (단위 천불) | ✔ |
-| 901Y027 / I61BC / I28B | M | 실업률 (계절조정) | ✔ |
-| 901Y067 / I16D | M | 동행지수 순환변동치 | ✔ |
-| 511Y002 / FME / 99988 | M | 소비자심리지수 | ✔ |
+| 패널 | 개수 | 코드 |
+|---|---|---|
+| 주식 · 변동성 | 2 | 802Y001/0001000, 802Y001/0089000 |
+| 한국 금리 · 금융 | 11 | 722Y001/0101000, 817Y002/010101000, 817Y002/010502000, 817Y002/010200000, 817Y002/010210000, 817Y002/010300000, 731Y001/0000001, 731Y001/0000002, 732Y001/99, 161Y006/BBHA00, 151Y001/1000000 |
+| 한국 성장 · 물가 · 경기 | 13 | 200Y102/10111, 901Y009/0, 901Y010/QB, 404Y014/*AA, 901Y118/T002, 901Y118/T004, 301Y017/SA000, 901Y027/I61BC/I28B, 901Y027/I61E/I28B, 901Y067/I16D, 901Y067/I16E, 511Y002/FME/99988, 513Y001/E2000 |
 
-공개 저장소들의 실제 호출 사례와 9개 모두 일치했습니다. API 서비스는
-StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습니다.
-- StatisticItemList: 항목코드 검증
-- StatisticTableList: 통계표 목록
-- KeyStatisticList: 100대 지표 최신값
-- StatisticWord: 용어 설명
-- StatisticMeta: 작성 방법론
+처음 쓰던 9개는 공개 저장소들의 실제 호출 사례와 코드가 일치했습니다. 이번에 추가한 코드는 아래 확인 표시를 기준으로 골랐습니다(고용률 `I61E/I28B`, 코스피·코스닥 `802Y001`은 검증이 약한 편).
 
 ### 미사용: 쓸 만한 것
 
@@ -306,15 +252,10 @@ StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습
 
 | 통계표 / 항목 | 주기 | 이름 | 확인 |
 |---|---|---|---|
-| 817Y002 / 010101000 | D | 콜금리 (익일물) | ✔ |
-| 817Y002 / 010502000 | D | CD 91일 | ✔ |
-| 817Y002 / 010300000 | D | 회사채 3년 AA− | ✔ |
 | 817Y002 / 010320000 | D | 회사채 3년 BBB− | ✔ |
 | 817Y002 / 010190000, 010195000, 010200001, 010220000, 010230000 | D | 국고채 1·2·5·20·30년 (수익률 곡선) | ✔ |
 | 121Y006 / BECBLA01 | M | 예금은행 대출금리 (신규) — 의미가 출처마다 다름 | △ |
 | 161Y005 / BBHS00 | M | M2 평잔 (계절조정) | ✔ |
-| 161Y006 / BBHA00 | M | M2 평잔 (원계열, YoY용) | ✔ |
-| 151Y001 / 1000000 | Q | 가계신용 총액 | ✔ |
 | 151Y005 / 1110000 | M | 예금취급기관 가계대출 | △ |
 | 104Y016 / BDCA1 | M | 예금은행 총대출금 | ✔ |
 
@@ -322,21 +263,15 @@ StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습
 
 | 통계표 / 항목 | 주기 | 이름 | 확인 |
 |---|---|---|---|
-| 731Y001 / 0000002 | D | 원/100엔 | △ |
 | 731Y001 / 0000053 | D | 원/위안 | ? |
 | 731Y004 / 0000001 / 0000100 | M | 원/달러 월평균 | ✔ |
-| 732Y001 / 99 | M | 외환보유액 | ✔ |
-| 301Y017 / SA000 | M | 경상수지 (계절조정) | ✔ |
 | 301Y013 / 000000 | M | 경상수지 (원계열) | △ |
-| 901Y118 / T004 | M | 통관 수입금액 (무역수지 = T002 − T004) | ✔ |
 
 **물가**
 
 | 통계표 / 항목 | 주기 | 이름 | 확인 |
 |---|---|---|---|
-| 901Y010 / QB | M | 근원 CPI (농산물·석유류 제외) | ✔ |
 | 901Y010 / DB | M | 근원 CPI (식료품·에너지 제외) | ✔ |
-| 404Y014 / *AA | M | 생산자물가 총지수 | ✔ |
 | 401Y015 / *AA / W | M | 수입물가지수 (원화) | ✔ |
 | 402Y014 / *AA / W | M | 수출물가지수 (원화) | ✔ |
 | 511Y003 / FMB | M | 기대인플레이션 (향후 1년) | △ |
@@ -345,7 +280,6 @@ StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습
 
 | 통계표 / 항목 | 주기 | 이름 | 확인 |
 |---|---|---|---|
-| 200Y102 / 10111, 10211 | Q | 실질 GDP 성장률 (전기비, 전년비) | ✔ |
 | 200Y104 / 1400 | Q | 실질 GDP 계절조정 수준 | ✔ |
 | 901Y033 / A00 | M | 전산업생산지수 | ✔ |
 | 901Y100 / G0 | M | 소매판매액지수 | ✔ |
@@ -358,10 +292,7 @@ StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습
 
 | 통계표 / 항목 | 주기 | 이름 | 확인 |
 |---|---|---|---|
-| 901Y067 / I16E | M | 선행지수 순환변동치 | ✔ |
-| 901Y027 / I61E | M | 고용률 | ✔ |
 | 901Y027 / I61BA / I28A | M | 취업자수 (원계열) | ✔ |
-| 513Y001 / E2000 | M | 경제심리지수(ESI) 순환변동치 | ✔ |
 | 511Y002 / FMFB / 99988 | M | 주택가격전망 CSI | △ |
 
 **부동산·해외**
@@ -374,9 +305,9 @@ StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습
 | 902Y006 / US, JP, CN, XM | M | 주요국 정책금리 | ✔ |
 | 902Y008 / 국가코드 | M | 주요국 CPI | ✔ |
 
-### 미사용: 정책상 제외 또는 가치 낮음
+### 미사용: 나머지
 
-- 802Y001 (KOSPI·KOSDAQ), 901Y014, 902Y002: 주가지수라 제외합니다.
+- 901Y014, 902Y002: 월간 주가 통계와 OECD 주요국 주가지수입니다. 일별 코스피·코스닥(802Y001)을 이미 씁니다.
 - 101Y003, 101Y004: 개편 전 M2 통계표입니다. 현행은 161Y005~161Y008입니다.
 - 511Y001, 512Y017, 512Y018: 끝난 계열입니다.
 - 512Y014 (BSI 전망): 갱신 중단과 무효 조합 사례가 보고됐습니다. BSI는 넣기 전에 StatisticItemList로 END_TIME을 확인하세요.
@@ -392,44 +323,32 @@ StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습
   - 변동구성 코드 U2를 쓰는 키는 영향이 없습니다.
   - I9(EA20)를 쓰는 키는 갱신이 멈췄을 수 있습니다.
 
-### 사용중
+### 사용중: 16개
 
-| 키 | 이름 | 상태 |
+| 패널 | 개수 | 코드 |
 |---|---|---|
-| `FM/B.U2.EUR.4F.KR.DFR.LEV` | 예금금리 | 정상 ✔ |
-| `ICP/M.U2.N.000000.4.ANR` | HICP 헤드라인 YoY | **중단된 데이터셋.** `HICP/M.U2.N.000000.4D0.ANR`로 교체 필요 ✔ |
-| `EXR/D.USD.EUR.SP00.A` | EUR/USD | 정상 |
-| `EXR/D.JPY.EUR.SP00.A` | EUR/JPY (USD/JPY 계산용) | 정상 |
+| 유로존 | 15 | FM/DFR, FM/MRR_FR, EST/WT, YC/SR_10Y, YC/SRS_10Y_3M, HICP/U2/ANR, HICP/XEF000, HICP/SERV00, BSI/M30, BSI/A20T/2240, LFSI/UNEHRT, STBS/PROD, CISS/SS_CIN, EXR/USD, EXR/E03 |
+| 글로벌 정책금리 · 환율 | 1 | EXR/JPY÷USD |
+
+유로존 HICP는 중단된 `ICP` 대신 `HICP` 데이터셋으로 받습니다. USD/JPY는 EUR/JPY ÷ EUR/USD로 계산합니다.
 
 ### 미사용: 쓸 만한 것
 
 | 키 | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| `EST/B.EU000A2X2A25.WT` | €STR | D | ✔ |
-| `FM/B.U2.EUR.4F.KR.MRR_FR.LEV` | 주요 리파이낸싱 금리 | D | ✔ |
-| `YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y` | AAA 국채 10년 | D | ✔ |
 | `YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_2Y` | AAA 국채 2년 | D | ? |
-| `YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SRS_10Y_3M` | AAA 10년 − 3개월 | D | ✔ |
 | `IRS/M.I10.L.L40.CI.0000.EUR.N.Z` | 유로존 장기금리 (국가별로 바꾸면 BTP−Bund) | M | ✔ |
-| `HICP/M.U2.N.XEF000.4D0.ANR` | 근원 HICP YoY | M | ✔ |
-| `HICP/M.U2.N.SERV00.4D0.ANR` | 서비스 HICP YoY | M | ✔ |
 | `HICP/M.U2.N.NRGY00.4D0.ANR` | 에너지 HICP YoY | M | ✔ |
-| `BSI/M.U2.Y.V.M30.X.I.U2.2300.Z01.A` | M3 증가율 | M | ✔ |
-| `BSI/M.U2.Y.U.A20T.A.I.U2.2240.Z01.A` | 기업 대출 증가율 | M | ✔ |
 | `BSI/M.U2.Y.U.A20T.A.I.U2.2250.Z01.A` | 가계 대출 증가율 | M | △ |
-| `CISS/D.U2.Z0Z.4F.EC.SS_CIN.IDX` | 시스템 스트레스 지수 | D | ? |
-| `LFSI/M.I9.S.UNEHRT.TOTAL0.15_74.T` | 실업률 (I10 버전 확인 필요) | M | ✔ |
-| `STBS/M.I10.W.PROD.NS0020.4D0.GY.IX` | 산업생산 YoY | M | ✔ |
 | `MNA/Q.N.I10.W2.S1.S1.B.B1GQ._Z._Z._Z.EUR.LR.N` | 실질 GDP (원계열 수준) | Q | ✔ |
 | `RESR/Q.I9._T.N._TR.TVAL.4F0.TB.N.IX` | 주택가격지수 | Q | ✔ |
 | `BLS/Q.U2.ALL.LE.E.Z.B3.ST.S.WFNET` | 은행 대출태도 (대기업) | Q | ✔ |
 | `ILM/W.U2.C.T000000.Z5.Z01` | 유로시스템 총자산 | W | ✔ |
-| `EXR/M.E03.EUR.EN00.A` | 유로 명목실효환율 | M | ✔ |
 | `EXR/D.{GBP,CNY,KRW,CHF}.EUR.SP00.A` | 다른 통화 참조환율 | D | △ |
 
-### 미사용: 정책상 제외 또는 가치 낮음
+### 미사용: 나머지
 
-- SPF(전문가 전망), MPD(스태프 전망), AME(AMECO 전망 연도 포함): 전망이라 제외합니다.
+- SPF(전문가 전망), MPD(스태프 전망), AME(AMECO): 전망 데이터셋입니다. SPF는 키가 예측자 단위라 구조가 복잡하고, AMECO는 연간입니다.
 - ICP, STS, SEC, CBD: 중단된 데이터셋입니다.
 - CSEC, IVF, QSA, TRD, CBD2, 지급결제·은행권·감독 통계: 너무 세부적이거나 늦게 나옵니다.
 
@@ -437,34 +356,24 @@ StatisticSearch 하나만 씁니다. 쓰지 않는 서비스는 다음과 같습
 
 ## 6. BIS Data Portal (키 없음)
 
-### 사용중
+### 사용중: 17개
 
-| 키 | 이름 |
-|---|---|
-| `WS_CBPOL/M.JP/all` | 일본은행 정책금리 |
-| `WS_CBPOL/M.GB/all` | 영란은행 정책금리 |
-
-WS_CBPOL은 40개 이상 중앙은행을 다룹니다. 확장 가능한 코드는 US, XM(유로지역,
-EA가 아님), CN, KR, IN, BR, CA, AU, CH, MX, TR 등입니다(?).
-`M.US+XM+CN+KR/all`처럼 묶어서 한 번에 받을 수 있습니다.
+| 패널 | 개수 | 코드 |
+|---|---|---|
+| 글로벌 정책금리 · 환율 | 6 | WS_CBPOL/JP, WS_CBPOL/GB, WS_CBPOL/CN, WS_CBPOL/CA, WS_CBPOL/AU, WS_CBPOL/CH |
+| 글로벌 신용 · 주택 · 실효환율 | 11 | WS_TC/Q.KR.H.A.M.770.A, WS_TC/Q.KR.P.A.M.770.A, WS_TC/Q.CN.P.A.M.770.A, WS_TC/Q.US.H.A.M.770.A, WS_CREDIT_GAP/Q.KR.P.A.C, WS_CREDIT_GAP/Q.CN.P.A.C, WS_SPP/Q.KR.R.628, WS_SPP/Q.US.R.628, WS_SPP/Q.CN.R.628, WS_EER/M.R.B.KR, WS_EER/M.R.B.US |
 
 ### 미사용: 쓸 만한 것
 
 | 데이터셋 / 예시 키 | 이름 | 주기 | 확인 |
 |---|---|---|---|
-| `WS_CBPOL/M.CN` 등 | 정책금리 국가 확장 | M | △ |
-| `WS_EER/M.R.B.KR` | 실질실효환율 (광의) | M | △ |
 | `WS_EER/M.N.B.US` | 명목실효환율 | M | ? |
-| `WS_SPP/Q.KR.R.628` | 실질 주택가격 | Q | △ (`Q.XW.N.628` 확인) |
-| `WS_TC/Q.KR.P.A.M.770.A` | 민간신용/GDP | Q | △ (`Q.US.C.A.M.770.A` 확인) |
-| `WS_TC/Q.KR.H.A.M.770.A` | 가계부채/GDP | Q | ? |
-| `WS_CREDIT_GAP/Q.KR.P.A.C` | 신용갭 | Q | △ (`Q.LU.P.A.B` 확인) |
 | `WS_DSR/Q.KR.H` | 가계 부채상환비율 | Q | ? |
 | `WS_LONG_CPI/M.KR.771` | 장기 CPI YoY | M | ? |
 | `WS_XRU/M.KR.KRW.A` | 달러 대비 환율 | M | ? |
 | `WS_GLI` | 글로벌 유동성 지표 | Q | 데이터셋만 ✔ |
 
-### 미사용: 가치 낮음
+### 미사용: 나머지
 
 - CPMI 지급결제 통계: 연간이고 늦게 나옵니다.
 - 3년 주기 외환 서베이: 시계열 대시보드에 맞지 않습니다.
@@ -476,14 +385,14 @@ EA가 아님), CN, KR, IN, BR, CA, AU, CH, MX, TR 등입니다(?).
 
 ## 7. OECD Data Explorer (키 없음)
 
-### 사용중
+### 사용중: 13개
 
-| 키 | 이름 | 상태 |
+| 패널 | 개수 | 코드 |
 |---|---|---|
-| `OECD.SDD.STES,DSD_STES@DF_CLI/USA+CHN+KOR.M.LI...AA...H` | 경기선행지수 (미국·중국·한국) | 공식 API 설명서 예시와 형식이 같음 ✔ |
+| 한국 성장 · 물가 · 경기 | 1 | CLI/KOR |
+| 글로벌 경기 · 심리 | 12 | CLI/USA, CLI/CHN, CLI/JPN, CLI/DEU, CLI/GBR, BCICP/USA, BCICP/CHN, BCICP/KOR, BCICP/DEU, CCICP/USA, CCICP/KOR, CCICP/DEU |
 
-CLI는 G20, 스페인, 권역 집계(G7 등)를 다룹니다. 권역 집계 중 일부(A5M)는 FRED
-미러에서 2024년 1월에 멈춰 있어 확인이 필요합니다.
+OECD는 시간당 60회 제한이 있어 경기선행지수 6개국을 한 번에, 기업·소비자 신뢰지수를 한 번에 받습니다(갱신당 2회).
 
 ### 미사용: 쓸 만한 것
 
@@ -500,9 +409,9 @@ CLI는 G20, 스페인, 권역 집계(G7 등)를 다룹니다. 권역 집계 중 
 | `OECD.SDD.NAD,DSD_NAMAIN1@DF_QNA` | 분기 GDP 성장률 | Q | 데이터셋만 ✔ |
 | `OECD.SDD.TPS,DSD_IMTS@DF_IMTS` | 월간 상품무역 | M | 데이터셋만 ✔ |
 
-### 미사용: 정책상 제외 또는 가치 낮음
+### 미사용: 나머지
 
-- Economic Outlook (`DSD_EO@DF_EO`) 계열: 전망이라 제외합니다.
+- Economic Outlook (`DSD_EO@DF_EO`) 계열: 반기 전망 데이터셋으로, 연간 전망치가 미래 연도에 찍혀 있습니다.
 - 분석용 주택가격: 갱신 중단 보고가 있고 BIS와 겹칩니다.
 - 연간 국민계정, 조세·임금·PPP: 연간 구조 지표입니다.
 - BTS/CS 원자료: CLI 데이터셋의 BCI/CCI로 대체할 수 있습니다.

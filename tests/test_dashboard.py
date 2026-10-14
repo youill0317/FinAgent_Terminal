@@ -60,8 +60,7 @@ def test_tape_ids_exist_in_panels() -> None:
     ids = {indicator.id for spec in catalog.PANELS for indicator in spec.indicators}
 
     assert set(catalog.TAPE) <= ids
-    assert "kr_ktb10" in catalog.TAPE
-    assert all("kospi" not in indicator_id for indicator_id in ids)
+    assert {"kr_ktb10", "us_sp500", "kr_kospi"} <= set(catalog.TAPE)
 
 
 def test_charts_regime_and_calendar() -> None:

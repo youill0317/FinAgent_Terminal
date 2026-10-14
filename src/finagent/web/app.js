@@ -10,8 +10,8 @@ const KEY_HELP = {
   FRED: {env: "FRED_API_KEY", url: "https://fredaccount.stlouisfed.org/apikeys"},
   ECOS: {env: "ECOS_API_KEY", url: "https://ecos.bok.or.kr/api/#/AuthKeyApply"},
 };
-const TAPE_LABELS = {us_fftu: "연준 상단", us_10y: "UST 10Y", us_10y3m: "10Y−3M", us_dollar: "달러 광의",
-  wti: "WTI", us_vix: "VIX", kr_usdkrw: "USD/KRW", kr_ktb10: "KTB 10Y"};
+const TAPE_LABELS = {us_fftu: "연준 상단", us_10y: "UST 10Y", us_10y3m: "10Y−3M", us_sp500: "S&P 500",
+  us_dollar: "달러 광의", wti: "WTI", us_vix: "VIX", kr_usdkrw: "USD/KRW", kr_ktb10: "KTB 10Y", kr_kospi: "KOSPI"};
 
 function fmt(v, f) {
   if (v === null || v === undefined) return "—";
