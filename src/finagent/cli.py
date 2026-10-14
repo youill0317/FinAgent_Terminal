@@ -130,6 +130,11 @@ def check_report(dashboard: Dashboard) -> str:
         lines.append(
             f"{source.name:<9}{source.state:<12}{source.ok}/{source.total}{note}"
         )
+    sep = dashboard.projections
+    if sep is not None:
+        state = f"{sep.published} 발표" if sep.rows else "error"
+        note = f"  {sep.message}" if sep.message else ""
+        lines.append(f"{'FOMC SEP':<9}{state}{note}")
     problems = [
         f"  {row.code}: {row.message}"
         for panel in dashboard.panels

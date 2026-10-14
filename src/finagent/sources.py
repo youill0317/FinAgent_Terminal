@@ -191,6 +191,67 @@ async def fred_release_dates(
     return tuple(out)
 
 
+class _FredVintageObservation(_Model):
+    realtime_start: str
+    realtime_end: str
+    date: str
+    value: str
+
+
+class _FredVintageObservations(_Model):
+    observations: tuple[_FredVintageObservation, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Vintage:
+    """A series as FRED published it from ``published`` on."""
+
+    published: date
+    series: Series
+
+
+async def fred_vintages(
+    ctx: FetchContext, series_id: str, since: date
+) -> tuple[Vintage, Vintage | None]:
+    """The current vintage of a series and the one it replaced.
+
+    One request with a real-time window returns every vintage published since
+    ``since``. FOMC projections get a new vintage at each SEP release.
+    """
+    params = {
+        "series_id": series_id,
+        "api_key": ctx.key(FRED_KEY_ENV),
+        "file_type": "json",
+        "realtime_start": since.isoformat(),
+        "realtime_end": "9999-12-31",
+    }
+    text = await ctx.text("FRED", FRED_OBSERVATIONS_URL, params)
+    try:
+        payload = _FredVintageObservations.model_validate_json(text)
+    except ValidationError as error:
+        raise SourceError(f"FRED {series_id}: 응답 형식 오류") from error
+    rows = [
+        (start, end, row.date, row.value)
+        for row in payload.observations
+        if (start := parse_period(row.realtime_start)) is not None
+        and (end := parse_period(row.realtime_end)) is not None
+    ]
+    if not rows:
+        raise SourceError(f"FRED {series_id}: 관측값 없음")
+
+    def as_of(day: date) -> Vintage | None:
+        valid = [row for row in rows if row[0] <= day <= row[1]]
+        series = to_series([(obs_date, value) for _, _, obs_date, value in valid])
+        if not series:
+            return None
+        return Vintage(max(start for start, _, _, _ in valid), series)
+
+    latest = as_of(max(start for start, _, _, _ in rows))
+    if latest is None:
+        raise SourceError(f"FRED {series_id}: 관측값 없음")
+    return latest, as_of(latest.published - timedelta(days=1))
+
+
 # ---------------------------------------------------------------- Treasury Fiscal Data
 
 

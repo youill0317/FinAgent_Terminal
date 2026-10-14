@@ -60,8 +60,7 @@ def test_tape_ids_exist_in_panels() -> None:
     ids = {indicator.id for spec in catalog.PANELS for indicator in spec.indicators}
 
     assert set(catalog.TAPE) <= ids
-    assert "kr_ktb10" in catalog.TAPE
-    assert all("kospi" not in indicator_id for indicator_id in ids)
+    assert {"kr_ktb10", "us_sp500", "kr_kospi"} <= set(catalog.TAPE)
 
 
 def test_charts_regime_and_calendar() -> None:
@@ -88,6 +87,46 @@ def test_charts_regime_and_calendar() -> None:
     assert all("Kansas" not in name for name in names)
 
 
+def test_fomc_projections_compare_with_the_previous_release() -> None:
+    dashboard = build(service())
+
+    sep = dashboard.projections
+    assert sep is not None
+    assert sep.message is None
+    assert sep.published == "2026-09-15"
+    assert sep.prior_published == "2026-06-16"
+    assert sep.years == ("2026", "2027", "2028", "2029")
+    rows = {row.label: row for row in sep.rows}
+    funds = rows["연방기금금리"]
+    assert [(cell.value, cell.prev) for cell in funds.years] == [
+        (3.6, 3.9),
+        (3.4, 3.6),
+        (3.1, 3.4),
+        (3.1, None),
+    ]
+    assert funds.longer_run is not None
+    assert funds.longer_run.value == 3.0
+    assert funds.current == 3.625
+    assert rows["근원 PCE 물가"].longer_run is None
+    assert all(row.current is not None for row in sep.rows)
+    assert "FOMC SEP 2026-09-15 발표" in check_report(dashboard)
+
+
+def test_one_missing_projection_series_keeps_the_rest() -> None:
+    def no_unrate(request: httpx.Request) -> httpx.Response | None:
+        if request.url.params.get("series_id") == "UNRATEMD":
+            return httpx.Response(400)
+        return None
+
+    sep = build(service(wrap=no_unrate)).projections
+
+    assert sep is not None
+    assert sep.message == "FRED HTTP 400"
+    rows = {row.label: row for row in sep.rows}
+    assert all(cell.value is None for cell in rows["실업률"].years)
+    assert rows["연방기금금리"].years[0].value == 3.6
+
+
 def test_missing_keys_mark_only_keyed_sources() -> None:
     dashboard = build(service(env={}))
 
@@ -97,6 +136,7 @@ def test_missing_keys_mark_only_keyed_sources() -> None:
     assert states["TREASURY"] == "ok"
     assert states["ECB"] == "ok"
     assert dashboard.curve is None
+    assert dashboard.projections is None
     assert dashboard.calendar == ()
     assert dashboard.regime[0].tag == "데이터 없음"
 

@@ -14,6 +14,9 @@ from finagent.models import (
     Dashboard,
     IndicatorRow,
     Panel,
+    ProjectionCell,
+    ProjectionRow,
+    Projections,
     RegimeCell,
     SourceSummary,
     Spread,
@@ -23,6 +26,7 @@ from finagent.sources import (
     Ratio,
     combine_ratio,
     fred_release_dates,
+    fred_vintages,
 )
 from finagent.transforms import (
     apply,
@@ -38,7 +42,7 @@ if TYPE_CHECKING:
 
     from finagent.fetch import FetchContext
     from finagent.models import SourceId, SourceState, Tone
-    from finagent.sources import Fetch, Series
+    from finagent.sources import Fetch, Series, Vintage
 
 SOURCE_NAMES: Final[tuple[tuple[SourceId, str], ...]] = (
     ("FRED", "FRED"),
@@ -76,7 +80,9 @@ async def build_dashboard(
         for spec in catalog.PANELS
     )
     rows = {row.id: row for panel in panels for row in panel.rows}
-    calendar = await _calendar(ctx, today)
+    calendar, projections = await asyncio.gather(
+        _calendar(ctx, today), _projections(ctx, today, rows)
+    )
     return Dashboard(
         version=__version__,
         generated_at=now.isoformat(timespec="seconds"),
@@ -87,6 +93,7 @@ async def build_dashboard(
         regime=_regime(rows),
         curve=_curve(outcomes),
         spread=_spread(outcomes),
+        projections=projections,
         panels=panels,
         calendar=calendar,
     )
@@ -314,6 +321,114 @@ def _spread(outcomes: Mapping[Fetch, Outcome]) -> Spread | None:
     recession = outcomes[catalog.RECESSION_SERIES]
     bands = () if isinstance(recession, SourceError) else recession_bands(recession)
     return Spread(points=monthly_mean(spread), recessions=bands)
+
+
+# ---------------------------------------------------------------- FOMC projections
+
+type VintagePair = tuple[Vintage, Vintage | None]
+
+
+async def _vintages(
+    ctx: FetchContext, series_id: str, since: date
+) -> VintagePair | SourceError:
+    try:
+        return await fred_vintages(ctx, series_id, since)
+    except SourceError as error:
+        return error
+
+
+async def _projections(
+    ctx: FetchContext, today: date, rows: Mapping[str, IndicatorRow]
+) -> Projections | None:
+    if not ctx.has_key(FRED_KEY_ENV):
+        return None
+    since = today - timedelta(days=catalog.SEP_LOOKBACK_DAYS)
+    ids = [row.series_id for row in catalog.SEP_ROWS] + [
+        row.longer_run_id for row in catalog.SEP_ROWS if row.longer_run_id
+    ]
+    results = await asyncio.gather(*(_vintages(ctx, sid, since) for sid in ids))
+    got: dict[str, VintagePair | SourceError] = dict(zip(ids, results, strict=True))
+    errors = [result for result in results if isinstance(result, SourceError)]
+    main = [
+        pair
+        for row in catalog.SEP_ROWS
+        if not isinstance(pair := got[row.series_id], SourceError)
+    ]
+    if not main:
+        return Projections(
+            published="",
+            prior_published=None,
+            years=(),
+            rows=(),
+            message=str(errors[0]),
+        )
+    published = max(latest.published for latest, _ in main)
+    priors = [prior.published for _, prior in main if prior is not None]
+    years = sorted(
+        {
+            day.year
+            for latest, _ in main
+            for day, _ in latest.series
+            if day.year >= published.year
+        }
+    )[: catalog.SEP_MAX_YEARS]
+    return Projections(
+        published=published.isoformat(),
+        prior_published=max(priors).isoformat() if priors else None,
+        years=tuple(str(year) for year in years),
+        rows=tuple(
+            _projection_row(spec, got, years, rows) for spec in catalog.SEP_ROWS
+        ),
+        message=str(errors[0]) if errors else None,
+    )
+
+
+def _projection_row(
+    spec: catalog.SepRow,
+    got: Mapping[str, VintagePair | SourceError],
+    years: list[int],
+    rows: Mapping[str, IndicatorRow],
+) -> ProjectionRow:
+    pair = got[spec.series_id]
+    if isinstance(pair, SourceError):
+        cells = tuple(ProjectionCell() for _ in years)
+    else:
+        latest = _by_year(pair[0])
+        prior = _by_year(pair[1]) if pair[1] is not None else {}
+        cells = tuple(
+            ProjectionCell(value=latest.get(year), prev=prior.get(year))
+            for year in years
+        )
+    longer_run: ProjectionCell | None = None
+    if spec.longer_run_id is not None:
+        lr = got[spec.longer_run_id]
+        longer_run = (
+            ProjectionCell()
+            if isinstance(lr, SourceError)
+            else ProjectionCell(
+                value=lr[0].series[-1][1],
+                prev=lr[1].series[-1][1] if lr[1] is not None else None,
+            )
+        )
+    values = [rows[id_].value for id_ in spec.current if id_ in rows]
+    current = (
+        sum(v for v in values if v is not None) / len(values)
+        if values and None not in values
+        else None
+    )
+    return ProjectionRow(
+        label=spec.label,
+        code=f"FRED:{spec.series_id}",
+        current=current,
+        current_note=spec.current_note,
+        current_dec=spec.current_dec,
+        years=cells,
+        longer_run=longer_run,
+    )
+
+
+def _by_year(vintage: Vintage) -> dict[int, float]:
+    return {day.year: value for day, value in vintage.series}
 
 
 async def _calendar(ctx: FetchContext, today: date) -> tuple[CalendarEntry, ...]:

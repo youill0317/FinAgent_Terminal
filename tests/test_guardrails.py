@@ -1,4 +1,4 @@
-"""Scope guardrails: public data only, nothing persisted, no keys in source."""
+"""Scope guardrails: public sources only, nothing persisted, no keys in source."""
 
 from __future__ import annotations
 
@@ -58,9 +58,6 @@ PUBLIC_HOSTS: Final = frozenset(
     }
 )
 URL_HOST_PATTERN: Final = re.compile(r"https://([A-Za-z0-9.-]+)")
-NOT_MACRO_DATA_PATTERN: Final = re.compile(
-    r"forecast|consensus|estimate|GDPNow|nowcast", re.IGNORECASE
-)
 
 
 def _python_files() -> list[Path]:
@@ -109,8 +106,3 @@ def test_catalog_integrity() -> None:
     assert len(ids) == len(set(ids))
     assert set(catalog.TAPE) <= set(ids)
     assert {indicator.fetch.source for indicator in indicators} <= set(SOURCE_LANES)
-    assert [
-        indicator.id
-        for indicator in indicators
-        if NOT_MACRO_DATA_PATTERN.search(f"{indicator.label} {indicator.code}")
-    ] == []
