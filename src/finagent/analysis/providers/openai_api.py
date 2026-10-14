@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     )
 
     from finagent.analysis.providers.base import (
-        Kind,
         ProviderEvent,
         ProviderId,
         RunRequest,
@@ -42,7 +41,6 @@ KEY_ENV: Final = "OPENAI_API_KEY"
 class OpenAiApiProvider:
     id: ProviderId = "openai_api"
     title: str = "OpenAI API 키"
-    kind: Kind = "api_key"
     default_model: str = "gpt-6-astra"
 
     def __init__(self, env: Mapping[str, str]) -> None:

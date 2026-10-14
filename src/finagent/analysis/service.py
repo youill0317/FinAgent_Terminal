@@ -20,7 +20,6 @@ from finagent.analysis.presets import PLACEHOLDER, PRESET_BY_ID, PRESETS
 from finagent.analysis.prompt import Conversation, ToolRecord, Turn, system_prompt
 from finagent.analysis.providers import DEFAULT_PROVIDER, registry
 from finagent.analysis.providers.base import (
-    McpEndpoint,
     ProviderError,
     RunRequest,
     TextDelta,
@@ -36,7 +35,7 @@ if TYPE_CHECKING:
 
     from finagent.analysis.context import Document
     from finagent.analysis.evidence import Evidence
-    from finagent.analysis.providers.base import Provider, ProviderStatus, RunTool
+    from finagent.analysis.providers.base import Provider, ProviderStatus
     from finagent.analysis.tools import Json, ToolResult
     from finagent.models import Dashboard
     from finagent.service import DashboardService
@@ -76,23 +75,17 @@ class AnalysisService:
         "_choice",
         "_dashboard",
         "_lock",
-        "_mcp_run",
-        "_mcp_token",
-        "_mcp_url",
         "_providers",
         "_settings_path",
         "_threads",
-        "_workspace",
     )
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         dashboard: DashboardService,
         env: Mapping[str, str],
         *,
-        workspace: Path,
         settings_path: Path | None = None,
-        mcp_url: str | None = None,
         providers: Mapping[str, Provider] | None = None,
     ) -> None:
         """Wire the analysis to the dashboard service it reads snapshots from."""
@@ -102,13 +95,9 @@ class AnalysisService:
             if providers is not None
             else registry(env, demo=dashboard.demo)
         )
-        self._workspace = workspace
         self._settings_path = settings_path
-        self._mcp_url = mcp_url
         self._threads: dict[str, Thread] = {}
         self._lock = asyncio.Lock()
-        self._mcp_run: RunTool | None = None
-        self._mcp_token = ""
         saved = load_analysis(settings_path) if settings_path is not None else None
         first = DEFAULT_PROVIDER if DEFAULT_PROVIDER in self._providers else ""
         self._choice = saved or AnalysisChoice(first or next(iter(self._providers)))
@@ -154,7 +143,6 @@ class AnalysisService:
                 {
                     "id": provider.id,
                     "title": provider.title,
-                    "kind": provider.kind,
                     "model": self.model_for(provider.id),
                     "default_model": provider.default_model,
                     "status": statuses[provider.id].kind,
@@ -164,19 +152,6 @@ class AnalysisService:
             ],
             "busy": self._lock.locked(),
         }
-
-    # ------------------------------------------------------------ MCP bridge
-
-    def mcp_token_ok(self, token: str) -> bool:
-        return bool(self._mcp_token) and secrets.compare_digest(token, self._mcp_token)
-
-    async def mcp_call(self, name: str, arguments: Mapping[str, object]) -> ToolResult:
-        """A tool call that came in over ``/mcp`` during the current run."""
-        run_tool = self._mcp_run
-        if run_tool is None:
-            msg = "실행 중인 분석이 없습니다"
-            raise ProviderError(msg)
-        return await run_tool(name, arguments)
 
     # ------------------------------------------------------------ run
 
@@ -251,8 +226,6 @@ class AnalysisService:
                 model=model,
                 tools=SPECS,
                 run_tool=run_tool,
-                workspace=self._workspace,
-                mcp=self._open_mcp(run_tool),
                 evidence={**thread.evidence},
             )
             task = asyncio.create_task(self._pump(provider, request, queue, answer))
@@ -263,8 +236,6 @@ class AnalysisService:
                 if not task.done():
                     _ = task.cancel()
                 _ = await asyncio.wait([task])
-                self._mcp_run = None
-                self._mcp_token = ""
             evidence = {**thread.evidence, **box.evidence}
         text = "".join(answer)
         if task.cancelled() or not task.result():
@@ -310,14 +281,6 @@ class AnalysisService:
             return False
         await queue.put(None)
         return True
-
-    def _open_mcp(self, run_tool: RunTool) -> McpEndpoint | None:
-        """Let ``/mcp`` calls in for this run, recorded like any other call."""
-        if self._mcp_url is None:
-            return None
-        self._mcp_run = run_tool
-        self._mcp_token = secrets.token_urlsafe(24)
-        return McpEndpoint(self._mcp_url, self._mcp_token)
 
     async def _thread(self, given: RunInput) -> Thread:
         known = self._threads.get(given.conversation)

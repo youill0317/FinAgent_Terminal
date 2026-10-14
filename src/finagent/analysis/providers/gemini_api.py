@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from google.genai import types
 
     from finagent.analysis.providers.base import (
-        Kind,
         ProviderEvent,
         ProviderId,
         RunRequest,
@@ -40,7 +39,6 @@ NOT_FOUND: Final = 404
 class GeminiApiProvider:
     id: ProviderId = "gemini_api"
     title: str = "Gemini API 키"
-    kind: Kind = "api_key"
     default_model: str = "gemini-4-argon"
 
     def __init__(self, env: Mapping[str, str]) -> None:

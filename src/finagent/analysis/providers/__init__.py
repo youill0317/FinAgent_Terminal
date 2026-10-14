@@ -1,12 +1,10 @@
-"""The five AI providers (two subscriptions, three API keys) and the demo one."""
+"""The three API-key AI providers and the demo one."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
 from finagent.analysis.providers.claude_api import ClaudeApiProvider
-from finagent.analysis.providers.claude_sub import ClaudeSubscriptionProvider
-from finagent.analysis.providers.codex_sub import CodexSubscriptionProvider
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.providers.gemini_api import GeminiApiProvider
 from finagent.analysis.providers.openai_api import OpenAiApiProvider
@@ -16,7 +14,7 @@ if TYPE_CHECKING:
 
     from finagent.analysis.providers.base import Provider
 
-DEFAULT_PROVIDER: Final = "claude_sub"
+DEFAULT_PROVIDER: Final = "claude_api"
 
 
 def registry(env: Mapping[str, str], *, demo: bool) -> dict[str, Provider]:
@@ -24,9 +22,7 @@ def registry(env: Mapping[str, str], *, demo: bool) -> dict[str, Provider]:
     if demo:
         return {"demo": DemoProvider()}
     providers: tuple[Provider, ...] = (
-        ClaudeSubscriptionProvider(env),
         ClaudeApiProvider(env),
-        CodexSubscriptionProvider(env),
         OpenAiApiProvider(env),
         GeminiApiProvider(env),
     )

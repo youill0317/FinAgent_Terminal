@@ -7,7 +7,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const PLACEHOLDER = "{지표}";
-const STATUS_TEXT = {ready: "준비됨", missing_key: "키 없음", login_needed: "로그인 필요", not_installed: "설치 안 됨", error: "확인 실패"};
+const STATUS_TEXT = {ready: "준비됨", missing_key: "키 없음", not_installed: "설치 안 됨"};
 const NUMBER_TEXT = {ok: "데이터와 일치", mismatch: "데이터와 다름", unsupported: "인용한 근거에 없는 숫자"};
 
 const panel = $("analysis"), openBtn = $("aiBtn"), pick = $("aiProvider"), modelIn = $("aiModel");

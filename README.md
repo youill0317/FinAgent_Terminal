@@ -107,25 +107,20 @@ uv run finagent --check      # 서버 없이 한 번 받아와서 출처별 상�
 - **저장하지 않음.** 대화는 앱이 켜져 있는 동안 메모리에만 있습니다. 설정 파일에는
   고른 공급자와 모델 이름만 더해집니다.
 
-공급자는 다섯 가지입니다. 기본은 Claude 구독입니다.
+공급자는 API 키로 쓰는 세 가지입니다. 기본은 Claude입니다. API 사용량만큼 각
+회사에 요금이 나갑니다.
 
-| 공급자 | 기본 모델 | 준비 |
+| 공급자 | 기본 모델 | 키 (`.env`) |
 |---|---|---|
-| Claude 구독 (Claude Agent SDK) | `claude-opus-5-5` | 터미널에서 `claude auth login` |
-| Claude API 키 | `claude-opus-5-5` | `.env`에 `ANTHROPIC_API_KEY` |
-| ChatGPT 구독 (Codex Python SDK, 베타) | `gpt-6-astra` | 터미널에서 `codex login` |
-| OpenAI API 키 | `gpt-6-astra` | `.env`에 `OPENAI_API_KEY` |
-| Gemini API 키 | `gemini-4-argon` | `.env`에 `GEMINI_API_KEY` |
+| Claude API | `claude-opus-5-5` | `ANTHROPIC_API_KEY` |
+| OpenAI API | `gpt-6-astra` | `OPENAI_API_KEY` |
+| Gemini API | `gemini-4-argon` | `GEMINI_API_KEY` (또는 `GOOGLE_API_KEY`) |
 
-- `uv sync`는 다섯 공급자의 SDK를 모두 설치합니다. 필요한 것만 설치하려면
-  `uv sync --no-dev --extra claude-sub`처럼 고릅니다(`claude-sub`, `claude-api`,
-  `codex-sub`, `openai`, `gemini`, 전부는 `llm`).
-- 구독 로그인은 각 CLI가 자기 방식으로 합니다. 앱은 로그인 토큰을 읽거나 저장하지
-  않고 CLI의 로그인 폴더도 건드리지 않습니다.
-- 구독 경로는 모델이 셸·파일 도구 없이 FinAgent의 데이터 도구만 쓰도록 실행합니다.
-  ChatGPT 구독은 앱의 `127.0.0.1` 주소(`/mcp`)로 도구를 부르고, 그 주소는 실행 중에만
-  그 실행의 토큰으로 열립니다.
-- 개인용입니다. 자기 구독과 자기 키로 씁니다.
+- `uv sync`는 세 공급자의 SDK를 모두 설치합니다. 필요한 것만 설치하려면
+  `uv sync --no-dev --extra claude`처럼 고릅니다(`claude`, `openai`, `gemini`,
+  전부는 `llm`).
+- 모델 이름은 화면에서 바꿀 수 있습니다. 비워 두면 위 기본 모델을 씁니다.
+- 키는 `.env`나 환경변수에서 읽기만 하고 어디에도 저장하지 않습니다.
 - 공급자 상태는 화면의 공급자 옆과 `uv run finagent --check` 출력에 나옵니다.
 
 ## 데이터 원칙

@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from finagent.analysis.providers.base import (
-        Kind,
         ProviderEvent,
         ProviderId,
         RunRequest,
@@ -33,7 +32,6 @@ SUMMARY: Final = "**결론**: 핵심 지표를 표로 옮기고 도구로 긴 �
 class DemoProvider:
     id: ProviderId = "demo"
     title: str = "데모 (모델 없음)"
-    kind: Kind = "demo"
     default_model: str = "demo"
 
     def __init__(self, delay: float = DELAY_SECONDS) -> None:

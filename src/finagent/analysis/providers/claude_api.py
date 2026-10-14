@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     )
 
     from finagent.analysis.providers.base import (
-        Kind,
         ProviderEvent,
         ProviderId,
         RunRequest,
@@ -45,7 +44,6 @@ EFFORT: Final = "high"
 class ClaudeApiProvider:
     id: ProviderId = "claude_api"
     title: str = "Claude API 키"
-    kind: Kind = "api_key"
     default_model: str = "claude-opus-5-5"
 
     def __init__(self, env: Mapping[str, str]) -> None:
@@ -54,7 +52,7 @@ class ClaudeApiProvider:
 
     async def status(self) -> ProviderStatus:
         if not installed("anthropic"):
-            return ProviderStatus("not_installed", "uv sync --extra claude-api")
+            return ProviderStatus("not_installed", "uv sync --extra claude")
         if not self._key:
             return ProviderStatus("missing_key", f"{KEY_ENV}가 없습니다")
         return ProviderStatus("ready")

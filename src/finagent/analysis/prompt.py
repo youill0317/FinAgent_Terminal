@@ -85,17 +85,6 @@ class Conversation:
                 )
         return tuple(out)
 
-    def transcript(self) -> str:
-        """The whole conversation as one prompt, for providers run as a CLI."""
-        blocks: list[str] = []
-        for message in self.messages():
-            tag = "user_turn" if message.role == "user" else "assistant_turn"
-            blocks.append(f"<{tag}>\n{message.text}\n</{tag}>")
-        return (
-            "아래는 지금까지의 대화다. 마지막 user_turn의 요청에 답해 줘.\n\n"
-            + "\n\n".join(blocks)
-        )
-
 
 def _answer_with_data(turn: Turn) -> str:
     if not turn.tools:

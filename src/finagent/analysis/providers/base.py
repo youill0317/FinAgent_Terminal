@@ -13,17 +13,13 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
-    from pathlib import Path
 
     from finagent.analysis.evidence import Evidence
     from finagent.analysis.prompt import Conversation
     from finagent.analysis.tools import Json, ToolResult
 
-ProviderId = Literal[
-    "claude_sub", "claude_api", "codex_sub", "openai_api", "gemini_api", "demo"
-]
-Kind = Literal["subscription", "api_key", "demo"]
-StatusKind = Literal["ready", "missing_key", "login_needed", "not_installed", "error"]
+ProviderId = Literal["claude_api", "openai_api", "gemini_api", "demo"]
+StatusKind = Literal["ready", "missing_key", "not_installed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,14 +54,6 @@ class RunTool(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class McpEndpoint:
-    """FinAgent's ``/mcp`` URL and the bearer token valid for this run."""
-
-    url: str
-    token: str
-
-
-@dataclass(frozen=True, slots=True)
 class ToolSpec:
     name: str
     description: str
@@ -82,8 +70,6 @@ class RunRequest:
     model: str
     tools: tuple[ToolSpec, ...]
     run_tool: RunTool
-    workspace: Path
-    mcp: McpEndpoint | None = None
     evidence: Mapping[str, Evidence] = field(default_factory=_no_evidence)
 
 
@@ -94,11 +80,10 @@ class ProviderError(Exception):
 class Provider(Protocol):
     id: ProviderId
     title: str
-    kind: Kind
     default_model: str
 
     async def status(self) -> ProviderStatus:
-        """Whether this provider can run now (installed, key or login present)."""
+        """Whether this provider can run now (SDK installed, key present)."""
         ...
 
     def stream(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:

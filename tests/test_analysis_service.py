@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
 import httpx
 
 from finagent import catalog
-from finagent.analysis import mcp
 from finagent.analysis.providers import DEFAULT_PROVIDER, registry
 from finagent.analysis.providers.base import (
     ProviderError,
@@ -33,9 +31,9 @@ from finagent.settings import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from pathlib import Path
 
     from finagent.analysis.providers.base import (
-        Kind,
         ProviderEvent,
         ProviderId,
         RunRequest,
@@ -62,7 +60,6 @@ class Recorder:
 
     id: ProviderId = "demo"
     title: str = "기록"
-    kind: Kind = "demo"
     default_model: str = "fixed"
 
     def __init__(self, text: str = "실업률은 4.1%다. [[us_unrate]]") -> None:
@@ -103,14 +100,11 @@ def analysis(
     provider: Recorder | DemoProvider,
     svc: DashboardService | None = None,
     settings_path: Path | None = None,
-    mcp_url: str | None = None,
 ) -> AnalysisService:
     return AnalysisService(
         svc or dashboard(),
         {},
-        workspace=Path.cwd(),
         settings_path=settings_path,
-        mcp_url=mcp_url,
         providers={"demo": provider},
     )
 
@@ -283,15 +277,9 @@ def test_settings_keep_each_others_keys(tmp_path: Path) -> None:
 def test_registry_and_api_key_status() -> None:
     providers = registry({}, demo=False)
 
-    assert list(providers) == [
-        "claude_sub",
-        "claude_api",
-        "codex_sub",
-        "openai_api",
-        "gemini_api",
-    ]
-    assert DEFAULT_PROVIDER == "claude_sub"
-    assert providers["claude_sub"].default_model == "claude-opus-5-5"
+    assert list(providers) == ["claude_api", "openai_api", "gemini_api"]
+    assert DEFAULT_PROVIDER == "claude_api"
+    assert providers["claude_api"].default_model == "claude-opus-5-5"
     assert providers["openai_api"].default_model == "gpt-6-astra"
     assert providers["gemini_api"].default_model == "gemini-4-argon"
     assert list(registry({}, demo=True)) == ["demo"]
@@ -308,14 +296,14 @@ def test_registry_and_api_key_status() -> None:
 def test_provider_report_lists_every_provider() -> None:
     report = provider_report(
         {
-            "claude_sub": ProviderStatus("ready", "로그인됨"),
+            "claude_api": ProviderStatus("ready"),
             "openai_api": ProviderStatus("missing_key", "OPENAI_API_KEY가 없습니다"),
         }
     )
 
     lines = report.splitlines()
     assert lines[0] == "AI 공급자 (선택 기능):"
-    assert "claude_sub" in lines[1]
+    assert "claude_api" in lines[1]
     assert "ready" in lines[1]
     assert "OPENAI_API_KEY" in lines[2]
 
@@ -364,109 +352,6 @@ def test_analysis_routes() -> None:
             assert (await client.get("/static/analysis.js")).status_code == 200
 
     asyncio.run(scenario())
-
-
-class McpProbe(Recorder):
-    """Calls FinAgent's /mcp endpoint the way the Codex runtime would."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.client: httpx.AsyncClient | None = None
-        self.answers: list[httpx.Response] = []
-
-    @override
-    async def stream(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:
-        assert request.mcp is not None
-        assert self.client is not None
-        good = {"authorization": f"Bearer {request.mcp.token}"}
-        bad = {"authorization": "Bearer wrong"}
-        calls: list[tuple[dict[str, str], object]] = [
-            (bad, {"jsonrpc": "2.0", "id": 0, "method": "ping"}),
-            (good, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
-            (good, {"jsonrpc": "2.0", "method": "notifications/initialized"}),
-            (good, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
-            (
-                good,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {"name": "get_series", "arguments": {"id": "us_unrate"}},
-                },
-            ),
-            (good, [{"jsonrpc": "2.0", "id": 4, "method": "nope"}]),
-        ]
-        for headers, body in calls:
-            self.answers.append(
-                await self.client.post("/mcp", json=body, headers=headers)
-            )
-        yield TextDelta("완료")
-
-
-def test_mcp_endpoint_serves_tools_only_during_a_run() -> None:
-    svc = dashboard()
-    probe = McpProbe()
-    service = analysis(probe, svc, mcp_url="http://local/mcp")
-    transport = httpx.ASGITransport(app=create_app(svc, warm=False, analysis=service))
-
-    async def scenario() -> list[Event]:
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://local"
-        ) as client:
-            probe.client = client
-            outside = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 9})
-            assert outside.status_code == 401
-            assert (await client.get("/mcp")).status_code == 405
-            return await collect(service, RunInput("도구 확인"))
-
-    events = asyncio.run(scenario())
-
-    assert events[-1]["type"] == "done"
-    assert [event["summary"] for event in of_type(events, "tool")] != []
-
-    statuses = [answer.status_code for answer in probe.answers]
-    assert statuses == [401, 200, 202, 200, 200, 200]
-    bodies = [
-        cast("object", answer.json()) for answer in probe.answers if answer.content
-    ]
-    init, listed, called, batch = (
-        json.dumps(body, ensure_ascii=False) for body in bodies[1:]
-    )
-    assert '"name": "finagent"' in init
-    assert all(
-        f'"name": "{name}"' in listed
-        for name in ("search_series", "get_series", "source_guide")
-    )
-    assert '"isError": false' in called
-    assert "us_unrate" in called
-    assert '"code": -32601' in batch
-    assert not service.mcp_token_ok("")
-
-
-def test_mcp_handle_without_a_run() -> None:
-    service = analysis(Recorder())
-
-    async def scenario() -> list[object]:
-        return [
-            await mcp.handle(service, "not an object"),
-            await mcp.handle(service, {"jsonrpc": "2.0", "method": "x"}),
-            await mcp.handle(
-                service,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {"name": "get_series", "arguments": {}},
-                },
-            ),
-        ]
-
-    invalid, notification, call = asyncio.run(scenario())
-
-    assert cast("dict[str, dict[str, object]]", invalid)["error"]["code"] == -32600
-    assert notification is None
-    result = cast("dict[str, dict[str, object]]", call)["result"]
-    assert result["isError"] is True
 
 
 def test_default_view_is_the_core_view() -> None:

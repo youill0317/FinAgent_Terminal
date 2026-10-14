@@ -4,13 +4,12 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from importlib.resources import files
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Literal
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from finagent.analysis import mcp
 from finagent.analysis.providers.base import ProviderError
 from finagent.analysis.service import RunInput
 
@@ -124,44 +123,6 @@ def _analysis_routes(app: FastAPI, analysis: AnalysisService) -> None:
         return StreamingResponse(
             events(), media_type="text/event-stream", headers=NO_STORE
         )
-
-    _mcp_routes(app, analysis)
-
-
-def _mcp_routes(app: FastAPI, analysis: AnalysisService) -> None:
-    @app.post("/mcp")
-    async def mcp_post(request: Request) -> Response:  # pyright: ignore[reportUnusedFunction]
-        token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-        if not analysis.mcp_token_ok(token):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        try:
-            message = cast("object", await request.json())
-        except json.JSONDecodeError:
-            return JSONResponse(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32700, "message": "parse error"},
-                },
-                status_code=400,
-            )
-        if isinstance(message, list):
-            answers = [
-                answer
-                for item in cast("list[object]", message)
-                if (answer := await mcp.handle(analysis, item)) is not None
-            ]
-            return JSONResponse(answers) if answers else Response(status_code=202)
-        answer = await mcp.handle(analysis, message)
-        return Response(status_code=202) if answer is None else JSONResponse(answer)
-
-    @app.get("/mcp")
-    async def mcp_get() -> Response:  # pyright: ignore[reportUnusedFunction]
-        return Response(status_code=405)
-
-    @app.delete("/mcp")
-    async def mcp_delete() -> Response:  # pyright: ignore[reportUnusedFunction]
-        return Response(status_code=200)
 
 
 def _json(dashboard: Dashboard) -> Response:

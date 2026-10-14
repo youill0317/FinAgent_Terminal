@@ -180,7 +180,6 @@ def test_conversation_puts_the_document_first_and_keeps_earlier_tool_data() -> N
     assert "<request>\n처음 질문\n</request>" in messages[0].parts[1]
     assert '<tool_result name="get_series"' in messages[1].text
     assert messages[2].text == "<request>\n후속 질문\n</request>"
-    assert talk.transcript().count("<user_turn>") == 2
 
 
 def test_presets_load_their_text_and_name_real_panels() -> None:

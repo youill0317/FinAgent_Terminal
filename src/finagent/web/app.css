@@ -177,7 +177,7 @@ ul.opts small{color:var(--muted);font-size:10.5px;white-space:nowrap}
 .ai-bar .seg button:disabled{opacity:.45;cursor:not-allowed}
 .ai-st{font-size:11px}
 .ai-st[data-s="ready"]{color:var(--up)}
-.ai-st[data-s="missing_key"],.ai-st[data-s="login_needed"],.ai-st[data-s="not_installed"]{color:var(--yellow)}
+.ai-st[data-s="missing_key"],.ai-st[data-s="not_installed"]{color:var(--yellow)}
 .ai-st[data-s="error"]{color:var(--down)}
 .chips{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0 6px}
 .chips button{background:transparent;border:1px solid var(--line-2);color:var(--amber);padding:1px 8px;cursor:pointer;font-size:11.5px}

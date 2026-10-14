@@ -121,14 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings_path = resolve_settings(args.settings)
     service = build_service(demo=args.demo, env=env, settings_path=settings_path)
 
-    url = f"http://{HOST}:{args.port}/"
-    analysis = AnalysisService(
-        service,
-        env,
-        workspace=Path.cwd(),
-        settings_path=settings_path,
-        mcp_url=f"{url}mcp",
-    )
+    analysis = AnalysisService(service, env, settings_path=settings_path)
     if args.check:
         return run_check(service, analysis)
 
@@ -136,6 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from finagent.server import create_app  # noqa: PLC0415
 
+    url = f"http://{HOST}:{args.port}/"
     print(f"FinAgent {__version__}: {url}  (종료: Ctrl+C)")  # noqa: T201
     print(f"보기 설정: {settings_path}")  # noqa: T201
     if not args.no_browser:
