@@ -42,8 +42,8 @@ def service(
     )
 
 
-def build(svc: DashboardService) -> Dashboard:
-    return asyncio.run(svc.get())
+def build(svc: DashboardService, deep: frozenset[str] = catalog.ALL_VIEWS) -> Dashboard:
+    return asyncio.run(svc.get(deep=deep))
 
 
 def test_every_catalog_indicator_resolves_with_demo_data() -> None:
@@ -60,6 +60,9 @@ def test_tape_ids_exist_in_panels() -> None:
     ids = {indicator.id for spec in catalog.PANELS for indicator in spec.indicators}
 
     assert set(catalog.TAPE) <= ids
+    # The tape and the SEP "current" column read rows the default view shows.
+    assert set(catalog.TAPE) <= catalog.CORE
+    assert {id_ for row in catalog.SEP_ROWS for id_ in row.current} <= catalog.CORE
     assert {"kr_ktb10", "us_sp500", "kr_kospi"} <= set(catalog.TAPE)
 
 
@@ -157,6 +160,87 @@ def test_one_failing_source_does_not_hide_the_others() -> None:
     assert "BIS:WS_CBPOL/JP" in check_report(dashboard)
 
 
+def test_default_view_shows_core_rows_only() -> None:
+    dashboard = build(service(), catalog.CORE_VIEW)
+
+    rows = [row for panel in dashboard.panels for row in panel.rows]
+    assert {row.id for row in rows} == catalog.CORE
+    assert all(row.status == "ok" for row in rows)
+    assert "housing" not in {panel.id for panel in dashboard.panels}
+    assert dashboard.deep == ()
+    assert dashboard.curve is None
+    assert dashboard.spread is not None
+    assert all(cell.tag != "데이터 없음" for cell in dashboard.regime)
+    assert dashboard.projections is not None
+    assert all(row.current is not None for row in dashboard.projections.rows)
+    views = {view.id: view for view in dashboard.views}
+    assert set(views) == catalog.ALL_VIEWS
+    assert views["housing"].core == 0
+    assert views["housing"].extra == 8
+    assert sum(view.core for view in views.values()) == len(catalog.CORE)
+
+
+def test_deep_view_adds_a_panels_remaining_rows() -> None:
+    dashboard = build(service(), frozenset({"labor", "curve", "nonsense"}))
+
+    panels = {panel.id: panel for panel in dashboard.panels}
+    labor = next(spec for spec in catalog.PANELS if spec.id == "labor")
+    assert len(panels["labor"].rows) == len(labor.indicators)
+    assert {row.id for row in panels["inflation"].rows} <= catalog.CORE
+    assert dashboard.deep == ("labor", "curve")
+    assert dashboard.curve is not None
+
+
+def test_changing_the_view_fetches_only_new_series() -> None:
+    requests: list[str] = []
+
+    def count(request: httpx.Request) -> None:
+        requests.append(str(request.url))
+
+    svc = service(wrap=count)
+
+    async def scenario() -> list[int]:
+        sizes: list[int] = []
+        for deep, refresh in (
+            (catalog.CORE_VIEW, False),
+            (frozenset({"housing"}), False),
+            (catalog.CORE_VIEW, False),
+            (catalog.CORE_VIEW, True),
+        ):
+            _ = await svc.get(deep=deep, refresh=refresh)
+            sizes.append(len(requests))
+        return sizes
+
+    core, with_housing, back, refreshed = asyncio.run(scenario())
+    housing = next(spec for spec in catalog.PANELS if spec.id == "housing")
+    assert with_housing - core == len(housing.indicators)
+    assert back == with_housing
+    assert refreshed - back == core
+
+
+def test_a_different_view_waits_for_the_pass_in_flight() -> None:
+    requests: list[str] = []
+
+    def count(request: httpx.Request) -> None:
+        requests.append(str(request.url))
+
+    svc = service(wrap=count)
+
+    async def scenario() -> tuple[Dashboard, Dashboard]:
+        first, second = await asyncio.gather(
+            svc.get(), svc.get(deep=frozenset({"housing"}))
+        )
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first.deep == ()
+    assert second.deep == ("housing",)
+    alone = len(requests)
+    requests.clear()
+    _ = asyncio.run(service(wrap=count).get(deep=frozenset({"housing"})))
+    assert alone == len(requests)
+
+
 def test_snapshot_is_reused_until_refresh() -> None:
     requests: list[str] = []
 
@@ -221,9 +305,17 @@ def test_server_routes() -> None:
                 "ECOS",
                 "OECD",
             }
+            assert payload.deep == ()
             refreshed = await client.get("/api/dashboard", params={"refresh": "true"})
             assert refreshed.status_code == 200
             assert refreshed.headers["cache-control"] == "no-store"
+            deep = await client.get(
+                "/api/dashboard", params={"deep": "housing,curve,../etc"}
+            )
+            assert Dashboard.model_validate_json(deep.text).deep == (
+                "housing",
+                "curve",
+            )
 
     asyncio.run(scenario())
 

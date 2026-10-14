@@ -105,4 +105,5 @@ def test_catalog_integrity() -> None:
 
     assert len(ids) == len(set(ids))
     assert set(catalog.TAPE) <= set(ids)
+    assert set(ids) >= catalog.CORE
     assert {indicator.fetch.source for indicator in indicators} <= set(SOURCE_LANES)

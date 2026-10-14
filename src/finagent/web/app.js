@@ -132,7 +132,7 @@ function renderStatus(d) {
   const total = d.sources.reduce((a, s) => a + s.ok, 0);
   $("status").innerHTML = d.sources.map((s) =>
     `<span class="src" data-s="${esc(s.state)}" title="${esc(s.message || "")}"><i aria-hidden="true"></i><b>${esc(s.name)}</b>${s.ok}/${s.total}</span>`).join("")
-    + `<span class="mem">v${esc(d.version)} · 메모리 ${total}개 시리즈 · 디스크 저장 0 · ${d.elapsed_seconds.toFixed(1)}s · 갱신 <span style="color:var(--amber)">${stamp}</span></span>`;
+    + `<span class="mem">보기 ${esc(viewLabel(d))} · v${esc(d.version)} · 메모리 ${total}개 시리즈 · 디스크 저장 0 · ${d.elapsed_seconds.toFixed(1)}s · 갱신 <span style="color:var(--amber)">${stamp}</span></span>`;
 }
 function renderNotices(d) {
   const out = [];
@@ -168,6 +168,10 @@ function renderRegime(d) {
 }
 const CURVE_STYLE = [{color: "var(--amber)", w: 2.5, end: true}, {color: "var(--cyan)", w: 1.5}, {color: "var(--muted)", w: 1.5, dash: "4 4"}];
 function renderCurve(d) {
+  const on = d.deep.includes("curve");
+  $("ycPanel").hidden = !on;
+  $("curveRow").classList.toggle("solo", !on);
+  if (!on) return;
   const c = d.curve;
   if (!c) { $("ycLg").innerHTML = ""; $("yc").innerHTML = '<div class="empty">FRED 키가 있어야 표시됩니다</div>'; return; }
   const series = c.lines.map((l, i) => ({...CURVE_STYLE[i], v: l.values, name: `${l.label} ${l.date.slice(2)}`}));
@@ -223,8 +227,9 @@ function renderSep(d) {
 }
 function renderPanels(d) {
   const host = $("panels");
+  const views = Object.fromEntries(d.views.map((v) => [v.id, v]));
   host.innerHTML = d.panels.map((p) => `<article class="pn" id="${esc(p.id)}">
-    <div class="pn-h"><b><span>${esc(p.key)}</span>${esc(p.title)}</b><small>${esc(p.note)}</small></div>
+    <div class="pn-h"><b><span>${esc(p.key)}</span>${esc(p.title)}</b><div class="hr"><small>${esc(p.note)}</small>${moreButton(views[p.id], d)}</div></div>
     <div class="tw"><table class="t"><thead><tr><th>지표</th><th>최신</th><th>변화</th><th>추이</th><th>기준</th></tr></thead><tbody>
     ${p.rows.map((r) => {
       const code = `<code>${esc(r.code)}${r.copyright ? " · © " + esc(r.copyright) : ""}</code>`;
@@ -242,6 +247,13 @@ function renderPanels(d) {
     if (cell) spark(cell, r);
   }));
 }
+function moreButton(v, d) {
+  if (!v || !v.extra) return "";
+  const on = d.deep.includes(v.id);
+  const label = on ? "핵심만" : `+${v.extra} 심화`;
+  const tip = on ? "핵심 지표만 보기" : `나머지 ${v.extra}개 지표도 보기`;
+  return `<button class="more" type="button" data-view="${esc(v.id)}" aria-pressed="${on}" title="${tip}">${label}</button>`;
+}
 function calendarPanel(d) {
   const fredOk = d.sources.some((s) => s.id === "FRED" && s.state !== "missing_key");
   const weekday = ["일", "월", "화", "수", "목", "금", "토"];
@@ -253,6 +265,68 @@ function calendarPanel(d) {
     : `<div class="cal-empty">${fredOk ? "앞으로 7일 안에 주요 발표가 없습니다." : "FRED 키가 있으면 이번 주 발표 일정이 표시됩니다."}</div>`;
   return `<article class="pn" id="calendar"><div class="pn-h"><b><span>CAL</span>앞으로 7일 미국 발표</b><small>FRED releases/dates</small></div><div class="pn-b">${body}</div></article>`;
 }
+// ---------------------------------------------------------------- view settings
+const VIEW_KEY = "finagent.deep";
+function readDeep() {
+  try {
+    const v = JSON.parse(localStorage.getItem(VIEW_KEY) || "[]");
+    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+  } catch (e) { return []; }
+}
+function saveDeep(list) {
+  try { localStorage.setItem(VIEW_KEY, JSON.stringify(list)); } catch (e) { /* view still applies for this tab */ }
+}
+let deep = readDeep();
+
+function viewLabel(d) {
+  if (!d.deep.length) return "핵심";
+  if (d.deep.length === d.views.length) return "전체";
+  return `핵심 + 심화 ${d.deep.length}`;
+}
+function setDeep(list) {
+  const next = [...new Set(list)].sort();
+  if (next.join(",") === [...deep].sort().join(",")) return;
+  deep = next; saveDeep(deep); load(false);
+}
+const dlg = $("settings");
+function checkedViews() { return [...dlg.querySelectorAll("#viewOpts input:checked")].map((i) => i.value); }
+function summarize() {
+  if (!data) return;
+  const on = new Set(checkedViews()), panels = data.views.filter((v) => v.id !== "curve");
+  const total = panels.reduce((a, v) => a + v.core + v.extra, 0);
+  const shown = panels.reduce((a, v) => a + v.core + (on.has(v.id) ? v.extra : 0), 0);
+  $("viewSum").textContent = `표시 지표 ${shown} / ${total}개${on.has("curve") ? " · 수익률 곡선 차트" : ""}`;
+}
+function openSettings() {
+  if (!data || dlg.open) return;
+  const on = new Set(data.deep);
+  $("viewOpts").innerHTML = data.views.map((v) => {
+    const note = v.id === "curve" ? `차트 · 시리즈 ${v.extra}개`
+      : !v.extra ? `모두 핵심 ${v.core}개`
+      : v.core ? `핵심 ${v.core} · 심화 +${v.extra}` : `기본 숨김 · 켜면 ${v.extra}개`;
+    return `<li><label><input type="checkbox" value="${esc(v.id)}"${on.has(v.id) ? " checked" : ""}${v.extra ? "" : " disabled"}>`
+      + `<span class="k">${esc(v.key)}</span><span>${esc(v.title)}</span><small>${note}</small></label></li>`;
+  }).join("");
+  summarize();
+  dlg.returnValue = "";
+  dlg.showModal();
+}
+$("viewOpts").addEventListener("change", summarize);
+$("presets").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-preset]");
+  if (!b) return;
+  dlg.querySelectorAll("#viewOpts input:not(:disabled)").forEach((i) => { i.checked = b.dataset.preset === "all"; });
+  summarize();
+});
+dlg.addEventListener("close", () => { if (dlg.returnValue === "apply") setDeep(checkedViews()); });
+$("settingsBtn").addEventListener("click", openSettings);
+$("panels").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-view]");
+  if (!b) return;
+  const id = b.dataset.view;
+  setDeep(deep.includes(id) ? deep.filter((x) => x !== id) : [...deep, id]);
+});
+
 function render(d) {
   data = d;
   renderStatus(d); renderNotices(d); renderTape(d); renderRegime(d);
@@ -261,20 +335,27 @@ function render(d) {
 
 // ---------------------------------------------------------------- load / refresh
 const btn = $("refreshBtn"), toast = $("toast");
-let busy = false, toastTimer;
+let busy = false, queued = false, toastTimer;
 function say(msg) { toast.textContent = msg; toast.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.hidden = true; }, 2800); }
 
 async function load(refresh) {
-  if (busy) return;
+  if (busy) { if (!refresh) queued = true; return; }
+  const before = data ? data.deep.join(",") : null;
   busy = true; btn.disabled = true;
   if (refresh && data) {
     document.querySelectorAll("#status .src").forEach((s) => { s.dataset.s = "loading"; });
   }
   try {
-    const res = await fetch(`/api/dashboard${refresh ? "?refresh=true" : ""}`, {cache: "no-store"});
+    const q = new URLSearchParams({deep: deep.join(",")});
+    if (refresh) q.set("refresh", "true");
+    const res = await fetch(`/api/dashboard?${q}`, {cache: "no-store"});
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const d = await res.json();
     render(d);
+    if (!refresh && before !== null && before !== d.deep.join(",")) {
+      const rows = d.panels.reduce((a, p) => a + p.rows.length, 0);
+      say(`보기 ${viewLabel(d)} · 지표 ${rows}개 표시`);
+    }
     if (refresh) {
       document.querySelectorAll("#panels tbody tr").forEach((r) => { r.classList.remove("fresh"); void r.offsetWidth; r.classList.add("fresh"); });
       const ok = d.sources.reduce((a, s) => a + s.ok, 0), total = d.sources.reduce((a, s) => a + s.total, 0);
@@ -285,6 +366,7 @@ async function load(refresh) {
     if (data) renderStatus(data);
   } finally {
     busy = false; btn.disabled = false;
+    if (queued) { queued = false; load(false); }
   }
 }
 
@@ -299,10 +381,12 @@ function clocks() {
 
 btn.addEventListener("click", () => load(true));
 document.addEventListener("keydown", (e) => {
-  if ((e.key === "r" || e.key === "R") && !e.metaKey && !e.ctrlKey && !e.altKey && !/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) load(true);
+  if (e.metaKey || e.ctrlKey || e.altKey || dlg.open || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+  if (e.key === "r" || e.key === "R") load(true);
+  else if (e.key === "s" || e.key === "S") { e.preventDefault(); openSettings(); }
 });
-document.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => {
-  document.querySelectorAll(".seg button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+document.querySelectorAll("#spRange button").forEach((b) => b.addEventListener("click", () => {
+  document.querySelectorAll("#spRange button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
   spreadRange = Number(b.dataset.r);
   if (data) renderSpread(data);
 }));

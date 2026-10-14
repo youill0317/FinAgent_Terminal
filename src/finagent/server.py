@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Annotated
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, Response
 
+from finagent import catalog
+
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
@@ -46,8 +48,10 @@ def create_app(service: DashboardService, *, warm: bool = True) -> FastAPI:
     @app.get("/api/dashboard")
     async def dashboard(  # pyright: ignore[reportUnusedFunction]
         refresh: Annotated[bool, Query()] = False,
+        deep: Annotated[str, Query()] = "",
     ) -> Response:
-        dashboard = await service.get(refresh=refresh)
+        views = frozenset(deep.split(",")) & catalog.ALL_VIEWS
+        dashboard = await service.get(refresh=refresh, deep=views)
         return Response(
             dashboard.model_dump_json(),
             media_type="application/json",

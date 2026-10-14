@@ -109,6 +109,14 @@ class Projections(Frozen):
     message: str | None = None
 
 
+class ViewOption(Frozen):
+    id: str
+    key: str
+    title: str
+    core: int
+    extra: int
+
+
 class Dashboard(Frozen):
     version: str
     generated_at: str
@@ -122,3 +130,5 @@ class Dashboard(Frozen):
     projections: Projections | None
     panels: tuple[Panel, ...]
     calendar: tuple[CalendarEntry, ...]
+    deep: tuple[str, ...]
+    views: tuple[ViewOption, ...]

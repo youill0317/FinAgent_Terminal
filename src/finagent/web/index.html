@@ -12,6 +12,7 @@
     <span class="logo">FINAGENT</span>
     <div class="line" aria-hidden="true">MACRO US KR EA GLOBAL <span class="go">GO</span><span class="cur"></span></div>
     <div class="clocks" id="clocks"></div>
+    <button class="rf ghost" id="settingsBtn" type="button" aria-haspopup="dialog">설정 <kbd>S</kbd></button>
     <button class="rf" id="refreshBtn" type="button">새로고침 <kbd>R</kbd></button>
   </div>
   <nav class="fkeys" aria-label="섹션">
@@ -40,8 +41,8 @@
   <section class="regime" id="regime"></section>
 
   <h2 class="sec" id="curve">금리곡선</h2>
-  <section class="grid2">
-    <div class="pn">
+  <section class="grid2" id="curveRow">
+    <div class="pn" id="ycPanel">
       <div class="pn-h"><b><span>YC</span>미 국채 수익률 곡선</b><small>FRED H.15 · DGS1MO~DGS30</small></div>
       <div class="pn-b">
         <div class="lg" id="ycLg"></div>
@@ -51,7 +52,7 @@
     </div>
     <div class="pn">
       <div class="pn-h"><b><span>2s10s</span>10년물 − 2년물</b>
-        <div class="seg" role="group" aria-label="기간"><button type="button" data-r="24">2Y</button><button type="button" data-r="60">5Y</button><button type="button" data-r="0" aria-pressed="true">전체</button></div>
+        <div class="seg" id="spRange" role="group" aria-label="기간"><button type="button" data-r="24">2Y</button><button type="button" data-r="60">5Y</button><button type="button" data-r="0" aria-pressed="true">전체</button></div>
       </div>
       <div class="pn-b">
         <div class="lg"><span><i style="border-color:var(--amber)"></i>T10Y2Y 월평균 %p</span><span><i class="band"></i>NBER 경기침체 USREC</span></div>
@@ -79,6 +80,19 @@
     </div>
   </section>
 </main>
+<dialog class="dlg" id="settings" aria-labelledby="settingsTitle">
+  <form method="dialog">
+    <div class="pn-h"><b id="settingsTitle"><span>SET</span>보기 설정</b><button class="x" type="submit" value="cancel" aria-label="닫기">✕</button></div>
+    <div class="pn-b">
+      <p class="dlg-p">기본 화면은 기업 분석에 쓰는 거시 지표만 보여줍니다. 경제 지표, 주요국 통화정책, 경기 주기(부채·통화량), 시장 심리 지표입니다. 매크로를 더 깊게 볼 패널만 켜세요. 켠 패널의 나머지 지표만 새로 받아옵니다.</p>
+      <div class="seg" id="presets" role="group" aria-label="한 번에 바꾸기"><button type="button" data-preset="core">핵심만</button><button type="button" data-preset="all">전체 매크로</button></div>
+      <ul class="opts" id="viewOpts"></ul>
+      <p class="note" id="viewSum"></p>
+      <p class="note">설정은 이 브라우저에만 저장됩니다.</p>
+    </div>
+    <div class="dlg-f"><button class="rf ghost" type="submit" value="cancel">취소</button><button class="rf" type="submit" value="apply">적용</button></div>
+  </form>
+</dialog>
 <div class="toast" id="toast" role="status" hidden></div>
 <script src="/static/app.js"></script>
 </body>

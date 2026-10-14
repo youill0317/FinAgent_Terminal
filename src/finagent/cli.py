@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Final
 
 import httpx
 
-from finagent import __version__
+from finagent import __version__, catalog
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
 
@@ -118,7 +118,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def run_check(service: DashboardService) -> int:
-    dashboard = asyncio.run(service.get())
+    dashboard = asyncio.run(service.get(deep=catalog.ALL_VIEWS))
     print(check_report(dashboard))  # noqa: T201
     return 0 if all(source.state == "ok" for source in dashboard.sources) else 1
 
