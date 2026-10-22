@@ -1,4 +1,4 @@
-"""The dashboard page. ``finagent`` starts it with Streamlit on 127.0.0.1.
+"""The dashboard page. ``macro`` starts it with Streamlit on 127.0.0.1.
 
 Script arguments (after ``--``) are the CLI's ``--demo``, ``--env-file`` and
 ``--settings``. The services live in one shared runtime, so every browser tab
@@ -233,7 +233,7 @@ def notices(d: Dashboard) -> None:
         st.error(d.settings_error)
     if d.demo:
         st.info(
-            "데모 모드: 수치는 모두 예시 값입니다. 실제 데이터는 `finagent`를 키와"
+            "데모 모드: 수치는 모두 예시 값입니다. 실제 데이터는 `macro`를 키와"
             " 함께 실행하세요."
         )
     for source in d.sources:

@@ -84,7 +84,7 @@ def build_service(
 
 def parse_args(argv: Sequence[str] | None) -> Options:
     parser = argparse.ArgumentParser(
-        prog="finagent",
+        prog="macro",
         description="공공·공개 데이터 매크로 대시보드를 로컬 브라우저에 띄웁니다.",
     )
     _ = parser.add_argument("--version", action="version", version=__version__)
@@ -117,10 +117,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     env = resolve_env(args.env_file, os.environ)
     settings_path = resolve_settings(args.settings)
-    service = build_service(demo=args.demo, env=env, settings_path=settings_path)
-
-    analysis = AnalysisService(service, env, settings_path=settings_path)
     if args.check:
+        service = build_service(demo=args.demo, env=env, settings_path=settings_path)
+        analysis = AnalysisService(service, env, settings_path=settings_path)
         return run_check(service, analysis)
 
     from streamlit.web import cli as streamlit_cli  # noqa: PLC0415 - only to serve

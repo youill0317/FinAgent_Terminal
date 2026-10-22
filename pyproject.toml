@@ -22,7 +22,7 @@ gemini = ["google-genai>=2.30.1"]
 llm = ["finagent[claude,openai,gemini]"]
 
 [project.scripts]
-finagent = "finagent.cli:main"
+macro = "finagent.cli:main"
 
 [dependency-groups]
 dev = [
