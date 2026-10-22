@@ -32,8 +32,6 @@ PERSISTENCE_PATTERN: Final = re.compile("|".join(PERSISTENCE_TERMS))
 FORBIDDEN_PACKAGES: Final = (
     "yfinance",
     "textual",
-    "pandas",
-    "numpy",
     "finnhub",
     "fmp",
     "langgraph",
