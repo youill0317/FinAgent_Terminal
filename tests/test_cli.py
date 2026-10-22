@@ -8,7 +8,16 @@ import httpx
 import pytest
 
 from finagent import __version__
-from finagent.cli import main, read_env_file, resolve_env, resolve_settings, run_check
+from finagent.cli import (
+    APP,
+    main,
+    parse_args,
+    read_env_file,
+    resolve_env,
+    resolve_settings,
+    run_check,
+    streamlit_args,
+)
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
 
@@ -112,3 +121,19 @@ def test_module_entry_point() -> None:
 
     assert result.returncode == 0
     assert result.stdout.strip() == __version__
+
+
+def test_streamlit_serves_locally_without_telemetry(tmp_path: Path) -> None:
+    args = parse_args(["--demo", "--no-browser", "--port", "9000"])
+
+    command = streamlit_args(args, tmp_path / "s.json")
+
+    assert command[:2] == ["run", str(APP)]
+    assert "--server.address=127.0.0.1" in command
+    assert "--server.port=9000" in command
+    assert "--server.headless=true" in command
+    assert "--browser.gatherUsageStats=false" in command
+    assert command[command.index("--") + 1 :] == [
+        f"--settings={tmp_path / 's.json'}",
+        "--demo",
+    ]

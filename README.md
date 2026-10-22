@@ -1,12 +1,12 @@
 # FinAgent
 
-공공·공개 데이터만으로 만든 매크로 대시보드입니다. 내 컴퓨터에서 작은 서버를
-띄우고(127.0.0.1) 브라우저에서 미국·한국·글로벌 매크로 지표를 한 화면에
-보여줍니다.
+공공·공개 데이터만으로 만든 매크로 대시보드입니다. 내 컴퓨터에서 Streamlit
+서버를 띄우고(127.0.0.1) 브라우저에서 미국·한국·글로벌 매크로 지표를 한 화면에
+보여줍니다. 화면까지 모두 Python으로 작성되어 있습니다.
 
 A local macro dashboard built only on public and open data (FRED, U.S.
 Treasury, New York Fed, Bank of Korea ECOS, ECB, BIS, OECD). It serves a
-terminal-style page on `127.0.0.1` and keeps everything it fetches in memory.
+Streamlit page on `127.0.0.1` and keeps everything it fetches in memory.
 
 <!-- 스크린샷: uv run finagent --demo 화면 -->
 
@@ -45,7 +45,7 @@ uv run finagent --check      # 서버 없이 한 번 받아와서 출처별 상�
 ```
 
 옵션: `--port`, `--no-browser`, `--env-file PATH`, `--settings PATH`, `--version`.
-서버는 항상 `127.0.0.1`에만 열립니다.
+서버는 항상 `127.0.0.1`에만 열리고, Streamlit 사용 통계 전송은 꺼 둡니다.
 
 ## 보기 설정
 
@@ -134,8 +134,8 @@ uv run finagent --check      # 서버 없이 한 번 받아와서 출처별 상�
 - **저장하지 않음.** 받은 시계열은 앱이 켜져 있는 동안 메모리에만 있고 디스크에
   쓰지 않습니다. 앱이 쓰는 파일은 보기 설정 파일(패널 id 목록과 고른 AI 공급자)
   하나뿐입니다.
-- **수동 갱신.** 앱을 시작할 때 한 번, 그리고 화면의 새로고침 버튼이나 `R` 키를
-  누를 때만 받아옵니다. 타이머로 자동 갱신하지 않습니다.
+- **수동 갱신.** 앱을 시작한 뒤 처음 화면을 열 때 한 번, 그리고 화면의 새로고침
+  버튼을 누를 때만 받아옵니다. 타이머로 자동 갱신하지 않습니다.
 - 키가 없거나 응답하지 않는 출처는 화면에 따로 표시되고, 나머지 지표는 그대로
   나옵니다. 일시적 오류(시간 초과, 연결 실패, 5xx)는 한 번 다시 시도합니다.
 - FRED는 키당 분당 약 120회까지 받습니다. 기본 화면은 한 번 갱신에 약 40회,
@@ -179,6 +179,11 @@ uv run ruff format --check .
 uv run basedpyright
 uv run pytest -q
 ```
+
+화면은 `src/finagent/app.py`(Streamlit 스크립트)이고, 숫자 표기와 분석 로그 같은
+화면용 텍스트는 `src/finagent/display.py`에 있습니다. 개발 중에는
+`uv run streamlit run src/finagent/app.py -- --demo`로 띄우면 파일을 고친 뒤
+화면에서 바로 다시 실행할 수 있습니다.
 
 테스트는 실제 API를 부르지 않습니다. `src/finagent/demo.py`가 각 출처의 실제 응답
 형식을 흉내 낸 가짜 응답을 만들고, `--demo`와 테스트가 이것을 씁니다. 이 저장소를

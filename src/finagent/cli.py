@@ -3,8 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import threading
-import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -26,7 +24,7 @@ DEFAULT_PORT: Final = 8765
 DEFAULT_ENV_FILE: Final = Path(".env")
 # Kept next to .env in the folder the app is started from.
 DEFAULT_SETTINGS_FILE: Final = Path("finagent.settings.json")
-BROWSER_DELAY_SECONDS: Final = 1.0
+APP: Final = Path(__file__).with_name("app.py")
 
 
 class Options(argparse.Namespace):
@@ -125,18 +123,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.check:
         return run_check(service, analysis)
 
-    import uvicorn  # noqa: PLC0415 - only needed when serving
-
-    from finagent.server import create_app  # noqa: PLC0415
+    from streamlit.web import cli as streamlit_cli  # noqa: PLC0415 - only to serve
 
     url = f"http://{HOST}:{args.port}/"
     print(f"FinAgent {__version__}: {url}  (종료: Ctrl+C)")  # noqa: T201
     print(f"보기 설정: {settings_path}")  # noqa: T201
-    if not args.no_browser:
-        threading.Timer(BROWSER_DELAY_SECONDS, webbrowser.open, args=(url,)).start()
-    app = create_app(service, analysis=analysis)
-    uvicorn.run(app, host=HOST, port=args.port, log_level="warning")
+    command = streamlit_args(args, settings_path)
+    streamlit_cli.main(command, prog_name="streamlit", standalone_mode=False)
     return 0
+
+
+def streamlit_args(args: Options, settings_path: Path) -> list[str]:
+    """``streamlit run`` arguments: local only, no telemetry, no prompts."""
+    script = [f"--settings={settings_path}"]
+    if args.demo:
+        script.append("--demo")
+    if args.env_file is not None:
+        script.append(f"--env-file={args.env_file.absolute()}")
+    return [
+        "run",
+        str(APP),
+        f"--server.address={HOST}",
+        f"--server.port={args.port}",
+        f"--server.headless={str(args.no_browser).lower()}",
+        "--server.showEmailPrompt=false",
+        "--server.fileWatcherType=none",
+        "--browser.gatherUsageStats=false",
+        "--client.toolbarMode=minimal",
+        "--",
+        *script,
+    ]
 
 
 def run_check(

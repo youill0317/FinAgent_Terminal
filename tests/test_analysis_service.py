@@ -19,7 +19,6 @@ from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import AnalysisService, RunInput
 from finagent.cli import provider_report
 from finagent.demo import DEMO_KEYS, demo_transport
-from finagent.server import create_app
 from finagent.service import DashboardService
 from finagent.settings import (
     AnalysisChoice,
@@ -211,7 +210,7 @@ def test_only_one_run_at_a_time() -> None:
         first = asyncio.create_task(collect(service, RunInput("하나")))
         for _ in range(200):
             await asyncio.sleep(0)
-            if (await service.meta())["busy"]:
+            if service.busy:
                 break
         second = await collect(service, RunInput("둘"))
         provider.release.set()
@@ -306,52 +305,6 @@ def test_provider_report_lists_every_provider() -> None:
     assert "claude_api" in lines[1]
     assert "ready" in lines[1]
     assert "OPENAI_API_KEY" in lines[2]
-
-
-def sse(text: str) -> list[Event]:
-    return [
-        cast("Event", json.loads(line.removeprefix("data: ")))
-        for line in text.splitlines()
-        if line.startswith("data: ")
-    ]
-
-
-def test_analysis_routes() -> None:
-    svc = dashboard()
-    service = analysis(DemoProvider(delay=0), svc)
-    app = create_app(svc, warm=False, analysis=service)
-
-    async def scenario() -> None:
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://local"
-        ) as client:
-            meta = cast(
-                "dict[str, object]", (await client.get("/api/analysis/meta")).json()
-            )
-            presets = cast("list[dict[str, object]]", meta["presets"])
-            assert len(presets) == 8
-            assert meta["tools"] == ["search_series", "get_series", "source_guide"]
-            providers = cast("list[dict[str, object]]", meta["providers"])
-            assert providers[0]["status"] == "ready"
-            assert meta["busy"] is False
-
-            bad = await client.put("/api/analysis/choice", json={"provider": "x"})
-            assert bad.status_code == 400
-            good = await client.put(
-                "/api/analysis/choice", json={"provider": "demo", "model": "m"}
-            )
-            assert good.json() == {"provider": "demo", "models": {"demo": "m"}}
-
-            response = await client.post("/api/analysis", json={"request": "요약"})
-            assert response.headers["content-type"].startswith("text/event-stream")
-            events = sse(response.text)
-            assert events[0]["type"] == "start"
-            assert events[0]["model"] == "m"
-            assert events[-1]["type"] == "done"
-            assert (await client.get("/static/analysis.js")).status_code == 200
-
-    asyncio.run(scenario())
 
 
 def test_default_view_is_the_core_view() -> None:

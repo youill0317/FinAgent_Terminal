@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Final, Literal, final
 
 from finagent import catalog
 from finagent.analysis.context import build_document
-from finagent.analysis.presets import PLACEHOLDER, PRESET_BY_ID, PRESETS
+from finagent.analysis.presets import PRESET_BY_ID
 from finagent.analysis.prompt import Conversation, ToolRecord, Turn, system_prompt
 from finagent.analysis.providers import DEFAULT_PROVIDER, registry
 from finagent.analysis.providers.base import (
@@ -25,7 +25,7 @@ from finagent.analysis.providers.base import (
     TextDelta,
     ToolSpec,
 )
-from finagent.analysis.tools import TOOL_NAMES, TOOL_SPECS, Toolbox
+from finagent.analysis.tools import TOOL_SPECS, Toolbox
 from finagent.analysis.verify import verify
 from finagent.settings import AnalysisChoice, load_analysis, save_analysis
 
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from finagent.analysis.context import Document
     from finagent.analysis.evidence import Evidence
     from finagent.analysis.providers.base import Provider, ProviderStatus
-    from finagent.analysis.tools import Json, ToolResult
+    from finagent.analysis.tools import ToolResult
     from finagent.models import Dashboard
     from finagent.service import DashboardService
 
@@ -108,6 +108,14 @@ class AnalysisService:
     def choice(self) -> AnalysisChoice:
         return self._choice
 
+    @property
+    def providers(self) -> Mapping[str, Provider]:
+        return self._providers
+
+    @property
+    def busy(self) -> bool:
+        return self._lock.locked()
+
     def model_for(self, provider_id: str) -> str:
         provider = self._providers[provider_id]
         return self._choice.models.get(provider_id) or provider.default_model
@@ -128,30 +136,6 @@ class AnalysisService:
         ids = list(self._providers)
         found = await asyncio.gather(*(self._providers[i].status() for i in ids))
         return dict(zip(ids, found, strict=True))
-
-    async def meta(self) -> Json:
-        statuses = await self.statuses()
-        return {
-            "presets": [
-                {"id": p.id, "title": p.title, "text": p.text, "panels": list(p.panels)}
-                for p in PRESETS
-            ],
-            "placeholder": PLACEHOLDER,
-            "tools": list(TOOL_NAMES),
-            "choice": {"provider": self._choice.provider},
-            "providers": [
-                {
-                    "id": provider.id,
-                    "title": provider.title,
-                    "model": self.model_for(provider.id),
-                    "default_model": provider.default_model,
-                    "status": statuses[provider.id].kind,
-                    "message": statuses[provider.id].message,
-                }
-                for provider in self._providers.values()
-            ],
-            "busy": self._lock.locked(),
-        }
 
     # ------------------------------------------------------------ run
 

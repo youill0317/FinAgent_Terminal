@@ -66,6 +66,14 @@ PUBLIC_HOSTS: Final = frozenset(
     }
 )
 URL_HOST_PATTERN: Final = re.compile(r"https://([A-Za-z0-9.-]+)")
+# Free-key sign-up pages the page links to; the app never fetches from them.
+KEY_PAGES: Final = frozenset(
+    {
+        "https://fredaccount.stlouisfed.org/apikeys",
+        "https://ecos.bok.or.kr/api/#/AuthKeyApply",
+    }
+)
+URL_PATTERN: Final = re.compile(r"https://[^\s\"')]+")
 
 
 def _python_files() -> list[Path]:
@@ -130,8 +138,14 @@ def test_data_hosts_are_public_and_live_in_sources_module() -> None:
     hosts = set(URL_HOST_PATTERN.findall(SOURCES_MODULE.read_text("utf-8")))
     other_modules = [path for path in _python_files() if path != SOURCES_MODULE]
 
+    links = {
+        match.group(0)
+        for path in other_modules
+        for match in URL_PATTERN.finditer(path.read_text("utf-8"))
+    }
+
     assert hosts == PUBLIC_HOSTS
-    assert _hits(re.compile(r"https://"), other_modules) == []
+    assert links <= KEY_PAGES
 
 
 def test_catalog_integrity() -> None:

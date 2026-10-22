@@ -10,14 +10,14 @@ import httpx
 from finagent import catalog
 from finagent.cli import check_report
 from finagent.demo import DEMO_KEYS, demo_transport
-from finagent.models import Dashboard
-from finagent.server import create_app
 from finagent.service import DashboardService
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     import pytest
+
+    from finagent.models import Dashboard
 
 NOW = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
 
@@ -279,52 +279,6 @@ def test_concurrent_callers_share_one_pass() -> None:
     requests.clear()
     _ = asyncio.run(svc.get(refresh=True))
     assert single_pass == len(requests)
-
-
-def test_server_routes() -> None:
-    app = create_app(service(), warm=False)
-
-    async def scenario() -> None:
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://local"
-        ) as client:
-            page = await client.get("/")
-            assert page.status_code == 200
-            assert "<title>FinAgent</title>" in page.text
-            script = await client.get("/static/app.js")
-            assert script.headers["content-type"].startswith("text/javascript")
-            assert (await client.get("/static/app.css")).status_code == 200
-            assert (await client.get("/static/http.py")).status_code == 404
-
-            response = await client.get("/api/dashboard")
-            payload = Dashboard.model_validate_json(response.text)
-            assert payload.generated_at == NOW.isoformat()
-            assert {source.id for source in payload.sources} >= {
-                "FRED",
-                "ECOS",
-                "OECD",
-            }
-            assert payload.deep == ()
-            refreshed = await client.get("/api/dashboard", params={"refresh": "true"})
-            assert refreshed.status_code == 200
-            assert refreshed.headers["cache-control"] == "no-store"
-            changed = await client.put(
-                "/api/settings", json={"deep": ["curve", "housing", "../etc"]}
-            )
-            assert Dashboard.model_validate_json(changed.text).deep == (
-                "housing",
-                "curve",
-            )
-            again = await client.get("/api/dashboard")
-            assert Dashboard.model_validate_json(again.text).deep == (
-                "housing",
-                "curve",
-            )
-            bad = await client.put("/api/settings", json={"deep": "housing"})
-            assert bad.status_code == 422
-
-    asyncio.run(scenario())
 
 
 def test_a_pass_writes_nothing_to_disk(
