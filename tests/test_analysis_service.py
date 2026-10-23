@@ -18,7 +18,7 @@ from finagent.analysis.providers.base import (
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import AnalysisService, RunInput
 from finagent.cli import provider_report
-from finagent.demo import DEMO_KEYS, demo_transport
+from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService
 from finagent.settings import (
     AnalysisChoice,
@@ -51,6 +51,7 @@ def dashboard(clock: list[datetime] | None = None) -> DashboardService:
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         clock=lambda: times[-1],
         retry_delay=0,
+        yahoo=demo_closes(NOW.date()),
     )
 
 
@@ -169,7 +170,7 @@ def test_preset_and_scope_widen_the_document_of_a_new_thread() -> None:
     service = analysis(provider)
 
     async def scenario() -> tuple[list[Event], list[Event]]:
-        preset = await collect(service, RunInput("유동성", preset="liquidity"))
+        preset = await collect(service, RunInput("유동성", preset="macro"))
         whole = await collect(service, RunInput("전부", scope="all"))
         return preset, whole
 
@@ -257,6 +258,35 @@ def test_the_choice_is_saved_next_to_the_view(tmp_path: Path) -> None:
         raise AssertionError
 
 
+def test_the_scope_is_saved_and_loaded(tmp_path: Path) -> None:
+    path = tmp_path / "finagent.settings.json"
+    service = analysis(Recorder(), settings_path=path)
+    assert service.choice.scope == "view"
+
+    picked = service.choose("demo", scope="all")
+    kept = service.choose("demo", "m")  # no scope given keeps the saved one
+
+    assert picked.scope == "all"
+    assert kept.scope == "all"
+    assert load_analysis(path) == kept
+    assert analysis(Recorder(), settings_path=path).choice.scope == "all"
+
+
+def test_a_file_without_a_valid_scope_loads_with_the_default(tmp_path: Path) -> None:
+    path = tmp_path / "finagent.settings.json"
+    old = '{"analysis": {"provider": "demo", "models": {"demo": "m"}}}'
+    _ = path.write_text(old, "utf-8")
+    assert load_analysis(path) == AnalysisChoice("demo", {"demo": "m"}, "view")
+
+    for bad in ('"nope"', "3", "null"):
+        _ = path.write_text(
+            '{"analysis": {"provider": "demo", "scope": ' + bad + "}}", "utf-8"
+        )
+        loaded = load_analysis(path)
+        assert loaded is not None
+        assert loaded.scope == "view"
+
+
 def test_settings_keep_each_others_keys(tmp_path: Path) -> None:
     path = tmp_path / "finagent.settings.json"
     save_analysis(path, AnalysisChoice("gemini_api", {"gemini_api": "m"}))
@@ -266,7 +296,11 @@ def test_settings_keep_each_others_keys(tmp_path: Path) -> None:
     assert body == {
         "version": 1,
         "deep": ["curve"],
-        "analysis": {"provider": "gemini_api", "models": {"gemini_api": "m"}},
+        "analysis": {
+            "provider": "gemini_api",
+            "models": {"gemini_api": "m"},
+            "scope": "view",
+        },
     }
     assert load_analysis(tmp_path / "missing.json") is None
     _ = path.write_text('{"analysis": {"provider": 3}}', "utf-8")

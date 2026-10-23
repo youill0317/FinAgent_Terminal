@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from typing import TYPE_CHECKING, Final, Literal, cast
 
 if TYPE_CHECKING:
@@ -31,15 +31,78 @@ KEY_HELP: Final = {
 }
 TAPE_LABELS: Final = {
     "us_fftu": "연준 상단",
+    "us_2y": "UST 2Y",
     "us_10y": "UST 10Y",
     "us_10y3m": "10Y−3M",
-    "us_sp500": "S&P 500",
-    "us_dollar": "달러 광의",
-    "wti": "WTI",
-    "us_vix": "VIX",
-    "kr_usdkrw": "USD/KRW",
+    "us_hy_oas": "HY 스프레드",
+    "kr_base": "한은 기준",
+    "kr_ktb3": "KTB 3Y",
     "kr_ktb10": "KTB 10Y",
+    "us_sp500": "S&P 500",
+    "us_nasdaq": "나스닥",
+    "us_nasdaq100": "나스닥 100",
+    "us_dow": "다우",
+    "us_vix": "VIX",
     "kr_kospi": "KOSPI",
+    "kr_kosdaq": "KOSDAQ",
+    "nikkei": "닛케이 225",
+    "us_dollar": "달러 광의",
+    "kr_usdkrw": "USD/KRW",
+    "usdjpy": "USD/JPY",
+    "eurusd": "EUR/USD",
+    "usdcny": "USD/CNY",
+    "wti": "WTI",
+    "henryhub": "천연가스",
+    "gold": "금",
+}
+# The overview's market groups, by tape id; eight each, so every row is full.
+TAPE_GROUPS: Final = (
+    (
+        "금리",
+        (
+            "us_fftu",
+            "us_2y",
+            "us_10y",
+            "us_10y3m",
+            "us_hy_oas",
+            "kr_base",
+            "kr_ktb3",
+            "kr_ktb10",
+        ),
+    ),
+    (
+        "주식",
+        (
+            "us_sp500",
+            "us_nasdaq",
+            "us_nasdaq100",
+            "us_dow",
+            "us_vix",
+            "kr_kospi",
+            "kr_kosdaq",
+            "nikkei",
+        ),
+    ),
+    (
+        "환율·원자재",
+        (
+            "us_dollar",
+            "kr_usdkrw",
+            "usdjpy",
+            "eurusd",
+            "usdcny",
+            "wti",
+            "henryhub",
+            "gold",
+        ),
+    ),
+)
+# The indicator each regime cell judges, for its trend line.
+REGIME_SOURCE: Final = {
+    "물가": "us_core_pce",
+    "고용": "us_sahm",
+    "금리곡선": "us_10y2y",
+    "금융여건": "us_nfci",
 }
 SOURCE_COLOR: Final[dict[str, Color]] = {
     "ok": "green",
@@ -58,7 +121,32 @@ STATUS_TEXT: Final = {
     "missing_key": "키 없음",
     "not_installed": "설치 안 됨",
 }
+# Korean convention: up is red, down is blue. Mid-tones that read on both themes.
+UP_COLOR: Final = "#e5484d"
+DOWN_COLOR: Final = "#3b82f6"
 NUMBER_COLOR: Final = {"ok": "green", "mismatch": "red", "unsupported": "orange"}
+# Menu pages for the indicator panels: url path, title, icon, panel ids.
+PANEL_PAGES: Final = (
+    (
+        "us",
+        "미국 경제",
+        ":material/flag:",
+        ("growth", "household", "labor", "inflation", "housing"),
+    ),
+    (
+        "rates",
+        "금리·금융",
+        ":material/percent:",
+        ("rates", "fincon", "markets", "liquidity"),
+    ),
+    ("korea", "한국", ":material/location_on:", ("korea", "korea_real")),
+    (
+        "world",
+        "글로벌",
+        ":material/public:",
+        ("euro", "global", "cycle", "credit", "commodities"),
+    ),
+)
 WEEKDAYS: Final = "월화수목금토일"
 IDLE_NOTE: Final = "수동 실행 · 대화는 메모리에만"
 STOPPED: Final = "멈췄습니다. 이 턴은 대화에 남지 않습니다."
@@ -99,6 +187,22 @@ def change_text(row: IndicatorRow) -> str:
     return f"{'▲' if diff > 0 else '▼'} {number(abs(diff), row.fmt.dec)}"
 
 
+def arrow_color(text: str) -> str | None:
+    """The CSS color for a cell holding a ▲ or ▼, else ``None``."""
+    if "▲" in text:
+        return UP_COLOR
+    if "▼" in text:
+        return DOWN_COLOR
+    return None
+
+
+def metric_color(row: IndicatorRow) -> Literal["red", "blue", "off"]:
+    diff = change(row)
+    if not diff:
+        return "off"
+    return "red" if diff > 0 else "blue"
+
+
 def metric_delta(row: IndicatorRow) -> str | None:
     """A signed delta for ``st.metric``, which colors by the leading sign."""
     diff = change(row)
@@ -116,10 +220,6 @@ def short_date(row: IndicatorRow) -> str:
 
 def short_time(iso: str) -> str:
     return iso.replace("T", " ")[:16]
-
-
-def stamp(iso: str) -> str:
-    return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def weekday(day: str) -> str:
@@ -161,6 +261,24 @@ def rows_by_id(d: Dashboard) -> dict[str, IndicatorRow]:
     return {row.id: row for panel in d.panels for row in panel.rows}
 
 
+def tape_groups(
+    tape: Sequence[str], rows: Mapping[str, IndicatorRow]
+) -> list[tuple[str, list[IndicatorRow]]]:
+    """The tape's rows by market; ids without a row are skipped."""
+    groups = [
+        (title, [rows[i] for i in ids if i in tape and i in rows])
+        for title, ids in TAPE_GROUPS
+    ]
+    return [(title, found) for title, found in groups if found]
+
+
+def trend(row: IndicatorRow | None) -> list[float] | None:
+    """The row's history for a metric sparkline, ``None`` when it has none."""
+    if row is None:
+        return None
+    return [value for _, value in row.history] or None
+
+
 def panel_of(d: Dashboard) -> dict[str, str]:
     """Indicator id to the panel it is shown in, for citation links."""
     return {row.id: panel.id for panel in d.panels for row in panel.rows}
@@ -172,18 +290,16 @@ def panel_of(d: Dashboard) -> dict[str, str]:
 def panel_table(panel: Panel) -> dict[str, list[object]]:
     table: dict[str, list[object]] = {
         "지표": [],
-        "코드": [],
         "최신": [],
         "변화": [],
         "추이": [],
         "기준": [],
     }
     for row in panel.rows:
-        code = row.code + (f" · © {row.copyright}" if row.copyright else "")
+        label = f"{row.label} © {row.copyright}" if row.copyright else row.label
         ok = row.status == "ok"
         missing = "키 없음" if row.status == "missing_key" else "받지 못함"
-        table["지표"].append(row.label)
-        table["코드"].append(code)
+        table["지표"].append(label)
         table["최신"].append(fmt(row.value, row.fmt) if ok else missing)
         table["변화"].append(change_text(row) if ok else "")
         table["추이"].append([value for _, value in row.history] if ok else [])
@@ -199,34 +315,79 @@ def panel_problems(panel: Panel) -> list[str]:
     ]
 
 
-def sep_cell(cell: ProjectionCell | None) -> str:
+# ---------------------------------------------------------------- detail view
+
+# Months shown by the detail chart's range control; 0 means the whole span.
+DETAIL_RANGES: Final = {"2Y": 24, "4Y": 48, "전체": 0}
+
+
+def label_day(label: str) -> date:
+    """The first day of a history label such as ``2025-03`` or ``2025Q2``."""
+    if "Q" in label:
+        year, quarter = label.split("Q")
+        return date(int(year), (int(quarter) - 1) * 3 + 1, 1)
+    parts = [int(part) for part in label.split("-")]
+    return date(parts[0], parts[1], parts[2] if len(parts) > 2 else 1)  # noqa: PLR2004
+
+
+def history_series(row: IndicatorRow) -> tuple[tuple[date, float], ...]:
+    """The row's short history as dated points, for when no longer one is kept."""
+    return tuple((label_day(label), value) for label, value in row.history)
+
+
+def detail_points(
+    series: Sequence[tuple[date, float]], months: int
+) -> list[dict[str, str | float]]:
+    """Chart rows for the last ``months`` months of ``series`` (0 keeps all)."""
+    if months and series:
+        last = series[-1][0]
+        count = last.year * 12 + last.month - months
+        cutoff = date(count // 12, count % 12 + 1, 1)
+        series = [point for point in series if point[0] >= cutoff]
+    return [{"day": day.isoformat(), "value": value} for day, value in series]
+
+
+def sep_value(cell: ProjectionCell | None) -> str:
     if cell is None or cell.value is None:
         return "—"
-    value = number(cell.value, 1)
+    return number(cell.value, 1)
+
+
+def sep_change(cell: ProjectionCell | None) -> str:
+    if cell is None or cell.value is None:
+        return ""
     if cell.prev is None:
-        return f"{value} 신규"
+        return "신규"
     diff = cell.value - cell.prev
     if abs(diff) < 0.05:  # noqa: PLR2004 - half of the one decimal shown
-        return f"{value} — 0"
-    return f"{value} {'▲' if diff > 0 else '▼'} {number(abs(diff), 1)}"
+        return "—"
+    return f"{'▲' if diff > 0 else '▼'}{number(abs(diff), 1)}"
+
+
+def sep_change_key(name: str) -> str:
+    """The unique column key of the change beside ``name`` (shown as Δ)."""
+    return f"{name}Δ"
 
 
 def sep_table(p: Projections) -> dict[str, list[str]]:
     longer = any(row.longer_run for row in p.rows)
-    table: dict[str, list[str]] = {"지표": [], "코드": [], "현재": []}
-    for year in p.years:
-        table[year] = []
-    if longer:
-        table["장기"] = []
+    names = [*p.years, *(["장기"] if longer else [])]
+    table: dict[str, list[str]] = {"지표": [], "현재": []}
+    for name in names:
+        table[name] = []
+        table[sep_change_key(name)] = []
     for row in p.rows:
         table["지표"].append(row.label)
-        table["코드"].append(row.code)
         current = "—" if row.current is None else number(row.current, row.current_dec)
         table["현재"].append(f"{current} {row.current_note}".strip())
-        for year, cell in zip(p.years, row.years, strict=False):
-            table[year].append(sep_cell(cell))
+        cells: dict[str, ProjectionCell | None] = dict(
+            zip(p.years, row.years, strict=False)
+        )
         if longer:
-            table["장기"].append(sep_cell(row.longer_run))
+            cells["장기"] = row.longer_run
+        for name in names:
+            table[name].append(sep_value(cells.get(name)))
+            table[sep_change_key(name)].append(sep_change(cells.get(name)))
     return table
 
 

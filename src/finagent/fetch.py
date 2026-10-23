@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Final, final
 import httpx
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
+    from datetime import date
 
     from finagent.models import SourceId
 
@@ -20,8 +21,13 @@ HTTP_TOO_MANY_REQUESTS: Final = 429
 HTTP_CLIENT_ERROR: Final = 400
 HTTP_SERVER_ERROR: Final = 500
 
+# Daily closes for a Yahoo ticker since a start date; blocking, so it runs in
+# a worker thread. ``sources.YahooCloses`` is the real one.
+type Closes = Callable[[str, date], tuple[tuple[date, float], ...]]
+
 # Concurrent requests allowed per source. OECD allows 60 downloads an hour,
-# so it gets one lane; FRED allows about 120 a minute.
+# so it gets one lane; FRED allows about 120 a minute. Yahoo (unofficial,
+# through yfinance) gets one lane too.
 SOURCE_LANES: Final[Mapping[SourceId, int]] = MappingProxyType(
     {
         "FRED": 6,
@@ -31,6 +37,7 @@ SOURCE_LANES: Final[Mapping[SourceId, int]] = MappingProxyType(
         "ECB": 2,
         "BIS": 2,
         "OECD": 1,
+        "YAHOO": 1,
     }
 )
 
@@ -40,7 +47,7 @@ class SourceError(Exception):
 
 
 class MissingKeyError(SourceError):
-    """The source needs an API key that is not configured."""
+    """The source needs an API key, or an optional package, that is not set up."""
 
 
 def new_client() -> httpx.AsyncClient:
@@ -55,10 +62,11 @@ def new_client() -> httpx.AsyncClient:
 class FetchContext:
     """One refresh pass: shared client, keys, and per-request de-duplication.
 
-    Responses live only for the duration of the pass. Nothing is written to disk.
+    Responses live only for the duration of the pass. Nothing is written to
+    disk, except yfinance's own caches when ``yahoo`` is ``YahooCloses``.
     """
 
-    __slots__ = ("_client", "_env", "_inflight", "_lanes", "_retry_delay")
+    __slots__ = ("_client", "_env", "_inflight", "_lanes", "_retry_delay", "_yahoo")
 
     def __init__(  # noqa: D107
         self,
@@ -66,10 +74,12 @@ class FetchContext:
         env: Mapping[str, str],
         *,
         retry_delay: float = RETRY_DELAY_SECONDS,
+        yahoo: Closes | None = None,
     ) -> None:
         self._client = client
         self._env = env
         self._retry_delay = retry_delay
+        self._yahoo = yahoo
         self._lanes = {
             source: asyncio.Semaphore(lanes) for source, lanes in SOURCE_LANES.items()
         }
@@ -100,6 +110,13 @@ class FetchContext:
             task = asyncio.ensure_future(self._get(source, url, dict(query)))
             self._inflight[cache_key] = task
         return await asyncio.shield(task)
+
+    async def closes(self, ticker: str, start: date) -> tuple[tuple[date, float], ...]:
+        """Yahoo daily closes since ``start``, read in a worker thread."""
+        if self._yahoo is None:
+            raise SourceError("YAHOO 시세를 받을 경로가 없습니다")
+        async with self._lanes["YAHOO"]:
+            return await asyncio.to_thread(self._yahoo, ticker, start)
 
     async def _get(self, source: SourceId, url: str, params: dict[str, str]) -> str:
         async with self._lanes[source]:

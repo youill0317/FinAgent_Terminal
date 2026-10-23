@@ -53,6 +53,7 @@ SOURCE_NAMES: Final[tuple[tuple[SourceId, str], ...]] = (
     ("ECB", "ECB"),
     ("BIS", "BIS"),
     ("OECD", "OECD"),
+    ("YAHOO", "Yahoo"),
 )
 
 type Outcome = Series | SourceError

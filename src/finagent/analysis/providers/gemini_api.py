@@ -57,7 +57,7 @@ class GeminiApiProvider:
         from google.genai import types  # noqa: PLC0415
 
         client = genai.Client(api_key=self._key)
-        contents: list[types.Content] = [
+        contents: list[types.ContentUnion] = [
             types.Content(
                 role="user" if message.role == "user" else "model",
                 parts=[types.Part.from_text(text=message.text)],
@@ -85,7 +85,7 @@ class GeminiApiProvider:
 
 
 async def _chunks(
-    client: genai.Client, request: RunRequest, contents: list[types.Content]
+    client: genai.Client, request: RunRequest, contents: list[types.ContentUnion]
 ) -> AsyncIterator[types.GenerateContentResponse]:
     """Stream one model turn; a 404 means the model is not open to this key."""
     from google.genai import errors, types  # noqa: PLC0415
@@ -107,9 +107,8 @@ async def _chunks(
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
     try:
-        # The SDK's union of content types includes an untyped member.
         models = client.aio.models
-        stream = await models.generate_content_stream(  # pyright: ignore[reportUnknownMemberType]
+        stream = await models.generate_content_stream(
             model=request.model, contents=contents, config=config
         )
         async for chunk in stream:

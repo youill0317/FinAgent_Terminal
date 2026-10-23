@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from finagent import catalog
-from finagent.demo import DEMO_KEYS, demo_transport
+from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService, local_now
 from finagent.settings import load_view, save_view
 
@@ -21,6 +21,7 @@ def service(path: Path) -> DashboardService:
         DEMO_KEYS,
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         retry_delay=0,
+        yahoo=demo_closes(local_now().date()),
         settings_path=path,
     )
 

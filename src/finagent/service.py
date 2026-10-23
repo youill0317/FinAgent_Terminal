@@ -9,6 +9,8 @@ from finagent import catalog
 from finagent.dashboard import build_dashboard
 from finagent.fetch import RETRY_DELAY_SECONDS, FetchContext, new_client
 from finagent.settings import load_view, save_view
+from finagent.sources import Ratio, combine_ratio
+from finagent.transforms import apply
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Mapping
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
 
     import httpx
 
+    from finagent.fetch import Closes
     from finagent.models import Dashboard
     from finagent.sources import Fetch, Series
 
@@ -33,7 +36,7 @@ class DashboardService:
     Changing the view fetches only the series not yet in memory; a refresh
     fetches everything the view shows again. There is no timer, and the only
     file written is the saved view at ``settings_path`` (none when it is
-    ``None``).
+    ``None``), besides yfinance's caches when ``yahoo`` is ``YahooCloses``.
     """
 
     __slots__ = (
@@ -51,6 +54,7 @@ class DashboardService:
         "_settings_path",
         "_snapshot",
         "_view",
+        "_yahoo",
     )
 
     def __init__(  # noqa: PLR0913
@@ -62,13 +66,16 @@ class DashboardService:
         demo: bool = False,
         retry_delay: float = RETRY_DELAY_SECONDS,
         settings_path: Path | None = None,
+        yahoo: Closes | None = None,
     ) -> None:
         """Create a service; inject a client factory and clock for tests or demo.
 
         With ``settings_path`` the view is read from that file at start and
         saved there when it changes; without it the view lives in memory only.
+        ``yahoo`` reads Yahoo closes; without it Yahoo rows fail.
         """
         self._retry_delay = retry_delay
+        self._yahoo = yahoo
         self._env = env
         self._client_factory = client_factory
         self._clock = clock
@@ -94,6 +101,35 @@ class DashboardService:
         """Series fetched so far (memory only); analysis tools add to it."""
         return self._cache
 
+    def full_series(self, indicator_id: str) -> Series:
+        """An indicator's whole fetched history with its transform applied.
+
+        Reads memory only; empty when the series is not (or no longer) cached.
+        """
+        indicator = next(
+            (
+                i
+                for spec in catalog.PANELS
+                for i in spec.indicators
+                if i.id == indicator_id
+            ),
+            None,
+        )
+        if indicator is None:
+            return ()
+        fetch = indicator.fetch
+        if isinstance(fetch, Ratio):
+            top, bottom = (
+                self._cache.get(fetch.numerator),
+                self._cache.get(fetch.denominator),
+            )
+            raw = combine_ratio(top, bottom) if top and bottom else None
+        else:
+            raw = self._cache.get(fetch)
+        if not raw:
+            return ()
+        return apply(raw, indicator.transform, indicator.freq, indicator.scale)
+
     @property
     def demo(self) -> bool:
         return self._demo
@@ -110,7 +146,9 @@ class DashboardService:
     async def fetch_context(self) -> AsyncGenerator[FetchContext]:
         """A client and fetch context for one analysis run's tool calls."""
         async with self._client_factory() as client:
-            yield FetchContext(client, self._env, retry_delay=self._retry_delay)
+            yield FetchContext(
+                client, self._env, retry_delay=self._retry_delay, yahoo=self._yahoo
+            )
 
     async def set_view(self, deep: frozenset[str]) -> Dashboard:
         """Switch to ``deep``, save it, and return the dashboard for it."""
@@ -170,7 +208,9 @@ class DashboardService:
         self, deep: frozenset[str], previous: Dashboard | None
     ) -> Dashboard:
         async with self._client_factory() as client:
-            ctx = FetchContext(client, self._env, retry_delay=self._retry_delay)
+            ctx = FetchContext(
+                client, self._env, retry_delay=self._retry_delay, yahoo=self._yahoo
+            )
             dashboard = await build_dashboard(
                 ctx,
                 self._clock(),

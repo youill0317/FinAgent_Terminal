@@ -2,6 +2,8 @@
 
 Used by ``finagent --demo`` (to see the dashboard without API keys) and by
 the tests. Values are made up and plausible; they are not real observations.
+Yahoo is read through yfinance, not HTTP, so ``demo_closes`` stands in for
+``sources.YahooCloses`` instead.
 """
 
 from __future__ import annotations
@@ -17,12 +19,15 @@ from urllib.parse import unquote
 
 import httpx
 
+from finagent.fetch import SourceError
 from finagent.sources import ecos_period, parse_period
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from finagent.fetch import Closes
     from finagent.models import Freq
+    from finagent.sources import Series
 
 DEMO_KEYS: Final = {"FRED_API_KEY": "demo", "ECOS_API_KEY": "demo"}
 
@@ -150,6 +155,9 @@ FRED: Final[dict[str, Walk]] = {
     "BUSLOANS": _w("M", (4, 2780), (0, 2860), vol=5),
     "SP500": _w("D", (4, 4300), (2, 5200), (1, 5900), (0, 6650), vol=40),
     "NASDAQCOM": _w("D", (4, 13200), (2, 16500), (1, 19300), (0, 22400), vol=150),
+    "NASDAQ100": _w("D", (4, 11500), (2, 17500), (1, 20500), (0, 24600), vol=170),
+    "DJIA": _w("D", (4, 33000), (2, 38500), (1, 42500), (0, 46500), vol=250),
+    "NIKKEI225": _w("D", (4, 27500), (2, 38500), (1, 39000), (0, 48500), vol=350),
     "TREAST": _w("W", (4, 5300000), (0, 4200000), vol=3000),
     "WSHOMCB": _w("W", (4, 2450000), (0, 2050000), vol=2000),
     "GFDEGDQ188S": _w("Q", (4, 118), (0, 121), vol=0.5),
@@ -357,6 +365,11 @@ OECD_DEMO: Final[dict[tuple[str, str], Walk]] = {
     ("CCICP", "DEU"): _w("M", (4, 97.0), (0, 98.0), vol=0.1),
 }
 
+# Yahoo tickers.
+YAHOO: Final[dict[str, Walk]] = {
+    "GC=F": _w("D", (4, 1750), (2, 2050), (1, 2700), (0, 4100), vol=25),
+}
+
 # FOMC SEP medians by years after the latest release year: (latest, prior).
 # The September SEP adds a year, so the prior vintage is one year shorter.
 SEP_DAYS_AGO: Final = (27, 118)
@@ -471,6 +484,18 @@ def demo_transport(today: date) -> httpx.MockTransport:
         return route(request, today)
 
     return httpx.MockTransport(handle)
+
+
+def demo_closes(today: date) -> Closes:
+    """Yahoo daily closes, as ``sources.YahooCloses`` returns them."""
+
+    def closes(ticker: str, start: date) -> Series:
+        walk = YAHOO.get(ticker)
+        if walk is None:
+            raise SourceError(f"YAHOO {ticker}: 관측값 없음")
+        return tuple(generate(ticker, walk, start, today))
+
+    return closes
 
 
 def _param(request: httpx.Request, name: str, default: str = "") -> str:

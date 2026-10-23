@@ -4,7 +4,7 @@ from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-SourceId = Literal["FRED", "TREASURY", "NYFED", "ECOS", "ECB", "BIS", "OECD"]
+SourceId = Literal["FRED", "TREASURY", "NYFED", "ECOS", "ECB", "BIS", "OECD", "YAHOO"]
 Freq = Literal["D", "W", "M", "Q"]
 RowStatus = Literal["ok", "missing_key", "error"]
 SourceState = Literal["ok", "partial", "missing_key", "error"]

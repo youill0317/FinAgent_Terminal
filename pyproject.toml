@@ -20,14 +20,21 @@ claude = ["anthropic>=1.13.0"]
 openai = ["openai>=3.30.0"]
 gemini = ["google-genai>=2.30.1"]
 llm = ["finagent[claude,openai,gemini]"]
+# S&P 500 screening, portfolios and the dashboard's gold row (yfinance, unofficial
+# Yahoo data); see the README.
+screen = [
+    "lxml>=6.1.3",
+    "yfinance>=1.7.0",
+]
 
 [project.scripts]
 macro = "finagent.cli:main"
 
 [dependency-groups]
 dev = [
-    # The adapters are type-checked and tested against the real SDKs.
+    # The adapters and the screener are type-checked against the real packages.
     "finagent[llm]",
+    "finagent[screen]",
     "basedpyright>=1.21",
     "pytest>=8",
     "ruff>=0.8",

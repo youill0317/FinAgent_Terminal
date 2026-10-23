@@ -10,6 +10,7 @@ import pytest
 from finagent import __version__
 from finagent.cli import (
     APP,
+    build_service,
     main,
     parse_args,
     read_env_file,
@@ -20,6 +21,7 @@ from finagent.cli import (
 )
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
+from finagent.sources import YAHOO_CACHE
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -74,6 +76,17 @@ def test_settings_file_lives_in_the_current_folder(
 
     assert resolve_settings(None) == tmp_path / "finagent.settings.json"
     assert resolve_settings(tmp_path / "x.json") == tmp_path / "x.json"
+
+
+def test_yahoo_caches_sit_next_to_the_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caches: list[Path] = []
+    monkeypatch.setattr("finagent.cli.YahooCloses", caches.append)
+
+    _ = build_service(demo=False, env={}, settings_path=tmp_path / "s.json")
+
+    assert caches == [tmp_path / YAHOO_CACHE]
 
 
 def test_check_never_writes_settings(

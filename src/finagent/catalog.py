@@ -1,6 +1,7 @@
 """What the dashboard shows. Edit this file to add, remove or re-order indicators.
 
-Every entry comes from one of the seven public sources in ``sources.py``.
+Every entry comes from one of the seven public sources in ``sources.py``,
+except gold futures, read from Yahoo Finance (unofficial) through yfinance.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from finagent.sources import (
     NyFedRate,
     Ratio,
     SdmxSeries,
+    YahooSeries,
 )
 
 if TYPE_CHECKING:
@@ -451,15 +453,27 @@ PANELS: Final = (
         "markets",
         "EQ",
         "주식 · 변동성",
-        "S&P DJI · Nasdaq · Cboe · 한국거래소(ECOS)",
+        "S&P DJI · Nasdaq · Cboe · 한국거래소(ECOS) · Nikkei",
         (
             fred("us_sp500", "S&P 500", "SP500", "D", IDX0, copyright_="S&P DJI"),
             fred(
                 "us_nasdaq", "나스닥 종합", "NASDAQCOM", "D", IDX0, copyright_="Nasdaq"
             ),
+            fred(
+                "us_nasdaq100",
+                "나스닥 100",
+                "NASDAQ100",
+                "D",
+                IDX0,
+                copyright_="Nasdaq",
+            ),
+            fred(
+                "us_dow", "다우존스 산업평균", "DJIA", "D", IDX0, copyright_="S&P DJI"
+            ),
             fred("us_vix", "VIX", "VIXCLS", "D", IDX1, copyright_="Cboe"),
             ecos("kr_kospi", "코스피", "802Y001", "D", "0001000", IDX2),
             ecos("kr_kosdaq", "코스닥", "802Y001", "D", "0089000", IDX2),
+            fred("nikkei", "닛케이 225", "NIKKEI225", "D", IDX0, copyright_="Nikkei"),
         ),
     ),
     PanelSpec(
@@ -937,11 +951,14 @@ PANELS: Final = (
         "commodities",
         "CMDY",
         "원자재",
-        "EIA · IMF",
+        "EIA · IMF · Yahoo Finance(금 선물)",
         (
             fred("wti", "WTI ($/bbl)", "DCOILWTICO", "D", USD2),
             fred("brent", "브렌트 ($/bbl)", "DCOILBRENTEU", "D", USD2),
             fred("henryhub", "헨리허브 가스 ($/MMBtu)", "DHHNGSP", "D", USD2),
+            Indicator(
+                "gold", "금 ($/oz)", "YAHOO:GC=F", YahooSeries("GC=F"), "D", USD2
+            ),
             fred("copper", "구리 ($/t)", "PCOPPUSDM", "M", USD0),
             fred("aluminum", "알루미늄 ($/t)", "PALUMUSDM", "M", USD0),
             fred("iron_ore", "철광석 ($/t)", "PIORECRUSDM", "M", USD2),
@@ -959,15 +976,29 @@ PANELS: Final = (
 
 TAPE: Final = (
     "us_fftu",
+    "us_2y",
     "us_10y",
     "us_10y3m",
-    "us_sp500",
-    "us_dollar",
-    "wti",
-    "us_vix",
-    "kr_usdkrw",
+    "us_hy_oas",
+    "kr_base",
+    "kr_ktb3",
     "kr_ktb10",
+    "us_sp500",
+    "us_nasdaq",
+    "us_nasdaq100",
+    "us_dow",
+    "us_vix",
     "kr_kospi",
+    "kr_kosdaq",
+    "nikkei",
+    "us_dollar",
+    "kr_usdkrw",
+    "usdjpy",
+    "eurusd",
+    "usdcny",
+    "wti",
+    "henryhub",
+    "gold",
 )
 
 CURVE_TENORS: Final = (
@@ -1078,8 +1109,10 @@ CORE: Final = frozenset(
         # Monetary policy at the Fed, BOK, ECB, BOJ and PBOC; major economies.
         "us_fftu",
         "us_fftl",
+        "us_2y",
         "us_10y",
         "kr_base",
+        "kr_ktb3",
         "kr_ktb10",
         "ecb_dfr",
         "ea_hicp",
@@ -1088,6 +1121,9 @@ CORE: Final = frozenset(
         "pboc_rate",
         "us_dollar",
         "kr_usdkrw",
+        "usdjpy",
+        "eurusd",
+        "usdcny",
         # Economic cycle: household and corporate debt, money supply, turning
         # points.
         "us_m2",
@@ -1107,14 +1143,19 @@ CORE: Final = frozenset(
         # Market sentiment.
         "us_sp500",
         "us_nasdaq",
+        "us_nasdaq100",
+        "us_dow",
         "kr_kospi",
         "kr_kosdaq",
+        "nikkei",
         "us_vix",
         "us_hy_oas",
         "us_nfci",
         "us_umich",
         "kr_csi",
         "wti",
+        "henryhub",
+        "gold",
     }
 )
 

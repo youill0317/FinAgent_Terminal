@@ -18,12 +18,15 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 SETTINGS_VERSION: Final = 1
+SCOPES: Final = ("view", "all")
+DEFAULT_SCOPE: Final = "view"
 
 
 @dataclass(frozen=True, slots=True)
 class AnalysisChoice:
     provider: str
     models: dict[str, str] = field(default_factory=dict)
+    scope: str = DEFAULT_SCOPE
 
 
 def load_view(path: Path) -> tuple[frozenset[str], str | None]:
@@ -58,7 +61,10 @@ def load_analysis(path: Path) -> AnalysisChoice | None:
             for key, value in cast("dict[object, object]", models).items()
             if isinstance(key, str) and isinstance(value, str)
         }
-    return AnalysisChoice(provider, clean)
+    scope = section.get("scope")
+    if not isinstance(scope, str) or scope not in SCOPES:
+        scope = DEFAULT_SCOPE
+    return AnalysisChoice(provider, clean, scope)
 
 
 def save_view(path: Path, deep: frozenset[str]) -> None:
@@ -83,7 +89,11 @@ def save_analysis(path: Path, choice: AnalysisChoice) -> None:
         {
             "version": SETTINGS_VERSION,
             "deep": ordered,
-            "analysis": {"provider": choice.provider, "models": dict(choice.models)},
+            "analysis": {
+                "provider": choice.provider,
+                "models": dict(choice.models),
+                "scope": choice.scope,
+            },
         },
     )
 

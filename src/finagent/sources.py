@@ -2,6 +2,10 @@
 
 A spec is a frozen, hashable value so a refresh pass can fetch each distinct
 series once even when several indicators or charts use it.
+
+Yahoo (gold futures) is the one source read through ``yfinance``, an optional
+package, instead of a URL here; its caches go under ``data/macro/.yfinance/``
+(``tests/test_guardrails.py``).
 """
 
 from __future__ import annotations
@@ -13,18 +17,21 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import TYPE_CHECKING, ClassVar, Final
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar, Final, cast, final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from finagent.fetch import (
     ECOS_KEY_ENV,
     FRED_KEY_ENV,
+    MissingKeyError,
     SourceError,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from datetime import datetime
 
     from finagent.fetch import FetchContext
     from finagent.models import SourceId
@@ -51,6 +58,9 @@ SDMX_STRUCTURE_ROOTS: Final[dict[str, tuple[str, str]]] = {
     "BIS": ("https://stats.bis.org/api/v1/dataflow", "BIS"),
     "OECD": ("https://sdmx.oecd.org/public/rest/dataflow", "all"),
 }
+
+# yfinance's caches, under the folder the app runs from.
+YAHOO_CACHE: Final = Path("data") / "macro" / ".yfinance"
 
 ECOS_MAX_ROWS: Final = 10000
 FISCAL_PAGE_SIZE: Final = 10000
@@ -465,10 +475,65 @@ def parse_sdmx_csv(text: str) -> list[dict[str, str]]:
     return [dict(zip(header, row, strict=False)) for row in reader]
 
 
+# ---------------------------------------------------------------- Yahoo Finance
+
+
+@final
+class YahooCloses:
+    """The real ``Closes``: yfinance, with its caches under ``cache``."""
+
+    def __init__(self, cache: Path) -> None:  # noqa: D107
+        self._cache = cache
+        self._pointed = False
+
+    def __call__(self, ticker: str, start: date) -> Series:
+        try:
+            # Optional dependency, without type stubs.
+            import yfinance as yf  # noqa: PLC0415  # pyright: ignore[reportMissingTypeStubs]
+        except ImportError as error:
+            raise MissingKeyError(
+                "yfinance가 설치되지 않았습니다 (uv sync --extra screen)"
+            ) from error
+        if not self._pointed:
+            self._cache.mkdir(parents=True, exist_ok=True)
+            yf.set_tz_cache_location(str(self._cache))
+            self._pointed = True
+        try:
+            frame = yf.Ticker(ticker).history(  # pyright: ignore[reportUnknownMemberType]
+                start=start.isoformat(), auto_adjust=False, raise_errors=True
+            )
+            stamps = cast("list[datetime]", frame.index.to_list())  # pyright: ignore[reportUnknownMemberType]
+            closes = cast("Sequence[float]", frame["Close"])
+        except Exception as error:  # yfinance raises many kinds
+            raise SourceError(f"YAHOO {ticker}: {type(error).__name__}") from error
+        return _require(
+            to_series(
+                [
+                    (stamp.date().isoformat(), close)
+                    for stamp, close in zip(stamps, closes, strict=True)
+                ]
+            ),
+            "YAHOO",
+            ticker,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class YahooSeries:
+    ticker: str
+    years: int = 4
+    source: ClassVar[SourceId] = "YAHOO"
+
+    async def fetch(self, ctx: FetchContext, today: date) -> Series:
+        return await ctx.closes(self.ticker, years_before(today, self.years))
+
+
 # ---------------------------------------------------------------- derived
 
 
-type Fetch = FredSeries | FiscalSeries | NyFedRate | EcosSeries | SdmxSeries
+type Fetch = (
+    FredSeries | FiscalSeries | NyFedRate | EcosSeries | SdmxSeries | YahooSeries
+)
 
 
 @dataclass(frozen=True, slots=True)

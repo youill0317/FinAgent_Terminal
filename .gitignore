@@ -10,3 +10,6 @@ __pycache__/
 .serena/
 .env
 finagent.settings.json
+
+# Screening snapshots and portfolio files (screen.py, portfolio.py)
+data/

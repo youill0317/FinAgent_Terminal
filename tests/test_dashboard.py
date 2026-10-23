@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -9,14 +10,16 @@ import httpx
 
 from finagent import catalog
 from finagent.cli import check_report
-from finagent.demo import DEMO_KEYS, demo_transport
+from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService
+from finagent.sources import YahooCloses
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     import pytest
 
+    from finagent.fetch import Closes
     from finagent.models import Dashboard
 
 NOW = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
@@ -25,6 +28,7 @@ NOW = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
 def service(
     env: dict[str, str] | None = None,
     wrap: Callable[[httpx.Request], httpx.Response | None] | None = None,
+    yahoo: Closes | None = None,
 ) -> DashboardService:
     demo = demo_transport(NOW.date())
 
@@ -39,6 +43,7 @@ def service(
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         clock=lambda: NOW,
         retry_delay=0,
+        yahoo=demo_closes(NOW.date()) if yahoo is None else yahoo,
     )
 
 
@@ -56,6 +61,18 @@ def test_every_catalog_indicator_resolves_with_demo_data() -> None:
     assert all(row.history for row in rows)
 
 
+def test_the_full_series_behind_every_row_is_in_memory() -> None:
+    svc = service()
+    dashboard = build(svc)
+
+    for row in (row for panel in dashboard.panels for row in panel.rows):
+        series = svc.full_series(row.id)
+        assert series[-1][1] == row.value
+        assert len(series) >= len(row.history)
+    assert svc.full_series("no_such_id") == ()
+    assert service().full_series("us_cpi") == ()
+
+
 def test_tape_ids_exist_in_panels() -> None:
     ids = {indicator.id for spec in catalog.PANELS for indicator in spec.indicators}
 
@@ -63,7 +80,25 @@ def test_tape_ids_exist_in_panels() -> None:
     # The tape and the SEP "current" column read rows the default view shows.
     assert set(catalog.TAPE) <= catalog.CORE
     assert {id_ for row in catalog.SEP_ROWS for id_ in row.current} <= catalog.CORE
-    assert {"kr_ktb10", "us_sp500", "kr_kospi"} <= set(catalog.TAPE)
+    assert {"kr_ktb10", "us_sp500", "kr_kospi", "gold"} <= set(catalog.TAPE)
+
+
+def test_gold_without_yfinance_leaves_the_other_sources_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "yfinance", None)
+
+    dashboard = build(service(yahoo=YahooCloses(tmp_path / "cache")))
+
+    gold = next(
+        row for panel in dashboard.panels for row in panel.rows if row.id == "gold"
+    )
+    assert gold.status == "missing_key"
+    assert "yfinance" in (gold.message or "")
+    states = {source.id: source.state for source in dashboard.sources}
+    assert states.pop("YAHOO") == "missing_key"
+    assert set(states.values()) == {"ok"}
+    assert not (tmp_path / "cache").exists()
 
 
 def test_charts_regime_and_calendar() -> None:

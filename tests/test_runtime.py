@@ -7,7 +7,7 @@ import httpx
 
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import AnalysisService, Event, RunInput
-from finagent.demo import DEMO_KEYS, demo_transport
+from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.runtime import Run, Runtime
 from finagent.service import DashboardService
 
@@ -21,6 +21,7 @@ def runtime(delay: float = 0) -> Runtime:
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         clock=lambda: NOW,
         retry_delay=0,
+        yahoo=demo_closes(NOW.date()),
     )
     return Runtime(
         service,

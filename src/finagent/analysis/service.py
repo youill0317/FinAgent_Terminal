@@ -27,7 +27,7 @@ from finagent.analysis.providers.base import (
 )
 from finagent.analysis.tools import TOOL_SPECS, Toolbox
 from finagent.analysis.verify import verify
-from finagent.settings import AnalysisChoice, load_analysis, save_analysis
+from finagent.settings import SCOPES, AnalysisChoice, load_analysis, save_analysis
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Mapping
@@ -120,14 +120,17 @@ class AnalysisService:
         provider = self._providers[provider_id]
         return self._choice.models.get(provider_id) or provider.default_model
 
-    def choose(self, provider_id: str, model: str = "") -> AnalysisChoice:
+    def choose(
+        self, provider_id: str, model: str = "", scope: str = ""
+    ) -> AnalysisChoice:
         if provider_id not in self._providers:
             msg = f"알 수 없는 공급자: {provider_id}"
             raise ProviderError(msg)
         models = dict(self._choice.models)
         if model.strip():
             models[provider_id] = model.strip()
-        self._choice = AnalysisChoice(provider_id, models)
+        kept = scope if scope in SCOPES else self._choice.scope
+        self._choice = AnalysisChoice(provider_id, models, kept)
         if self._settings_path is not None:
             save_analysis(self._settings_path, self._choice)
         return self._choice

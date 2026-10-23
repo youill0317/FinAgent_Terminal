@@ -10,8 +10,9 @@ import httpx
 
 from finagent import __version__, catalog
 from finagent.analysis.service import AnalysisService
-from finagent.demo import DEMO_KEYS, demo_transport
+from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService, local_now
+from finagent.sources import YAHOO_CACHE, YahooCloses
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -72,13 +73,18 @@ def build_service(
     *, demo: bool, env: Mapping[str, str], settings_path: Path | None = None
 ) -> DashboardService:
     if not demo:
-        return DashboardService(env, settings_path=settings_path)
-    transport = demo_transport(local_now().date())
+        cache = resolve_settings(settings_path).parent / YAHOO_CACHE
+        return DashboardService(
+            env, settings_path=settings_path, yahoo=YahooCloses(cache)
+        )
+    today = local_now().date()
+    transport = demo_transport(today)
     return DashboardService(
         DEMO_KEYS,
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         demo=True,
         settings_path=settings_path,
+        yahoo=demo_closes(today),
     )
 
 

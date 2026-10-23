@@ -10,11 +10,11 @@ import httpx
 from finagent import catalog
 from finagent.analysis.context import build_document, fmt_value
 from finagent.analysis.evidence import Evidence
-from finagent.analysis.presets import PLACEHOLDER, PRESET_BY_ID, PRESETS
+from finagent.analysis.presets import PRESET_BY_ID, PRESETS
 from finagent.analysis.prompt import Conversation, ToolRecord, Turn, system_prompt
 from finagent.analysis.tools import MAX_POINTS, MAX_TOOL_CALLS, TOOL_NAMES, Toolbox
 from finagent.analysis.verify import verify
-from finagent.demo import DEMO_KEYS, demo_transport
+from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.models import Fmt
 from finagent.service import DashboardService
 
@@ -34,6 +34,7 @@ def service(env: dict[str, str] | None = None) -> DashboardService:
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         clock=lambda: NOW,
         retry_delay=0,
+        yahoo=demo_closes(NOW.date()),
     )
 
 
@@ -188,7 +189,11 @@ def test_presets_load_their_text_and_name_real_panels() -> None:
     for preset in PRESETS:
         assert preset.text.startswith("<task>")
         assert set(preset.panels) <= panel_ids
-    assert PLACEHOLDER in PRESET_BY_ID["deep_dive"].text
+    assert [preset.id for preset in PRESETS] == ["macro"]
+    macro = PRESET_BY_ID["macro"]
+    assert {"markets", "commodities", "credit", "housing"} <= set(macro.panels)
+    for anchor in ("매우 불리", "불리·주의", "혼재·보통", "유리", "매우 유리"):
+        assert anchor in macro.text
 
 
 # ---------------------------------------------------------------- tools

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import types
 from datetime import date
 from typing import TYPE_CHECKING
 
 import httpx
+import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 import pytest
 
 from finagent.fetch import FetchContext, MissingKeyError, SourceError
@@ -15,6 +18,8 @@ from finagent.sources import (
     FredSeries,
     NyFedRate,
     SdmxSeries,
+    YahooCloses,
+    YahooSeries,
     ecos_period,
     fred_release_dates,
     fred_vintages,
@@ -22,6 +27,7 @@ from finagent.sources import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
+    from pathlib import Path
 
 TODAY = date(2026, 10, 12)
 KEYS = {"FRED_API_KEY": "fred-secret-key", "ECOS_API_KEY": "ecos-secret-key"}
@@ -361,3 +367,96 @@ def test_client_errors_are_not_retried(status: int, message: str) -> None:
     assert str(caught.value) == message
     assert "fred-secret-key" not in str(caught.value)
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------- Yahoo
+
+
+def fake_yfinance(
+    monkeypatch: pytest.MonkeyPatch, answer: pd.DataFrame | Exception
+) -> list[dict[str, object]]:
+    """Stand in for the yfinance module; returns the ``history`` calls."""
+    calls: list[dict[str, object]] = []
+
+    class Ticker:
+        def __init__(self, ticker: str) -> None:
+            self.ticker: str = ticker
+
+        def history(self, **kwargs: object) -> pd.DataFrame:
+            calls.append({"ticker": self.ticker, **kwargs})
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    def point(_: str) -> None:
+        pass
+
+    fake = types.ModuleType("yfinance")
+    fake.set_tz_cache_location = point  # pyright: ignore[reportAttributeAccessIssue]
+    fake.Ticker = Ticker  # pyright: ignore[reportAttributeAccessIssue]
+    monkeypatch.setitem(sys.modules, "yfinance", fake)
+    return calls
+
+
+def test_yahoo_closes_by_exchange_day_without_gaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    days = pd.DatetimeIndex(["2026-10-08", "2026-10-09"], tz="America/New_York")
+    frame = pd.DataFrame({"Open": [1.0, 2.0], "Close": [4010.5, None]}, index=days)
+    calls = fake_yfinance(monkeypatch, frame)
+
+    series = YahooCloses(tmp_path)("GC=F", date(2022, 10, 12))
+
+    assert series == ((date(2026, 10, 8), 4010.5),)
+    assert calls == [
+        {
+            "ticker": "GC=F",
+            "start": "2022-10-12",
+            "auto_adjust": False,
+            "raise_errors": True,
+        }
+    ]
+
+
+def test_yahoo_failures_are_source_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ = fake_yfinance(monkeypatch, ConnectionError("down"))
+    with pytest.raises(SourceError, match="YAHOO GC=F: ConnectionError"):
+        _ = YahooCloses(tmp_path)("GC=F", TODAY)
+
+    _ = fake_yfinance(monkeypatch, pd.DataFrame({"Close": []}))
+    with pytest.raises(SourceError, match="YAHOO GC=F: 관측값 없음"):
+        _ = YahooCloses(tmp_path)("GC=F", TODAY)
+
+
+def test_yahoo_without_yfinance_is_a_missing_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "yfinance", None)
+
+    with pytest.raises(MissingKeyError, match="yfinance가 설치되지 않았습니다"):
+        _ = YahooCloses(tmp_path / "cache")("GC=F", TODAY)
+    assert not (tmp_path / "cache").exists()
+
+
+def test_yahoo_series_reads_closes_through_the_context() -> None:
+    asked: list[tuple[str, date]] = []
+
+    def closes(ticker: str, start: date) -> tuple[tuple[date, float], ...]:
+        asked.append((ticker, start))
+        return ((TODAY, 4000.0),)
+
+    async def main() -> tuple[tuple[date, float], ...]:
+        async with httpx.AsyncClient() as client:
+            ctx = FetchContext(client, {}, yahoo=closes)
+            return await YahooSeries("GC=F", years=1).fetch(ctx, TODAY)
+
+    assert asyncio.run(main()) == ((TODAY, 4000.0),)
+    assert asked == [("GC=F", date(2025, 10, 12))]
+
+    def unused(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    with pytest.raises(SourceError, match="YAHOO 시세를 받을 경로가 없습니다"):
+        _ = run(unused, lambda ctx: YahooSeries("GC=F").fetch(ctx, TODAY))
