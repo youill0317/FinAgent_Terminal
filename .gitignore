@@ -1,19 +1,21 @@
-.venv/
+# Only the paths listed below are tracked; anything else at the top level
+# (.venv, data/, .env, settings, caches, agent folders, notes) stays local.
+/*
+!/.gitignore
+!/.github/
+!/.env.example
+!/README.md
+!/pyproject.toml
+!/uv.lock
+!/src/
+!/tests/
+!/training/
+
+# docs/: only the guide the AI tools read at runtime (analysis/tools.py)
+!/docs/
+/docs/*
+!/docs/data-sources.md
+
+# Caches inside the tracked folders
 __pycache__/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.pyright/
-.omo/
-.codegraph
-.codegraph/
-.serena/
-.env
-finagent.settings.json
-
-# Screening snapshots and portfolio files (screen.py, portfolio.py)
-data/
-
-# Agent skill links into .venv (created locally by Streamlit)
-.agents/skills/developing-with-streamlit
-.claude/skills/developing-with-streamlit
+*.py[cod]
