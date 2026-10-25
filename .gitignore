@@ -13,3 +13,7 @@ finagent.settings.json
 
 # Screening snapshots and portfolio files (screen.py, portfolio.py)
 data/
+
+# Agent skill links into .venv (created locally by Streamlit)
+.agents/skills/developing-with-streamlit
+.claude/skills/developing-with-streamlit
