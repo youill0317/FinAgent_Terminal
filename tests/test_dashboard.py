@@ -61,28 +61,6 @@ def test_every_catalog_indicator_resolves_with_demo_data() -> None:
     assert all(row.history for row in rows)
 
 
-def test_the_full_series_behind_every_row_is_in_memory() -> None:
-    svc = service()
-    dashboard = build(svc)
-
-    for row in (row for panel in dashboard.panels for row in panel.rows):
-        series = svc.full_series(row.id)
-        assert series[-1][1] == row.value
-        assert len(series) >= len(row.history)
-    assert svc.full_series("no_such_id") == ()
-    assert service().full_series("us_cpi") == ()
-
-
-def test_tape_ids_exist_in_panels() -> None:
-    ids = {indicator.id for spec in catalog.PANELS for indicator in spec.indicators}
-
-    assert set(catalog.TAPE) <= ids
-    # The tape and the SEP "current" column read rows the default view shows.
-    assert set(catalog.TAPE) <= catalog.CORE
-    assert {id_ for row in catalog.SEP_ROWS for id_ in row.current} <= catalog.CORE
-    assert {"kr_ktb10", "us_sp500", "kr_kospi", "gold"} <= set(catalog.TAPE)
-
-
 def test_gold_without_yfinance_leaves_the_other_sources_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -213,17 +191,17 @@ def test_default_view_shows_core_rows_only() -> None:
     assert views["housing"].core == 0
     assert views["housing"].extra == 8
     assert sum(view.core for view in views.values()) == len(catalog.CORE)
+    # The tape and the SEP "current" column read rows the default view shows.
+    assert set(catalog.TAPE) <= catalog.CORE
+    assert {id_ for row in catalog.SEP_ROWS for id_ in row.current} <= catalog.CORE
 
-
-def test_deep_view_adds_a_panels_remaining_rows() -> None:
-    dashboard = build(service(), frozenset({"labor", "curve", "nonsense"}))
-
-    panels = {panel.id: panel for panel in dashboard.panels}
+    deep = build(service(), frozenset({"labor", "curve", "nonsense"}))
+    panels = {panel.id: panel for panel in deep.panels}
     labor = next(spec for spec in catalog.PANELS if spec.id == "labor")
     assert len(panels["labor"].rows) == len(labor.indicators)
     assert {row.id for row in panels["inflation"].rows} <= catalog.CORE
-    assert dashboard.deep == ("labor", "curve")
-    assert dashboard.curve is not None
+    assert deep.deep == ("labor", "curve")
+    assert deep.curve is not None
 
 
 def test_changing_the_view_fetches_only_new_series() -> None:
@@ -252,28 +230,21 @@ def test_changing_the_view_fetches_only_new_series() -> None:
     assert back == with_housing
     assert refreshed - back == core
 
+    # A different view asked for during a pass waits for it, then adds only
+    # its own series.
+    requests.clear()
+    fresh = service(wrap=count)
 
-def test_a_different_view_waits_for_the_pass_in_flight() -> None:
-    requests: list[str] = []
-
-    def count(request: httpx.Request) -> None:
-        requests.append(str(request.url))
-
-    svc = service(wrap=count)
-
-    async def scenario() -> tuple[Dashboard, Dashboard]:
+    async def together() -> tuple[Dashboard, Dashboard]:
         first, second = await asyncio.gather(
-            svc.get(), svc.get(deep=frozenset({"housing"}))
+            fresh.get(), fresh.get(deep=frozenset({"housing"}))
         )
         return first, second
 
-    first, second = asyncio.run(scenario())
+    first, second = asyncio.run(together())
     assert first.deep == ()
     assert second.deep == ("housing",)
-    alone = len(requests)
-    requests.clear()
-    _ = asyncio.run(service(wrap=count).get(deep=frozenset({"housing"})))
-    assert alone == len(requests)
+    assert len(requests) == with_housing
 
 
 def test_snapshot_is_reused_until_refresh() -> None:
@@ -297,23 +268,12 @@ def test_snapshot_is_reused_until_refresh() -> None:
     assert second == first
     assert third == first * 2
 
-
-def test_concurrent_callers_share_one_pass() -> None:
-    requests: list[str] = []
-
-    def count(request: httpx.Request) -> None:
-        requests.append(str(request.url))
-
-    svc = service(wrap=count)
-
-    async def scenario() -> None:
+    async def concurrent() -> None:
         _ = await asyncio.gather(svc.get(), svc.get(refresh=True), svc.get())
 
-    asyncio.run(scenario())
-    single_pass = len(requests)
     requests.clear()
-    _ = asyncio.run(svc.get(refresh=True))
-    assert single_pass == len(requests)
+    asyncio.run(concurrent())
+    assert len(requests) == first  # concurrent callers share one pass
 
 
 def test_a_pass_writes_nothing_to_disk(

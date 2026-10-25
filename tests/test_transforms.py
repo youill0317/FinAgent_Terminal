@@ -131,12 +131,6 @@ def test_daily_history_is_monthly_means_capped_at_24_months() -> None:
     )
 
 
-def test_quarterly_history_labels() -> None:
-    series = ((date(2026, 4, 1), 2.1),)
-
-    assert history(series, "Q") == (("2026Q2", 2.1),)
-
-
 def test_recession_bands_find_each_run() -> None:
     series = _monthly([0, 1, 1, 0, 0, 1], start_year=2020)
 

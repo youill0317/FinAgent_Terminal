@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         Panel,
         ProjectionCell,
         Projections,
+        RegimeCell,
     )
 
 type Color = Literal["red", "orange", "yellow", "blue", "green", "violet", "gray"]
@@ -97,6 +98,21 @@ TAPE_GROUPS: Final = (
         ),
     ),
 )
+# The market groups' heading help, by title.
+TAPE_HELP: Final = {
+    "금리": (
+        "**정의** 미국·한국 정책금리, 국채 수익률, 장단기 금리차, 하이일드"
+        " 스프레드 · 변화는 직전 관측치 대비(%p)\n\n**기준** 상승 빨강 · 하락 파랑"
+    ),
+    "주식": (
+        "**정의** 미국·한국·일본 주가지수와 VIX(S&P 500 내재 변동성) · 변화는"
+        " 직전 관측치 대비\n\n**기준** 상승 빨강 · 하락 파랑"
+    ),
+    "환율·원자재": (
+        "**정의** 달러 지수, 주요 환율, 원유·천연가스·금 가격 · 변화는"
+        " 직전 관측치 대비\n\n**기준** 상승 빨강 · 하락 파랑"
+    ),
+}
 # The indicator each regime cell judges, for its trend line.
 REGIME_SOURCE: Final = {
     "물가": "us_core_pce",
@@ -112,9 +128,9 @@ SOURCE_COLOR: Final[dict[str, Color]] = {
 }
 TONE: Final[dict[str, tuple[Color, str]]] = {
     "good": ("green", "●"),
-    "warn": ("orange", "▲"),
+    "warn": ("orange", "◆"),
     "crit": ("red", "■"),
-    "neutral": ("gray", "◆"),
+    "neutral": ("gray", "○"),
 }
 STATUS_TEXT: Final = {
     "ready": "준비됨",
@@ -148,8 +164,7 @@ PANEL_PAGES: Final = (
     ),
 )
 WEEKDAYS: Final = "월화수목금토일"
-IDLE_NOTE: Final = "수동 실행 · 대화는 메모리에만"
-STOPPED: Final = "멈췄습니다. 이 턴은 대화에 남지 않습니다."
+STOPPED: Final = "중지했습니다. 이 턴은 대화에 남지 않습니다."
 CUT_SHORT: Final = "응답이 끝나기 전에 실행이 끝났습니다."
 # Citation marks ``[[id, id]]`` are hidden while the answer streams in.
 LIVE_MARK: Final = re.compile(r"\s?\[\[[^\]]*\]\]")
@@ -170,6 +185,16 @@ def fmt(value: float | None, f: Fmt) -> str:
     return f"{sign}{f.pre}{number(abs(value), f.dec)}{f.suf}"
 
 
+def share(value: float) -> str:
+    """A simulated share in whole percent; a possible outcome never shows 0% or 100%."""
+    text = f"{value:.0%}"
+    if text == "0%" and value > 0:
+        return "<1%"
+    if text == "100%" and value < 1:
+        return ">99%"
+    return text
+
+
 def change(row: IndicatorRow) -> float | None:
     """Latest minus previous, ``0.0`` when it rounds away, ``None`` if unknown."""
     if row.value is None or row.prev is None:
@@ -183,7 +208,7 @@ def change_text(row: IndicatorRow) -> str:
     if diff is None:
         return ""
     if diff == 0:
-        return "— 0"
+        return "—"
     return f"{'▲' if diff > 0 else '▼'} {number(abs(diff), row.fmt.dec)}"
 
 
@@ -203,10 +228,22 @@ def metric_color(row: IndicatorRow) -> Literal["red", "blue", "off"]:
     return "red" if diff > 0 else "blue"
 
 
+def unit(f: Fmt) -> str:
+    """The unit a value is shown in, for a chart title: ``%``, ``$B``, ``원``."""
+    return f"{f.pre}{f.suf}"
+
+
 def metric_delta(row: IndicatorRow) -> str | None:
-    """A signed delta for ``st.metric``, which colors by the leading sign."""
+    """A signed delta for ``st.metric``, which colors by the leading sign.
+
+    The unit follows the value's, except that a change in % is in %p.
+    """
     diff = change(row)
-    return None if diff is None else f"{diff:+,.{row.fmt.dec}f}"
+    if diff is None:
+        return None
+    text = f"{diff:+,.{row.fmt.dec}f}"
+    suf = "%p" if row.fmt.suf == "%" else row.fmt.suf
+    return f"{text[0]}{row.fmt.pre}{text[1:]}{suf}"
 
 
 def short_date(row: IndicatorRow) -> str:
@@ -279,6 +316,19 @@ def trend(row: IndicatorRow | None) -> list[float] | None:
     return [value for _, value in row.history] or None
 
 
+def regime_card(cell: RegimeCell) -> tuple[str, str]:
+    """A 국면 요약 card's label and value.
+
+    A leading % or %p in ``cell.unit`` joins the value, like every other
+    card's unit; the rest (what is measured) joins the label.
+    """
+    head, _, rest = cell.unit.partition(" ")
+    if head not in {"%", "%p"}:
+        return f"{cell.label} · {cell.unit}", cell.value
+    value = cell.value if cell.value == "—" else f"{cell.value}{head}"
+    return (f"{cell.label} · {rest}" if rest else cell.label), value
+
+
 def panel_of(d: Dashboard) -> dict[str, str]:
     """Indicator id to the panel it is shown in, for citation links."""
     return {row.id: panel.id for panel in d.panels for row in panel.rows}
@@ -317,8 +367,9 @@ def panel_problems(panel: Panel) -> list[str]:
 
 # ---------------------------------------------------------------- detail view
 
-# Months shown by the detail chart's range control; 0 means the whole span.
-DETAIL_RANGES: Final = {"2Y": 24, "4Y": 48, "전체": 0}
+# Months shown by a chart's range control (2s10s, indicator detail); 0 means
+# the whole span.
+CHART_RANGES: Final = {"2Y": 24, "5Y": 60, "전체": 0}
 
 
 def label_day(label: str) -> date:
@@ -361,7 +412,7 @@ def sep_change(cell: ProjectionCell | None) -> str:
     diff = cell.value - cell.prev
     if abs(diff) < 0.05:  # noqa: PLR2004 - half of the one decimal shown
         return "—"
-    return f"{'▲' if diff > 0 else '▼'}{number(abs(diff), 1)}"
+    return f"{'▲' if diff > 0 else '▼'} {number(abs(diff), 1)}"
 
 
 def sep_change_key(name: str) -> str:
@@ -490,8 +541,8 @@ class AnalysisLog:
     @property
     def header(self) -> str:
         if not self.snapshot:
-            return IDLE_NOTE
-        return f"데이터 {short_time(self.snapshot)}에 고정 · 메모리에만"
+            return ""
+        return f"데이터 {short_time(self.snapshot)}에 고정"
 
     def ask(self, question: str) -> None:
         self.stopped = False
@@ -505,10 +556,7 @@ class AnalysisLog:
             self.conversation = str(event["conversation"])
             self.snapshot = str(event["snapshot"])
             self.stale = self.stale or bool(event.get("stale"))
-            turn.run = (
-                f"{event['provider_title']} · {event['model']} · {event['view']}"
-                f" · 데이터 {short_time(self.snapshot)}"
-            )
+            turn.run = f"{event['provider_title']} · {event['model']} · {event['view']}"
         elif kind == "text":
             turn.raw += str(event["text"])
         elif kind == "tool":

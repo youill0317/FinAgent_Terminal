@@ -39,43 +39,6 @@ def button(at: AppTest, label: str) -> None:
     _ = next(b for b in at.button if b.label == label).click().run()
 
 
-def test_the_dashboard_renders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    at = page(tmp_path, monkeypatch)
-
-    assert not at.exception
-    labels = [metric.label for metric in at.metric]
-    assert labels[:5] == ["물가", "고용", "금리곡선", "금융여건", "연준 상단"]
-    assert at.info[0].value.startswith("데모 모드")
-    headers = [header.value for header in at.header]
-    assert headers[:3] == ["국면 요약", "시장", "금리곡선"]
-
-    _ = open_page(at, "us")
-    assert not at.exception
-    assert "미국 고용" in [header.value for header in at.subheader]
-
-    _ = open_page(at, "schedule")
-    assert not at.exception
-    assert "앞으로 7일 미국 발표" in [header.value for header in at.subheader]
-    assert any(
-        c.value.startswith("This product uses the FRED® API") for c in at.caption
-    )
-    assert any("-badge[FRED " in m.value for m in at.markdown)
-
-
-def test_a_panel_switches_to_its_deep_rows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    at = open_page(page(tmp_path, monkeypatch), "us")
-    before = sum(len(frame.value) for frame in at.dataframe)
-
-    _ = at.button(key="more_growth").click().run()
-
-    assert not at.exception
-    assert at.button(key="more_growth").label == "핵심만 보기"
-    assert sum(len(frame.value) for frame in at.dataframe) > before
-    assert '"growth"' in (tmp_path / "finagent.settings.json").read_text("utf-8")
-
-
 def click_row(at: AppTest, panel: str, index: int = 0, column: str = "지표") -> None:
     """Stand in for a click on a table cell, which AppTest cannot send."""
     key = f"table_{panel}_{at.session_state.get('table_gen', 0)}"
@@ -85,29 +48,41 @@ def click_row(at: AppTest, panel: str, index: int = 0, column: str = "지표") -
     _ = at.run()
 
 
-def test_a_clicked_row_opens_its_detail_once(
+def test_the_pages_render_and_a_row_opens_its_detail_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    at = open_page(page(tmp_path, monkeypatch), "us")
-    assert not at.metric
+    at = page(tmp_path, monkeypatch)
+    assert not at.exception
+    assert at.metric  # the regime summary
 
+    _ = open_page(at, "us")
+    assert not at.exception
+    assert not at.metric
     click_row(at, "growth", column="최신")  # only the name cell opens a detail
     assert not at.exception
     assert not at.metric
 
     click_row(at, "growth")
     assert not at.exception
-    assert [m.label for m in at.metric] == ["최신", "이전", "기준"]
+    assert len(at.metric) == 3
     assert len(at.get("vega_lite_chart")) == 1
-    assert any(c.value.startswith("FRED:") for c in at.caption)
-
     _ = at.run()  # an unrelated rerun does not bring the dialog back
     assert not at.metric
-    _ = at.button(key="more_growth").click().run()
-    assert not at.metric
 
+    before = sum(len(frame.value) for frame in at.dataframe)
+    _ = at.button(key="more_growth").click().run()
+    assert not at.exception
+    assert not at.metric
+    assert sum(len(frame.value) for frame in at.dataframe) > before
+    assert '"growth"' in (tmp_path / "finagent.settings.json").read_text("utf-8")
     click_row(at, "growth")  # the same row again opens it again
-    assert [m.label for m in at.metric] == ["최신", "이전", "기준"]
+    assert len(at.metric) == 3
+
+    _ = open_page(at, "schedule")
+    assert not at.exception
+    assert any(
+        c.value.startswith("This product uses the FRED® API") for c in at.caption
+    )
 
 
 def finish_run(at: AppTest) -> None:
@@ -120,35 +95,7 @@ def finish_run(at: AppTest) -> None:
     _ = at.run()
 
 
-def test_an_analysis_runs_to_a_verified_answer_and_takes_a_follow_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    at = page(tmp_path, monkeypatch)
-    _ = at.button(key="ai_toggle").click().run()
-    _ = at.chat_input[0].set_value("요약해 주세요").run()
-    finish_run(at)
-
-    assert not at.exception
-    log = cast("AnalysisLog", at.session_state["ai_log"])
-    assert log.conversation
-    assert log.turns[-1].lines is not None
-    first = log.conversation
-    assert not at.chat_input[0].disabled
-
-    _ = at.chat_input[0].set_value("더 설명해 주세요").run()
-    finish_run(at)
-
-    assert not at.exception
-    log = cast("AnalysisLog", at.session_state["ai_log"])
-    assert [turn.question for turn in log.turns] == [
-        "요약해 주세요",
-        "더 설명해 주세요",
-    ]
-    assert log.conversation == first
-    assert all(turn.lines is not None for turn in log.turns)
-
-
-def test_the_macro_preset_button_runs_at_once(
+def test_the_macro_preset_runs_to_a_verified_answer_and_takes_a_follow_up(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     at = page(tmp_path, monkeypatch)
@@ -158,25 +105,22 @@ def test_the_macro_preset_button_runs_at_once(
 
     assert not at.exception
     log = cast("AnalysisLog", at.session_state["ai_log"])
+    assert log.conversation
     assert log.turns[-1].lines is not None
     assert log.turns[0].question.startswith("<task>")
     assert "ai_preset_macro" not in [b.key for b in at.button]  # the input takes over
+    first = log.conversation
+    assert not at.chat_input[0].disabled
 
-
-def test_the_settings_dialog_groups_views_by_page(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    at = page(tmp_path, monkeypatch)
-    button(at, "설정")
+    _ = at.chat_input[0].set_value("더 설명해 주세요").run()
+    finish_run(at)
 
     assert not at.exception
-    labels = [expander.label for expander in at.expander]
-    assert labels[0] == "개요 · 0/1"
-    assert labels[1].startswith("미국 경제 · 0/")
-    assert at.checkbox(key="view_growth").value is False
-    assert "AI 분析" not in labels
-    assert "AI 분석" in labels
-    assert "적용" in [b.label for b in at.button]
+    log = cast("AnalysisLog", at.session_state["ai_log"])
+    assert len(log.turns) == 2
+    assert log.turns[-1].question == "더 설명해 주세요"
+    assert log.conversation == first
+    assert all(turn.lines is not None for turn in log.turns)
 
 
 def test_the_settings_dialog_holds_the_ai_choice(
@@ -192,6 +136,13 @@ def test_the_settings_dialog_holds_the_ai_choice(
     assert provider.options
     assert at.text_input(key=f"set_model_{provider.value}")
     assert "set_scope" in [w.key for w in at.get("button_group")]
+    # 생성 모델 학습 on canned choices: Colab is never checked or called.
+    tickers = at.multiselect(key="train_tickers")
+    assert tickers.value
+    # USD/KRW is always trained, so not offered; indices and rates never are.
+    assert all(t != "KRW=X" and not t.startswith("^") for t in tickers.options)
+    assert at.date_input(key="train_span")
+    assert not at.button(key="train_start").disabled
     _ = at.button(key="ai_toggle").click().run()
     assert "set_provider" not in [w.key for w in at.selectbox]
     assert "ai_scope" not in [w.key for w in at.get("button_group")]

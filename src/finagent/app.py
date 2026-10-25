@@ -12,44 +12,64 @@ sees the same view, snapshot and analysis lock.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 from zoneinfo import ZoneInfo
 
 import altair as alt
+import numpy as np
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 import streamlit as st
 
-from finagent import catalog, display, investors, perf, portfolio, quant, screen
+from finagent import (
+    catalog,
+    colab_jobs,
+    display,
+    generative,
+    investors,
+    perf,
+    portfolio,
+    quant,
+    screen,
+)
 from finagent.analysis.presets import PRESETS
 from finagent.analysis.providers.base import ProviderError
 from finagent.analysis.service import AnalysisService, RunInput
 from finagent.cli import build_service, parse_args, resolve_env, resolve_settings
+from finagent.dashboard import REGIME_HELP
 from finagent.fetch import SourceError
 from finagent.guides import GUIDES
 from finagent.runtime import Run, Runtime
+from finagent.settings import (
+    ScreenChoice,
+    TrainingChoice,
+    load_screen,
+    load_training,
+    save_screen,
+    save_training,
+)
 from finagent.sources import EcosSeries, FredSeries
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
-    from datetime import date
+    from collections.abc import Callable, Collection, Sequence
 
-    import numpy as np
     from numpy.typing import NDArray
+    from streamlit.delta_generator import DeltaGenerator
 
     from finagent.models import Curve, Dashboard, IndicatorRow, Panel, Spread
     from finagent.sources import Fetch
     from finagent.sources import Series as Points
 
 CLOCKS = (("NY", "America/New_York"), ("SEOUL", "Asia/Seoul"), ("UTC", "UTC"))
-SPREAD_RANGES = {"2Y": 24, "5Y": 60, "전체": 0}
 CHART_HEIGHT = 240
+LIST_HEIGHT = 560  # long tables: screening results, investor holdings
 DETAIL_POINT_LIMIT = 60
 SCOPES = {"view": "지금 보기", "all": "전체 매크로"}
 # The floating AI button and the panel above it; {bg} is the page background.
@@ -68,6 +88,44 @@ AI_CSS = """<style>
   {{flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex;
   flex-direction: column-reverse}}
 </style>"""
+# Equal cards on a grid: a horizontal container sizes each card by its
+# content. auto-fill keeps a card the same width however many share the row,
+# so one or two cards do not stretch across it, and 1fr rows keep a wrapped
+# card as tall as the row above. 188px fits the 최대 낙폭 dates; 160px keeps
+# the eight 고급 cards on one line at 1600px wide; 260px fits amounts and the
+# 난기류 pill; 280px the what-if "before → after" values.
+CARDS_CSS = """<style>
+.st-key-pf_risk_cards, .st-key-pf_spread_cards, .st-key-detail_cards,
+.st-key-screen_stock_cards
+  {display: grid; grid-auto-rows: 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(188px, 1fr))}
+.st-key-pf_more_cards {display: grid; grid-auto-rows: 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))}
+.st-key-pf_now_cards, .st-key-pf_return_cards, .st-key-pf_trade_cards,
+.st-key-pf_split_cards, .st-key-pf_turbulence_cards, .st-key-pf_reverse_cards,
+.st-key-inv_now_cards, .st-key-inv_return_cards, .st-key-inv_overlap_cards,
+.st-key-inv_stock_cards
+  {display: grid; grid-auto-rows: 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr))}
+.st-key-pf_whatif_cards, .st-key-pf_whatif_path_cards {display: grid;
+  grid-auto-rows: 1fr; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr))}
+</style>"""
+FRED_NOTICE = "**조건** FRED API 키 · 환경변수 FRED_API_KEY 또는 .env"
+
+
+def notice(text: str) -> None:
+    """A "!" whose hover shows ``text``, like a heading's "?"."""
+    st.badge("", icon=":material/priority_high:", color="orange", help=text)
+
+
+def headed(text: str, help_: str | None = None, warns: Sequence[str] = ()) -> None:
+    """A bold ``st.markdown`` heading, with a "!" beside it for ``warns``."""
+    if not warns:
+        st.markdown(text, help=help_)
+        return
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.markdown(text, help=help_)
+        notice("\n\n".join(warns))
 
 
 @st.cache_resource(show_spinner=False)
@@ -147,12 +205,15 @@ def ai_settings() -> None:
                 f"{display.STATUS_TEXT.get(found[pid].kind, found[pid].kind)}"
             ),
             key="set_provider",
+            help="**정의** AI 분석을 실행할 공급자 · 옆은 상태(준비됨 · 키 없음 ·"
+            " 설치 안 됨)",
         )
         _ = st.text_input(
             "모델",
             value=rt.analysis.model_for(provider_id),
             placeholder=providers[provider_id].default_model,
             key=f"set_model_{provider_id}",
+            help="**정의** 공급자에 보낼 모델 이름 · 비우면 기본 모델",
         )
         _ = st.segmented_control(
             "새 대화의 범위",
@@ -160,7 +221,9 @@ def ai_settings() -> None:
             format_func=SCOPES.__getitem__,
             default=rt.analysis.choice.scope,
             key="set_scope",
-            help="진행 중인 대화는 시작할 때의 범위를 유지합니다",
+            help="**정의** 새 대화가 읽는 지표 범위 · 지금 보기: 보기 설정에서 켠"
+            " 지표 · 전체 매크로: 모든 지표\n\n**기준** 진행 중인 대화는 시작 시점의"
+            " 범위 유지",
         )
 
 
@@ -179,9 +242,306 @@ def apply_ai() -> None:
         state.ai_error = ""
 
 
-@st.dialog("보기 설정", width="large")
+# ---- 생성 모델 학습 (Colab)
+
+GEN_LABELS: dict[str, str] = {
+    "tailgan": "Tail-GAN",
+    "sigcwgan": "SigCWGAN",
+    "nsde": "신경망 SDE",
+    "kronos": "Kronos",
+}
+
+
+@st.cache_resource(show_spinner=False)
+def trainer(root: str) -> colab_jobs.Trainer:
+    """One training job runner per models folder; picks up an unfinished job."""
+    jobs = colab_jobs.Trainer(Path(root))
+    jobs.reconcile()
+    return jobs
+
+
+type Jobs = colab_jobs.Trainer | colab_jobs.DemoTrainer
+
+
+def demo_trainer() -> colab_jobs.DemoTrainer:
+    """The demo's canned stand-in, one per session so the dialog keeps it."""
+    return cast(
+        "colab_jobs.DemoTrainer",
+        state.setdefault("train_demo", colab_jobs.DemoTrainer()),
+    )
+
+
+def gen_root() -> Path:
+    return resolve_settings(args.settings).parent / generative.MODELS_DIR
+
+
+def train_request() -> colab_jobs.Request | None:
+    """The dialog's training choices; None while the dates are half picked."""
+    span = cast("tuple[date, ...]", state.get("train_span") or ())
+    if len(span) != 2:  # noqa: PLR2004 - a start and an end
+        return None
+    return colab_jobs.Request(
+        tickers=(*(state.get("train_tickers") or ()), portfolio.FX),
+        start=span[0].isoformat(),
+        end=span[1].isoformat(),
+        gpu=state.get("train_gpu") or colab_jobs.DEFAULT_GPU,
+        models=tuple(state.get("train_models") or ()),
+    )
+
+
+def train_fetch_later() -> None:
+    state.train_fetch = True
+
+
+def priced_tickers(adjusted: pd.DataFrame) -> list[str]:
+    priced = cast("list[object]", adjusted.dropna(axis=1, how="all").columns.tolist())
+    return sorted(str(c) for c in priced)
+
+
+def trainable(ticker: str) -> bool:
+    """Offered in 종목: not an index or rate (^…), not USD/KRW (always trained)."""
+    return not ticker.startswith("^") and ticker != portfolio.FX
+
+
+def train_fetch(root: Path) -> None:
+    """Fetch the typed tickers without saved prices; drop the ones that fail.
+
+    Runs before the 종목 field is drawn, after it changed, so its value can
+    still be set.
+    """
+    priced = priced_tickers(pf_prices(str(root), pf_files_stamp(root)).adjusted)
+    kept: list[str] = []
+    errors: list[str] = []
+    for text in cast("list[str]", state.get("train_tickers") or []):
+        try:
+            ticker = portfolio.clean_ticker(text)
+        except portfolio.BookError as error:
+            errors.append(f"{text}: {error}")
+            continue
+        if ticker.startswith("^"):
+            errors.append(f"{ticker}: 지수·금리는 학습하지 않습니다.")
+        elif ticker != portfolio.FX:  # always trained; nothing to add
+            kept.append(ticker)
+    todo = [t for t in dict.fromkeys(kept) if t not in priced]
+    if todo:
+        with st.spinner(f"{', '.join(todo)} 가격 받는 중…"):
+            try:
+                adjusted = portfolio_fetcher(str(root)).fetch_now(todo).adjusted
+            except Exception:  # noqa: BLE001 - shown in the dialog
+                adjusted = portfolio.no_prices().adjusted
+        got = priced_tickers(adjusted)
+        failed = [t for t in todo if t not in got]
+        if failed:
+            errors.append(f"{', '.join(failed)} 가격을 받지 못했습니다.")
+        kept = [t for t in kept if t not in failed]
+    state.train_tickers = list(dict.fromkeys(kept))
+    state.train_error = " · ".join(errors)
+
+
+def apply_training() -> None:
+    r = train_request()
+    if args.demo or r is None or "train_tickers" not in state:
+        return
+    choice = TrainingChoice(r.tickers, r.start, r.end, r.gpu, r.models)
+    if load_training(resolve_settings(args.settings)) == choice:
+        return
+    try:
+        save_training(resolve_settings(args.settings), choice)
+    except OSError as error:
+        state.toast = f"학습 설정을 저장하지 못했습니다: {error}"
+
+
+def start_training(jobs: Jobs, adjusted: pd.DataFrame) -> None:
+    r = train_request()
+    if r is None:
+        return
+    apply_training()
+    _ = jobs.start(r, adjusted)
+
+
+def hours(span: timedelta) -> str:
+    seconds = int(span.total_seconds())
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}"
+
+
+def busy(jobs: Jobs) -> str | None:
+    """A disabled button's help while a job runs; None if none."""
+    return "학습 중입니다" if jobs.running else None
+
+
+def training_status(jobs: Jobs) -> None:
+    job, last = jobs.job, jobs.last
+    if job is not None:
+        stage = colab_jobs.STAGES.get(job.stage, job.stage)
+        if job.message:
+            stage += f" ({job.message})"
+        results = " · ".join(
+            f"{GEN_LABELS.get(m, m)} {outcome}" for m, outcome in job.results.items()
+        )
+        st.markdown(
+            f"**단계** {stage} · **경과** {hours(jobs.elapsed(job))}"
+            + (f" · {results}" if results else "")
+        )
+    if last is not None:
+        when = datetime.fromisoformat(last.finished).astimezone()
+        r = last.request
+        st.markdown(
+            f"**마지막 학습** {when:%Y-%m-%d %H:%M} · {', '.join(r.tickers)}"
+            f" · {r.start}–{r.end}"
+        )
+    canned = colab_jobs.DEMO_REQUEST
+    current = (
+        [
+            (m, f"{canned.start}–{canned.end} 학습", canned.tickers)
+            for m in canned.models
+        ]
+        if args.demo
+        else [
+            (s.model, s.note, s.tickers)
+            for s in generative.status(gen_root())
+            if s.model != "kronos"
+        ]
+    )
+    st.markdown(
+        "**현재 모델**\n"
+        + "".join(
+            f"\n- **{GEN_LABELS[m]}** {note}"
+            + (f" · {', '.join(tickers)}" if tickers else "")
+            for m, note, tickers in current
+        )
+    )
+
+
+def training_settings() -> None:
+    """Tickers, dates, GPU and models for retraining on Colab; 학습 시작 runs it.
+
+    The demo shows the same controls on canned choices and jobs.
+    """
+    root = pf_root()
+    jobs: Jobs
+    typed = not args.demo and not portfolio.missing_packages()
+    if args.demo:
+        adjusted, jobs = colab_jobs.demo_prices(), demo_trainer()
+        r = colab_jobs.DEMO_REQUEST
+        saved = TrainingChoice(r.tickers, r.start, r.end, r.gpu, r.models)
+    else:
+        if typed and state.pop("train_fetch", False):
+            train_fetch(root)
+        adjusted = pf_prices(str(root), pf_files_stamp(root)).adjusted
+        jobs = trainer(str(gen_root()))
+        saved = load_training(resolve_settings(args.settings)) or TrainingChoice()
+    with st.expander("생성 모델 학습", icon=":material/model_training:"):
+        if adjusted.empty:
+            st.info("저장된 가격이 없습니다.")
+            return
+        options = [t for t in priced_tickers(adjusted) if trainable(t)]
+        wanted = saved.tickers or portfolio.book_tickers(portfolio.load_book(root))
+        _ = st.multiselect(
+            "종목",
+            options,
+            # Only on the first draw: train_fetch may have set the value.
+            default=None
+            if "train_tickers" in state
+            else [t for t in dict.fromkeys(wanted) if t in options],
+            key="train_tickers",
+            on_change=train_fetch_later,
+            accept_new_options=typed,
+            placeholder="티커 입력 (예: NVDA, 005930.KS)" if typed else None,
+            help="**정의** 생성 모델 학습 종목 · 포트폴리오 페이지에 수정 종가가 저장된"
+            " 종목"
+            + (" · 목록에 없는 티커는 입력하면 가격을 받아 추가" if typed else "")
+            + f" · 환율 {portfolio.FX}는 항상 포함 · 지수·금리 제외"
+            "\n\n**기준** 꼬리위험·전망 탭 사용 조건: 보유 종목을 모두 담은 모델 ·"
+            f" 기준 통화와 다른 종목은 {portfolio.FX}로 환산",
+        )
+        if error := state.pop("train_error", ""):
+            st.error(error)
+        first = cast("pd.Timestamp", adjusted.index[0]).date()
+        last = cast("pd.Timestamp", adjusted.index[-1]).date()
+        start = min(
+            max(date.fromisoformat(saved.start or first.isoformat()), first), last
+        )
+        end = min(max(date.fromisoformat(saved.end or last.isoformat()), first), last)
+        if start > end:
+            start, end = first, last
+        _ = st.date_input(
+            "학습 기간",
+            value=(start, end),
+            min_value=first,
+            max_value=last,
+            key="train_span",
+            help="**정의** 학습 자료 기간 · 고른 모든 종목에 종가가 있는 날\n\n**기준**"
+            " 시간순 앞 80% 학습 · 뒤 20% 평가",
+        )
+        request = train_request()
+        if request is not None and request.tickers:
+            rows = colab_jobs.returns_table(
+                adjusted,
+                request.tickers,
+                date.fromisoformat(request.start),
+                date.fromisoformat(request.end),
+            )
+            span = (
+                f"{cast('pd.Timestamp', rows.index[0]):%Y-%m-%d}–"
+                f"{cast('pd.Timestamp', rows.index[-1]):%Y-%m-%d}, {len(rows):,}일"
+                if len(rows)
+                else "없음"
+            )
+            st.markdown(f"**겹치는 기간** {span}")
+        _ = st.segmented_control(
+            "Colab GPU",
+            colab_jobs.GPUS,
+            default=saved.gpu if saved.gpu in colab_jobs.GPUS else "T4",
+            required=True,
+            key="train_gpu",
+            help="**정의** 학습에 쓸 Colab 런타임 GPU",
+        )
+        _ = st.multiselect(
+            "모델",
+            generative.METHODS,
+            default=[m for m in generative.METHODS if m in saved.models]
+            or list(generative.METHODS),
+            format_func=GEN_LABELS.__getitem__,
+            key="train_models",
+            help="**정의** 학습할 생성 모델 · Tail-GAN(Cont 외) · SigCWGAN(Liao 외"
+            " 2020) · 신경망 SDE(Issa 외 2023)",
+        )
+        training_status(jobs)
+        request = train_request()
+        blocked = (
+            (None if args.demo else colab_jobs.blocker())
+            or busy(jobs)
+            or (None if state.get("train_tickers") else "종목을 고르세요")
+            or (
+                colab_jobs.problem(request, adjusted)
+                if request is not None
+                else "학습 기간을 고르세요"
+            )
+        )
+        with st.container(horizontal=True):
+            st.button(
+                "학습 시작",
+                icon=":material/play_arrow:",
+                key="train_start",
+                disabled=blocked is not None,
+                help=blocked
+                or "**정의** Colab VM 설치 뒤 고른 모델 순차 학습 · 받은 모델 검증 뒤"
+                " 교체(이전 모델은 data/models/<모델>.prev)\n\n**기준** 상태 확인"
+                f" {colab_jobs.POLL_SECONDS / 60:.0f}분 간격 · 종료 시 Colab 세션 중지",
+                on_click=start_training,
+                args=(jobs, adjusted),
+            )
+            if jobs.running:
+                st.button(
+                    "중지",
+                    icon=":material/stop:",
+                    key="train_cancel",
+                    on_click=jobs.cancel,
+                )
+
+
+@st.dialog("보기 설정", width="medium")
 def settings_dialog(d: Dashboard) -> None:
-    st.caption("깊게 볼 패널만 켜세요. 켠 패널의 나머지 지표만 새로 받아옵니다.")
     with st.container(horizontal=True):
         st.button("핵심만", on_click=check_all, args=(d,), kwargs={"on": False})
         st.button("전체 매크로", on_click=check_all, args=(d,), kwargs={"on": True})
@@ -203,19 +563,16 @@ def settings_dialog(d: Dashboard) -> None:
                     disabled=not view.extra,
                 )
     ai_settings()
+    training_settings()
     on = frozenset(view.id for view in d.views if state.get(f"view_{view.id}"))
     st.caption(display.view_summary(d, on))
-    st.caption(
-        f"설정은 {d.settings_file} 파일에 저장됩니다."
-        if d.settings_file
-        else "설정은 앱이 켜져 있는 동안만 유지됩니다."
-    )
     with st.container(horizontal=True, horizontal_alignment="right"):
         if st.button("취소"):
             st.rerun()
         if st.button("적용", type="primary"):
             set_deep(on)
             apply_ai()
+            apply_training()
             st.rerun()
 
 
@@ -235,7 +592,7 @@ def curve_chart(curve: Curve) -> alt.LayerChart:
         .mark_line(point=True)
         .encode(
             x=alt.X("tenor:O", sort=list(curve.tenors), title=None),
-            y=alt.Y("value:Q", title="%", scale=alt.Scale(zero=False)),
+            y=alt.Y("value:Q", title=None, scale=alt.Scale(zero=False)),
             color=alt.Color(
                 "line:N", sort=names, title=None, legend=alt.Legend(orient="bottom")
             ),
@@ -263,7 +620,7 @@ def spread_chart(spread: Spread, months: int) -> alt.LayerChart:
         .mark_area(line=True, opacity=0.25)
         .encode(
             x=alt.X("month:T", title=None),
-            y=alt.Y("value:Q", title="%p"),
+            y=alt.Y("value:Q", title=None),
             tooltip=[
                 alt.Tooltip("month:T", title="월", format="%Y-%m"),
                 alt.Tooltip("value:Q", title="10Y−2Y %p", format="+.2f"),
@@ -299,11 +656,11 @@ def clocks(generated_at: str) -> None:
                 icon=":material/schedule:" if i == 0 else None,
                 color="gray",
             )
-        st.badge(f"갱신 {updated:%H:%M}", color="gray", help="데이터를 받은 시각")
+        st.badge(f"갱신 {updated:%H:%M}", color="gray")
 
 
 def status(d: Dashboard) -> None:
-    with st.container(horizontal=True, vertical_alignment="center"):
+    with st.container(horizontal=True, gap="xsmall", vertical_alignment="center"):
         for source in d.sources:
             st.badge(
                 f"{source.name} {source.ok}/{source.total}",
@@ -316,10 +673,7 @@ def notices(d: Dashboard) -> None:
     if d.settings_error:
         st.error(d.settings_error)
     if d.demo:
-        st.info(
-            "데모 모드: 수치는 모두 예시 값입니다. 실제 데이터는 `macro`를 키와"
-            " 함께 실행하세요."
-        )
+        st.info("데모 모드: 예시 값입니다.")
     for source in d.sources:
         help_ = display.KEY_HELP.get(source.id)
         if source.state == "missing_key" and help_:
@@ -341,7 +695,7 @@ def tape(d: Dashboard) -> None:
     groups = display.tape_groups(d.tape, display.rows_by_id(d))
     width = max((len(rows) for _, rows in groups), default=0)
     for title, rows in groups:
-        st.markdown(f"**{title}**")
+        headed(f"**{title}**", display.TAPE_HELP.get(title))
         for col, row in zip(st.columns(width), rows, strict=False):
             flat = display.change(row) == 0
             col.metric(
@@ -363,13 +717,14 @@ def regime(d: Dashboard) -> None:
     for col, cell in zip(st.columns(len(d.regime)), d.regime, strict=True):
         color, icon = display.TONE[cell.tone]
         source = rows.get(display.REGIME_SOURCE.get(cell.label, ""))
+        label, value = display.regime_card(cell)
         col.metric(
-            cell.label,
-            f"{cell.value} :small[:gray[{cell.unit}]]",
+            label,
+            value,
             f"{icon} {cell.tag}",
             delta_color=color,
             delta_arrow="off",
-            help=cell.rule,
+            help=REGIME_HELP.get(cell.label, cell.rule),
             border=True,
             height="stretch",
             chart_data=display.trend(source),
@@ -377,44 +732,68 @@ def regime(d: Dashboard) -> None:
 
 
 def curves(d: Dashboard) -> None:
-    st.header("금리곡선", anchor="curve")
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.header("금리곡선", anchor="curve", width="content")
+    spread = d.spread
+    missing = spread is None or len(spread.points) < 2  # noqa: PLR2004
     with st.container(border=True, height="stretch"):
         with st.container(horizontal=True, vertical_alignment="center"):
-            st.markdown("**2s10s** 10년물 − 2년물")
+            headed(
+                "**2s10s** · 10년물 − 2년물, %p",
+                "**정의** 미 국채 10년물 − 2년물 수익률 차(T10Y2Y)의 월평균(%p) ·"
+                " 회색 음영 NBER 경기침체 기간(USREC)\n\n**해석** 0 아래 장단기 역전 ·"
+                " 경기침체 선행 신호로 쓰이는 구간",
+                [FRED_NOTICE] if missing else [],
+            )
             picked = st.segmented_control(
                 "기간",
-                list(SPREAD_RANGES),
-                default="전체",
+                list(display.CHART_RANGES),
+                default="5Y",
                 key="spread_range",
                 label_visibility="collapsed",
             )
-        spread = d.spread
-        if spread is None or len(spread.points) < 2:  # noqa: PLR2004
-            st.caption("FRED 키가 있어야 표시됩니다")
-        else:
-            months = SPREAD_RANGES[picked or "전체"]
+        if spread is not None and not missing:
+            months = display.CHART_RANGES[picked or "전체"]
             st.altair_chart(
                 spread_chart(spread, months),
                 height=CHART_HEIGHT,
                 alt="10년물 − 2년물 금리차",
             )
+        else:
+            st.caption("2s10s 금리차 자료가 없습니다.")
     if "curve" in d.deep:
         with st.container(border=True):
-            st.markdown("**미 국채 수익률 곡선**")
-            if d.curve is None:
-                st.caption("FRED 키가 있어야 표시됩니다")
-            else:
+            headed(
+                "**미 국채 수익률 곡선** · %",
+                "**정의** 만기별 미 국채 수익률(FRED DGS1MO~DGS30, %) · 최신 ·"
+                " 1개월 전 · 1년 전 곡선\n\n**해석** 우상향은 정상 · 평탄화·역전은"
+                " 단기 금리의"
+                " 상대적 상승 · 곡선 간 간격은 금리 수준 변화",
+                [FRED_NOTICE] if d.curve is None else [],
+            )
+            if d.curve is not None:
                 st.altair_chart(
                     curve_chart(d.curve), height=CHART_HEIGHT, alt="미 국채 수익률 곡선"
                 )
+            else:
+                st.caption("수익률 곡선 자료가 없습니다.")
 
 
 def projections(d: Dashboard) -> None:
-    st.header("FOMC 경제전망 · 위원 중앙값", anchor="sep")
     p = d.projections
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.header(
+            "FOMC 경제전망 · 위원 중앙값",
+            anchor="sep",
+            help="**정의** FOMC 경제전망(SEP) 위원 전망 중앙값 · 연도 말 기준 · 장기"
+            " 전망 · 현재: 최근 실적\n\n**기준** Δ: 직전 SEP 대비 변화",
+            width="content",
+        )
+        if p is None:
+            notice(FRED_NOTICE)
     with st.container(border=True, height="stretch"):
         if p is None:
-            st.caption("FRED 키가 있어야 표시됩니다.")
+            st.caption("FOMC 경제전망 자료가 없습니다.")
             return
         if not p.rows:
             st.caption(f"받지 못했습니다. {p.message or ''}")
@@ -426,7 +805,7 @@ def projections(d: Dashboard) -> None:
             table.style.map(arrow_style, subset=changes),
             column_config={
                 c: st.column_config.TextColumn(
-                    "Δ", width="small", help="직전 발표 대비"
+                    "Δ", width="small", help="**정의** 직전 SEP 발표 대비 변화"
                 )
                 for c in changes
             },
@@ -442,7 +821,7 @@ def arrow_style(text: str) -> str:
     return f"color: {color}" if color else ""
 
 
-def detail_chart(points: list[dict[str, str | float]]) -> alt.Chart:
+def detail_chart(points: list[dict[str, str | float]], dec: int) -> alt.Chart:
     return (
         alt.Chart(alt.Data(values=points))
         .mark_line(point=len(points) <= DETAIL_POINT_LIMIT)
@@ -451,35 +830,51 @@ def detail_chart(points: list[dict[str, str | float]]) -> alt.Chart:
             y=alt.Y("value:Q", title=None, scale=alt.Scale(zero=False)),
             tooltip=[
                 alt.Tooltip("day:T", title="날짜", format="%Y-%m-%d"),
-                alt.Tooltip("value:Q", title="값", format=",.2f"),
+                alt.Tooltip("value:Q", title="값", format=f",.{dec}f"),
             ],
         )
-        .properties(height=360)
     )
 
 
 def detail_body(row: IndicatorRow) -> None:
-    with st.container(horizontal=True):
+    source = row.code + (f" · © {row.copyright}" if row.copyright else "")
+    st.caption(f"출처 {source}")
+    with st.container(horizontal=True, key="detail_cards"):
         st.metric(
             "최신",
             display.fmt(row.value, row.fmt),
             display.metric_delta(row),
             delta_color=display.metric_color(row),
             delta_arrow="off" if display.change(row) == 0 else "auto",
+            help=GUIDES.get(row.id),
+            border=True,
+            height="stretch",
         )
-        st.metric("이전", display.fmt(row.prev, row.fmt))
-        st.metric("기준", display.short_date(row) or "—")
-    picked = st.segmented_control(
-        "기간", list(display.DETAIL_RANGES), default="4Y", key="detail_range"
-    )
-    series = rt.dashboard.full_series(row.id) or display.history_series(row)
-    points = display.detail_points(series, display.DETAIL_RANGES[picked or "전체"])
-    if len(points) > 1:
-        st.altair_chart(detail_chart(points), alt=f"{row.label} 추이")
-    elif row.message:
-        st.caption(f":red[{row.message}]")
-    st.markdown(GUIDES.get(row.id, ""))
-    st.caption(row.code + (f" · © {row.copyright}" if row.copyright else ""))
+        st.metric("이전", display.fmt(row.prev, row.fmt), border=True, height="stretch")
+        st.metric("기준", display.short_date(row) or "—", border=True, height="stretch")
+    with st.container(border=True):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            unit = display.unit(row.fmt)
+            headed(f"**추이** · {unit}" if unit else "**추이**")
+            picked = st.segmented_control(
+                "기간",
+                list(display.CHART_RANGES),
+                default="5Y",
+                key="detail_range",
+                label_visibility="collapsed",
+            )
+        series = rt.dashboard.full_series(row.id) or display.history_series(row)
+        points = display.detail_points(series, display.CHART_RANGES[picked or "전체"])
+        if len(points) > 1:
+            st.altair_chart(
+                detail_chart(points, row.fmt.dec),
+                height=CHART_HEIGHT,
+                alt=f"{row.label} 추이",
+            )
+        elif row.message:
+            st.caption(f":red[{row.message}]")
+        else:
+            st.caption("추이 자료가 없습니다.")
 
 
 def open_detail(row: IndicatorRow) -> None:
@@ -498,10 +893,10 @@ def panel(d: Dashboard, p: Panel) -> None:
     view = next((v for v in d.views if v.id == p.id), None)
     with st.container(border=True):
         with st.container(horizontal=True, vertical_alignment="center"):
-            st.subheader(p.title, anchor=p.id)
+            st.subheader(p.title, anchor=p.id, width="content")
             with st.popover(":material/help:", help="지표 해석", type="tertiary"):
                 for row in p.rows:
-                    st.markdown(f"**{row.label}** {GUIDES.get(row.id, row.code)}")
+                    st.markdown(f"**{row.label}**\n\n{GUIDES.get(row.id, row.code)}")
         event = st.dataframe(
             pd.DataFrame(display.panel_table(p)).style.map(
                 arrow_style, subset=["변화"]
@@ -510,7 +905,7 @@ def panel(d: Dashboard, p: Panel) -> None:
             height="content",
             column_config={
                 "지표": st.column_config.TextColumn(width="medium"),
-                "추이": st.column_config.LineChartColumn(width="small"),
+                "추이": st.column_config.LineChartColumn(width="small", color="gray"),
             },
             alt=p.title,
             on_select="rerun",
@@ -523,10 +918,10 @@ def panel(d: Dashboard, p: Panel) -> None:
         if view is not None and view.extra:
             on = p.id in d.deep
             st.button(
-                "핵심만 보기" if on else f"＋ 지표 {view.extra}개 더 보기",
+                "핵심만 보기" if on else f"지표 {view.extra}개 더 보기",
                 key=f"more_{p.id}",
-                help="핵심 지표만 보기" if on else "나머지 지표도 보기",
                 type="tertiary",
+                icon=None if on else ":material/add:",
                 on_click=toggle_deep,
                 args=(p.id,),
             )
@@ -535,8 +930,19 @@ def panel(d: Dashboard, p: Panel) -> None:
 
 
 def calendar(d: Dashboard) -> None:
+    fred = any(s.id == "FRED" and s.state != "missing_key" for s in d.sources)
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.header(
+            "앞으로 7일 미국 발표",
+            anchor="calendar",
+            help="**정의** FRED 발표 일정 중 미국 주요 지표 발표 · 오늘부터 7일 ·"
+            " 날짜는 발표 예정일\n\n**기준** 물가·고용·성장·소비·주택·연준·금융여건"
+            " 발표만 추림",
+            width="content",
+        )
+        if not d.calendar and not fred:
+            notice(FRED_NOTICE)
     with st.container(border=True):
-        st.subheader("앞으로 7일 미국 발표", anchor="calendar")
         if d.calendar:
             st.dataframe(
                 {
@@ -547,13 +953,10 @@ def calendar(d: Dashboard) -> None:
                 hide_index=True,
                 alt="앞으로 7일 미국 발표",
             )
+        elif fred:
+            st.caption("앞으로 7일 안에 주요 발표가 없습니다.")
         else:
-            fred = any(s.id == "FRED" and s.state != "missing_key" for s in d.sources)
-            st.caption(
-                "앞으로 7일 안에 주요 발표가 없습니다."
-                if fred
-                else "FRED 키가 있으면 이번 주 발표 일정이 표시됩니다."
-            )
+            st.caption("FRED API 키가 없어 발표 일정을 받지 못했습니다.")
 
 
 def panels(d: Dashboard, ids: tuple[str, ...]) -> None:
@@ -563,14 +966,16 @@ def panels(d: Dashboard, ids: tuple[str, ...]) -> None:
 
 
 def provenance(d: Dashboard) -> None:
-    st.header("출처", anchor="sources")
-    st.subheader("데이터 호출 점검", anchor=False)
-    status(d)
-    st.caption(
-        "This product uses the FRED® API but is not endorsed or certified by the"
-        " Federal Reserve Bank of St. Louis. · 출처: FRED, 미 재무부, 뉴욕 연은,"
-        " 한국은행 ECOS, ECB, BIS, OECD, Yahoo Finance(금 선물, yfinance)"
-    )
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.header("출처", anchor="sources", width="content")
+    with st.container(border=True):
+        headed("**데이터 호출 점검**")
+        status(d)
+        st.caption(
+            "This product uses the FRED® API but is not endorsed or certified by the"
+            " Federal Reserve Bank of St. Louis. · 출처: FRED, 미 재무부, 뉴욕 연은,"
+            " 한국은행 ECOS, ECB, BIS, OECD, Yahoo Finance(금 선물, yfinance)"
+        )
 
 
 # ---------------------------------------------------------------- analysis
@@ -640,18 +1045,18 @@ def controls() -> None:
                 preset.title,
                 key=f"ai_preset_{preset.id}",
                 disabled=running,
-                help="새 대화로 바로 실행합니다",
             ) and start_run(preset.text, preset.id):
                 st.rerun()
-        if running and st.button("멈춤") and state.ai_run is not None:
+        if (
+            running
+            and st.button("중지", icon=":material/stop:", key="ai_stop")
+            and state.ai_run is not None
+        ):
             log.stopped = True
             state.ai_run.stop()
         st.button("새 대화", on_click=new_conversation, disabled=running)
-        if log.conversation:
-            st.caption(f"대화 {log.conversation}")
     request = st.chat_input(
-        "무엇을 분석할까요? 화면의 지표와 도구로 받은 공개 데이터만 근거로 답합니다."
-        " (Enter 실행 · Shift+Enter 줄바꿈)",
+        "무엇을 분석할까요?",
         key="ai_input",
         disabled=running,
     )
@@ -699,17 +1104,18 @@ def analysis(d: Dashboard) -> None:
         }
         # Header on top, the scrolling conversation in the middle and the input
         # at the bottom; the CSS in AI_CSS makes the panel a column.
-        st.subheader("AI 매크로 분석 · 선택 기능", anchor="analysis")
-        st.caption(log.header)
+        st.subheader("AI 분석", anchor="analysis")
+        # The pinned data time shows once: as a warning once newer data came.
+        if log.stale and log.conversation:
+            st.warning(
+                f"이 대화는 {display.short_time(log.snapshot)} 데이터 기준입니다."
+            )
+        elif log.header:
+            st.caption(log.header)
         if state.ai_error:
             st.error(state.ai_error)
         else:
             st.caption(choice_line(statuses, bool(log.conversation)))
-        if log.stale and log.conversation:
-            st.warning(
-                f"이 대화는 {display.short_time(log.snapshot)} 데이터에 고정돼"
-                " 있습니다. 새로 받은 데이터로 보려면 새 대화를 시작하세요."
-            )
         with st.container(key="ai_turns"), st.container(key="ai_turns_inner"):
             turns(d)
             if log.received:
@@ -729,28 +1135,175 @@ def analysis(d: Dashboard) -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def screen_updater(root: str) -> screen.Updater:
-    """One updater per data folder, shared by every tab."""
-    return screen.Updater(Path(root))
+def screen_updater(root: str, universe: str) -> screen.Updater:
+    """One updater per universe's data folder, shared by every tab."""
+    return screen.Updater(Path(root), source=partial(screen.Yahoo, universe=universe))
 
 
 @st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=2)
-def screen_table(root: str, stamp: tuple[tuple[str, int], ...]) -> pd.DataFrame | None:
-    """The evaluated table; ``stamp`` changes whenever a stored file does."""
+def screen_prepared(
+    root: str, stamp: tuple[tuple[str, int], ...]
+) -> pd.DataFrame | None:
+    """The stored files with indicators; ``stamp`` changes whenever one does."""
     inputs = screen.load(Path(root)) if stamp else None
-    return None if inputs is None else screen.evaluate(inputs)
+    return None if inputs is None else screen.prepare(inputs)
+
+
+@st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=8)
+def screen_table(
+    root: str, stamp: tuple[tuple[str, int], ...], criteria: screen.Criteria
+) -> pd.DataFrame | None:
+    """The table screened by ``criteria``; only a changed rule recomputes it."""
+    prepared = screen_prepared(root, stamp)
+    return None if prepared is None else screen.judge(prepared, criteria)
+
+
+def crit_values(c: screen.Criteria) -> dict[str, bool | float]:
+    """The 기준 widgets' values for ``c``: a switch per rule, a number per limit."""
+    out: dict[str, bool | float] = {}
+    for rule in screen.RULES:
+        if rule.toggle:
+            out[f"crit_on_{rule.key}"] = c.on(rule.key)
+        for limit in rule.limits:
+            out[f"crit_{limit.field}"] = limit.shown(getattr(c, limit.field))
+    return out
+
+
+def crit_state() -> screen.Criteria:
+    """The criteria the 기준 widgets hold, seeded from the settings file."""
+    saved = load_screen(resolve_settings(args.settings))
+    for key, value in crit_values(screen.criteria(saved.values, saved.off)).items():
+        state.setdefault(key, value)
+    values = {
+        limit.field: limit.stored(state[f"crit_{limit.field}"])
+        for rule in screen.RULES
+        for limit in rule.limits
+    }
+    off = [r.key for r in screen.RULES if r.toggle and not state[f"crit_on_{r.key}"]]
+    return screen.criteria(values, off)
+
+
+def save_criteria() -> None:
+    values, off = screen.saved(crit_state())
+    choice = ScreenChoice(values, off)
+    path = resolve_settings(args.settings)
+    if load_screen(path) == choice:
+        return
+    try:
+        save_screen(path, choice)
+    except OSError as error:
+        state.toast = f"스크리닝 기준을 저장하지 못했습니다: {error}"
+
+
+def reset_criteria() -> None:
+    for key, value in crit_values(screen.DEFAULT).items():
+        state[key] = value
+    save_criteria()
+
+
+def crit_number(limit: screen.Limit, *, disabled: bool) -> None:
+    if limit.whole:
+        st.number_input(
+            limit.label,
+            min_value=int(limit.low),
+            max_value=int(limit.high),
+            step=int(limit.step),
+            format="%d",
+            key=f"crit_{limit.field}",
+            disabled=disabled,
+            on_change=save_criteria,
+            width=150,
+        )
+        return
+    digits = len(f"{limit.step:g}".partition(".")[2])
+    st.number_input(
+        limit.label,
+        min_value=float(limit.low),
+        max_value=float(limit.high),
+        step=float(limit.step),
+        format=f"%.{digits}f",
+        key=f"crit_{limit.field}",
+        disabled=disabled,
+        on_change=save_criteria,
+        width=150,
+    )
+
+
+def crit_switch(rule: screen.Rule, *, changed: bool) -> None:
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        st.checkbox(
+            rule.name,
+            key=f"crit_on_{rule.key}",
+            help=rule.help,
+            on_change=save_criteria,
+        )
+        if changed:
+            st.badge("변경", color="blue")
+
+
+def crit_row(rule: screen.Rule, *, changed: bool) -> None:
+    """A rule with numbers: its switch (or name), the numbers and a 변경 mark."""
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        if rule.toggle:
+            st.checkbox(
+                rule.name,
+                key=f"crit_on_{rule.key}",
+                help=rule.help,
+                on_change=save_criteria,
+                width=200,
+            )
+        else:
+            st.markdown(rule.name, help=rule.help, width=200)
+        off = rule.toggle and not state[f"crit_on_{rule.key}"]
+        for limit in rule.limits:
+            crit_number(limit, disabled=off)
+        if changed:
+            st.badge("변경", color="blue")
+
+
+def criteria_panel(c: screen.Criteria) -> None:
+    """The 기준 expander: every rule by section, with a reset to the defaults."""
+    changed = set(screen.changed(c))
+    label = f"기준 · 변경 {len(changed)}" if changed else "기준"
+    # Tracked by key, so a new count in the label keeps it open.
+    with st.expander(label, icon=":material/tune:", key="crit_open", on_change="rerun"):
+        st.button(
+            "기본값으로",
+            icon=":material/restart_alt:",
+            key="crit_reset",
+            disabled=not changed,
+            on_click=reset_criteria,
+        )
+        heads: dict[tuple[str, str], list[screen.Rule]] = {}
+        for rule in screen.RULES:
+            heads.setdefault((rule.section, rule.part), []).append(rule)
+        section = ""
+        for (title, part), rules in heads.items():
+            if title != section:
+                section = title
+                st.markdown(f"**{title}**")
+            if part:
+                st.markdown(f":gray[{part}]")
+            switches = [rule for rule in rules if not rule.limits]
+            if switches:
+                with st.container(horizontal=True):
+                    for rule in switches:
+                        crit_switch(rule, changed=rule.key in changed)
+            for rule in rules:
+                if rule.limits:
+                    crit_row(rule, changed=rule.key in changed)
 
 
 def parts_line(parts: screen.Parts) -> str:
     return (
         f"시세 {parts.prices or '—'} 종가 · 재무 {parts.fundamentals or '—'}"
         f" · 추정치 {parts.estimates or '—'} · 유니버스 {parts.universe or '—'}"
-        " · USD · yfinance (Yahoo Finance 비공식 데이터)"
+        f" · SEC {parts.margins or '—'}"
     )
 
 
-def screen_bar(updater: screen.Updater, root: Path) -> None:
-    """Data dates, the 갱신 button and, while an update runs, its progress."""
+def screen_bar(updater: screen.Updater, root: Path, help_: str) -> None:
+    """Data dates with the page's ``help_``, the 갱신 button and any progress."""
     polling = updater.progress.running
     missing = screen.missing_packages()
 
@@ -760,7 +1313,7 @@ def screen_bar(updater: screen.Updater, root: Path) -> None:
         if polling and not progress.running:
             st.rerun()
         with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption(parts_line(screen.parts(root)))
+            st.caption(parts_line(screen.parts(root)), help=help_)
             st.space("stretch")
             if st.button(
                 "갱신",
@@ -768,13 +1321,9 @@ def screen_bar(updater: screen.Updater, root: Path) -> None:
                 type="primary",
                 key="screen_refresh",
                 disabled=progress.running or bool(missing) or args.demo,
-                help=(
-                    "시세는 새 날짜만, 추정치는 하루 1회, 재무는 분기 1회,"
-                    " 구성 종목은 월 1회 받습니다. 처음에는 오래 걸립니다."
-                ),
             ):
                 # Rerun the page even if another tab started first, so it polls.
-                updater.start()
+                updater.start(sec_agent())
                 st.rerun()
         if progress.running:
             done = progress.done / progress.total if progress.total else 0.0
@@ -782,7 +1331,7 @@ def screen_bar(updater: screen.Updater, root: Path) -> None:
             st.progress(done, text=f"{progress.stage}{count}")
         elif progress.message:
             if progress.failed:
-                st.error(progress.message)
+                st.warning(progress.message)
             else:
                 st.success(progress.message)
         if missing:
@@ -790,8 +1339,6 @@ def screen_bar(updater: screen.Updater, root: Path) -> None:
                 f"갱신하려면 추가 패키지({', '.join(missing)})가 필요합니다:"
                 f" `{screen.INSTALL_HINT}`"
             )
-        elif args.demo:
-            st.caption("데모 모드에서는 갱신하지 않습니다.")
 
     body()
 
@@ -810,7 +1357,7 @@ def stock_chart(points: list[dict[str, str | float]]) -> alt.Chart:
         .mark_line()
         .encode(
             x=alt.X("day:T", title=None),
-            y=alt.Y("value:Q", title="$", scale=alt.Scale(zero=False)),
+            y=alt.Y("value:Q", title=None, scale=alt.Scale(zero=False)),
             color=alt.Color(
                 "line:N", sort=lines, title=None, legend=alt.Legend(orient="bottom")
             ),
@@ -841,45 +1388,83 @@ def status_lines(lines: list[tuple[str, str, str]]) -> str:
     )
 
 
-def stock_body(root: Path, row: dict[str, object]) -> None:
+def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
     fmt = screen.fmt
     st.caption(
         f"{row['sector']} · {row['industry']} · 비교 업종"
-        f" {row['peer']} ({screen.peer_level(row)}, {fmt('int', row['peer_n'])}종목,"
-        " S&P 500 내) · 재무 통화"
+        f" {row['peer']} ({screen.peer_level(row)}, {fmt('int', row['peer_n'])}종목)"
+        " · 재무 통화"
         f" {row['currency'] or '—'}"
     )
-    groups = [
-        name for key, name in screen.GROUP_NAMES.items() if row.get(f"in_{key}") is True
-    ]
-    with st.container(horizontal=True):
-        st.metric("주가", fmt("usd", row["price"]))
-        st.metric("시가총액", fmt("big", row["mcap"]))
-        st.metric("기술 점수", f"{fmt('int', row['score'])}/10 {row['chart']}")
-        st.metric("52주 고점 대비", fmt("signed", row["from_high"]))
-        st.metric("그룹", ", ".join(groups) or "—")
+    with st.container(horizontal=True, key="screen_stock_cards"):
+        st.metric("주가", fmt("usd", row["price"]), border=True, height="stretch")
+        st.metric("시가총액", fmt("big", row["mcap"]), border=True, height="stretch")
+        st.metric(
+            "기술 점수",
+            f"{fmt('int', row['score'])}/{len(c.kept(screen.TECH_CHECKS))}"
+            f" {row['chart']}",
+            help=screen.score_help(c),
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "52주 고점 대비",
+            fmt("signed", row["from_high"]),
+            help=screen.FROM_HIGH_HELP,
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "칸",
+            screen.GROUP_NAMES.get(str(row.get("group")), "—"),
+            help=screen.group_help(c),
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "퀄리티",
+            fmt("rank", row.get("quality")),
+            help=screen.quality_help(c),
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "밸류에이션",
+            fmt("rank", row.get("valuation")),
+            help=screen.valuation_help(c),
+            border=True,
+            height="stretch",
+        )
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
-        st.markdown("**기술 점수**")
-        st.markdown(check_lines(screen.tech_lines(row)))
-        st.markdown("**과열 표시**")
-        st.markdown(check_lines(screen.overheat_lines(row)))
-        st.caption(display.md(screen.TECH_BASIS))
+        headed("**기술 점수**", display.md(screen.tech_basis(c)))
+        st.markdown(check_lines(screen.tech_lines(row, c)))
+        headed("**과열 표시**", screen.overheat_help(c))
+        st.markdown(check_lines(screen.overheat_lines(row, c)))
     with right, st.container(border=True, height="stretch"):
-        st.markdown("**결격 점검**")
-        st.markdown(status_lines(screen.dq_lines(row)))
-        st.markdown("**라벨** :gray[업종 중앙값은 S&P 500 내 업종 중앙값]")
-        st.markdown(status_lines(screen.label_lines(row)))
-        st.markdown(f"**EPS 추정치** :gray[{row['est_currency'] or '—'}]")
+        headed("**결격 점검**", screen.dq_help(c))
+        st.markdown(status_lines(screen.dq_lines(row, c)))
+        universe = screen.UNIVERSES[state.get("screen_universe") or "sp500"]
+        headed(
+            "**퀄리티·밸류에이션**",
+            f"{screen.labels_help(c)} · 비교 범위 {universe.name} 구성 종목",
+        )
+        st.markdown(status_lines(screen.label_lines(row, c)))
+        headed(
+            f"**EPS 추정치** :gray[{row['est_currency'] or '—'}]",
+            screen.ESTIMATE_HELP,
+        )
         st.dataframe(screen.estimate_table(row), hide_index=True, alt="EPS 추정치")
     points = screen.chart_rows(screen.history(root, str(row["ticker"])))
     if len(points) > 1:
-        st.altair_chart(stock_chart(points), alt=f"{row['ticker']} 1년 주가")
+        with st.container(border=True):
+            headed("**1년 주가** · 종가·이동평균, USD")
+            st.altair_chart(stock_chart(points), alt=f"{row['ticker']} 1년 주가")
     if row["error"]:
         st.caption(f":red[{display.md(str(row['error']))}]")
 
 
-def open_stock(root: Path, row: dict[str, object]) -> None:
+def open_stock(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
     """Show the stock dialog; a fresh table key clears the clicked cell.
 
     Same pattern as ``open_detail``: clicking that cell again reopens the
@@ -887,56 +1472,92 @@ def open_stock(root: Path, row: dict[str, object]) -> None:
     """
     state["screen_gen"] = state.get("screen_gen", 0) + 1
     title = f"{row['ticker']} · {row['name']}"
-    st.dialog(title, width="large", on_dismiss="rerun")(stock_body)(root, row)
+    st.dialog(title, width="large", on_dismiss="rerun")(stock_body)(root, row, c)
 
 
-def pick_group(key: str) -> None:
-    state["screen_group"] = key
+def map_chart(
+    points: list[dict[str, str | float]], current: str, split: float
+) -> alt.LayerChart:
+    """밸류에이션 against 퀄리티, colored by the FY1 estimate direction.
 
-
-def group_button(key: str, counts: dict[str, int], current: str) -> None:
-    st.button(
-        f"{screen.GROUP_NAMES[key]} · {counts[key]}",
-        key=f"screen_cell_{key}",
-        type="primary" if key == current else "secondary",
-        width="stretch",
-        help=screen.GROUPS[key],
-        on_click=pick_group,
-        args=(key,),
+    Points outside the chosen cell are dimmed; the chart takes no clicks.
+    """
+    cells = {key for _, keys in screen.MAP_ROWS for key in keys}
+    opacity = (
+        alt.condition(alt.datum.group == current, alt.value(0.9), alt.value(0.15))
+        if current in cells
+        else alt.value(0.9)
+    )
+    share = alt.Axis(format=".0%")
+    stocks = (
+        alt.Chart(alt.Data(values=points))
+        .mark_circle(size=40)
+        .encode(
+            x=alt.X(
+                "valuation:Q",
+                title="밸류에이션",
+                scale=alt.Scale(domain=[0, 1]),
+                axis=share,
+            ),
+            y=alt.Y(
+                "quality:Q",
+                title="퀄리티",
+                scale=alt.Scale(domain=[0, 1]),
+                # Level, above the axis at its top left, not turned on its side.
+                axis=alt.Axis(
+                    format=".0%",
+                    titleAngle=0,
+                    titleAlign="left",
+                    titleAnchor="end",
+                    titleBaseline="bottom",
+                    titleX=-30,
+                    titleY=-8,
+                ),
+            ),
+            color=alt.Color(
+                "est:N",
+                title="FY1 추정치",
+                scale=alt.Scale(
+                    domain=list(screen.EST_ORDER),
+                    range=[display.UP_COLOR, "gray", display.DOWN_COLOR, "lightgray"],
+                ),
+                # One line above the plot at its right end, to leave the plot room.
+                legend=alt.Legend(
+                    orient="top", direction="horizontal", titleOrient="left"
+                ),
+            ),
+            opacity=opacity,
+            tooltip=[
+                alt.Tooltip("ticker:N", title="티커"),
+                alt.Tooltip("name:N", title="종목"),
+                alt.Tooltip("cell:N", title="칸"),
+                alt.Tooltip("quality:Q", title="퀄리티", format=".0%"),
+                alt.Tooltip("valuation:Q", title="밸류에이션", format=".0%"),
+                alt.Tooltip("est:N", title="추정치"),
+            ],
+        )
+    )
+    rule = alt.Chart(alt.Data(values=[{"v": split}])).mark_rule(
+        strokeDash=[2, 3], color="gray"
+    )
+    return (
+        alt.LayerChart(layer=[rule.encode(x="v:Q"), rule.encode(y="v:Q"), stocks])
+        .properties(height=2 * CHART_HEIGHT)
+        .configure_legend(layout=alt.ExprRef("{top: {anchor: 'end'}}"))
     )
 
 
-def group_map(counts: dict[str, int], current: str) -> None:
-    """Chart strength by valuation; 저평가 개선 sits beside it on its own axis."""
-    widths = [1, 2, 2]
-    with st.container(horizontal=True, vertical_alignment="top"):
-        with st.container(border=True):
-            for cell, text in zip(
-                st.columns(widths), ("", *screen.MAP_COLUMNS), strict=True
-            ):
-                cell.caption(text)
-            for label, keys in screen.MAP_ROWS:
-                cells = st.columns(widths, vertical_alignment="center")
-                cells[0].caption(label)
-                for cell, key in zip(cells[1:], keys, strict=True):
-                    with cell:
-                        if key is None:
-                            st.button(
-                                "—",
-                                key="screen_cell_none",
-                                disabled=True,
-                                width="stretch",
-                                help="차트 약이면서 비쌈인 종목은 어느 그룹에도"
-                                " 넣지 않습니다",
-                            )
-                        else:
-                            group_button(key, counts, current)
-        with st.container(border=True, width=220):
-            st.caption("추정치 개선")
-            group_button("D", counts, current)
+def group_map(rows: pd.DataFrame, current: str, c: screen.Criteria) -> None:
+    """The stocks as 퀄리티 by 밸류에이션 points, boxed with the 칸 help."""
+    with st.container(border=True):
+        headed("**퀄리티·밸류에이션 분포** · 업종 백분위", screen.group_help(c))
+        st.altair_chart(
+            map_chart(screen.map_rows(rows), current, c.split),
+            alt="퀄리티와 밸류에이션 분포",
+        )
 
 
-def screen_results(root: Path, table: pd.DataFrame) -> None:
+def screen_results(root: Path, table: pd.DataFrame, c: screen.Criteria) -> None:
     liquid = screen.liquid(table)
     chosen: list[str] = state.get("screen_sectors") or []
     filtered = screen.pick(table, "all", chosen)
@@ -944,16 +1565,17 @@ def screen_results(root: Path, table: pd.DataFrame) -> None:
     state.setdefault("screen_group", "all")
     with st.container(horizontal=True, vertical_alignment="bottom"):
         picked = st.segmented_control(
-            "그룹",
+            "칸",
             ["all", *screen.GROUPS],
             format_func=lambda key: (
-                f"전체 {len(filtered)}"
+                f"전체 · {len(filtered)}"
                 if key == "all"
-                else f"{screen.GROUP_NAMES[key]} {counts[key]}"
+                else f"{screen.GROUP_NAMES[key]} · {counts[key]}"
             ),
             key="screen_group",
-            help=screen.group_help(),
+            label_visibility="collapsed",
         )
+        st.space("stretch")
         sectors = st.multiselect(
             "섹터",
             screen.sectors(liquid),
@@ -962,28 +1584,22 @@ def screen_results(root: Path, table: pd.DataFrame) -> None:
             width=320,
         )
     key = picked or "all"
-    group_map(counts, key)
+    group_map(filtered, key, c)
     rows = screen.pick(table, key, sectors)
-    st.caption(
-        f"유동성 통과 {len(rows)}종목 · 시가총액순 · 티커나 종목 이름을 누르면"
-        " 점검 내용을 봅니다"
-        if key == "all"
-        else f"**{screen.GROUP_NAMES[key]}** 상위 {len(rows)}종목 ·"
-        f" {screen.GROUP_SORT[key]}"
-    )
-    shown = screen.view(rows)
-    if key != "D":
-        shown = shown.drop(columns=["signals"])
+    shown = screen.view(rows, c)
     columns = [c for c, _, _ in screen.TABLE if c in shown.columns]
     formats = {c: partial(screen.fmt, kind) for c, _, kind in screen.TABLE if kind}
-    styled = shown.style.map(return_style, subset=list(screen.RETURN_COLUMNS)).format(
+    signed = [c for c, _, kind in screen.TABLE if kind == "signed"]
+    styled = shown.style.map(return_style, subset=signed).format(
         {c: formats[c] for c in columns if c in formats}
     )
-    labels = {c: label for c, label, _ in screen.TABLE}
+    labels = {column: label for column, label, _ in screen.TABLE}
+    tips = screen.column_help(c)
     event = st.dataframe(
         styled,
         hide_index=True,
-        height=560,
+        height=LIST_HEIGHT,
+        placeholder="—",  # NaN cells; the grid ignores the Styler's dash for them
         on_select="rerun",
         selection_mode="single-cell",
         key=f"screen_table_{state.get('screen_gen', 0)}",
@@ -992,16 +1608,11 @@ def screen_results(root: Path, table: pd.DataFrame) -> None:
                 labels[column],
                 pinned=column == "ticker",
                 width="medium" if column == "name" else None,
+                help=tips.get(column),
             )
             for column in columns
         },
         alt="스크리닝 결과",
-    )
-    st.caption(
-        "커트라인(상위 20%·하위 40%·결격 3개·은행 TCE/TA 4%)은 백테스트 없이 정한"
-        " 값입니다 ·"
-        " 재무는 Yahoo 단일 출처라 일회성 항목에 약합니다 · 공매도 비율은 약 2주"
-        " 늦습니다 · 기술 점수와 재무는 합산하지 않습니다"
     )
     failed = screen.failures(table)
     if len(failed):
@@ -1010,22 +1621,40 @@ def screen_results(root: Path, table: pd.DataFrame) -> None:
     records = screen.records(rows)
     for index, column in event.selection.cells:
         if column in {"ticker", "name"}:
-            open_stock(root, records[index])
+            open_stock(root, records[index], c)
 
 
 # ---------------------------------------------------------------- portfolio
 
 PF_SECTIONS = {
-    "holdings": "보유·거래",
     "returns": "수익률",
     "analysis": "위험지표",
     "correlation": "상관·분산",
-    "risk": "시뮬레이션·VaR",
+    "tail": "꼬리위험",
+    "outlook": "전망",
     "stress": "스트레스",
 }
+PF_WINDOW_HELP = (
+    "**정의** 지표·분포 추정에 쓰는 최근 일간 수익률 기간 · "
+    + " · ".join(f"{k} {v}개월" for k, v in portfolio.WINDOWS.items())
+    + "\n\n**기준** 전망·편입 효과: 재표본 대상 과거 수익률 · 시뮬레이션 길이:"
+    " 전망 기간"
+)
+PF_HORIZON_HELP = (
+    "**정의** 시뮬레이션 경로 길이 · "
+    + " · ".join(f"{k} {v}거래일" for k, v in portfolio.HORIZONS.items())
+    + "\n\n**기준** 지금 평가액에서 출발 · 재표본 대상 과거 기간: 추정 기간"
+)
 PF_MIN_QUANTITY = 0.0001
 PF_SIDE_WIDTH = 72  # 매수 and 매도 the same width
-PF_CURRENCY_HELP = "종목의 거래 통화 기준 (AAPL은 USD, 005930.KS는 KRW)"
+PF_CURRENCY_HELP = "**정의** 종목의 거래 통화 기준 금액 · AAPL은 USD · 005930.KS는 KRW"
+PF_VALUE_HELP = (
+    "**정의** Σ 보유 수량 × 최근 종가 · 다른 통화 종목은 최근 USD/KRW로 기준 통화 환산"
+)
+PF_UNREALIZED_HELP = (
+    "**정의** 평가액 − 보유분 원가 · 원가: 이동평균, 매수 수수료 포함, 매수일"
+    " 환율\n\n**해석** 아래 비율: 보유분 원가 대비 수익률"
+)
 PF_DIALOGS = {
     "new": "새 포트폴리오",
     "edit": "포트폴리오 편집",
@@ -1084,6 +1713,32 @@ def pf_axis(base: portfolio.Currency) -> str:
     return ",.0f" if portfolio.DECIMALS[base] == 0 else ",.2f"
 
 
+def pf_periods(horizon: str | None = None) -> int:
+    """추정 기간, and 전망 기간 under the key ``horizon`` on a tab that simulates.
+
+    Drawn in the caller's row; returns the window in months. The simulation
+    reads its horizon from ``state``.
+    """
+    window = st.segmented_control(
+        "추정 기간",
+        list(portfolio.WINDOWS),
+        default="3Y",
+        required=True,
+        key="pf_window",
+        help=PF_WINDOW_HELP,
+    )
+    if horizon is not None:
+        st.segmented_control(
+            "전망 기간",
+            list(portfolio.HORIZONS),
+            default="1M",
+            required=True,
+            key=horizon,
+            help=PF_HORIZON_HELP,
+        )
+    return portfolio.WINDOWS[window or "3Y"]
+
+
 # ---- caches: in memory only, keyed by everything the inputs depend on
 # The leading-underscore arguments are not hashed; the key stands for them:
 # the saved prices' stamp, the portfolio or book JSON (trades and base), the
@@ -1094,7 +1749,7 @@ type Key = tuple[object, ...]
 
 def pf_files_stamp(root: Path) -> tuple[tuple[str, int, int], ...]:
     out: list[tuple[str, int, int]] = []
-    for name in (portfolio.CLOSE_FILE, portfolio.ADJUSTED_FILE):
+    for name in (portfolio.CLOSE_FILE, portfolio.ADJUSTED_FILE, *portfolio.RANGE_FILES):
         path = root / name
         if path.is_file():
             info = path.stat()
@@ -1134,10 +1789,10 @@ def cached_history(
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def cached_held(
-    key: Key, _p: portfolio.Portfolio, _adjusted: pd.DataFrame
+    key: Key, _p: portfolio.Portfolio, _close: pd.DataFrame, _adjusted: pd.DataFrame
 ) -> pd.Series:
     del key
-    return portfolio.held_returns(_p, _adjusted)
+    return portfolio.held_returns(_p, _close, _adjusted)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1216,7 +1871,9 @@ def cached_covariance(
 
 
 @st.cache_resource(show_spinner=False, max_entries=8)
-def cached_draws(stamp: object, n: int, horizon: int, block: int) -> NDArray[np.int64]:
+def cached_draws(
+    stamp: object, n: int, horizon: int, block: float
+) -> NDArray[np.int64]:
     """Stationary-bootstrap day indices, drawn once per window length and horizon.
 
     Any weight vector reuses them; read-only, so the cached array is shared.
@@ -1228,6 +1885,15 @@ def cached_draws(stamp: object, n: int, horizon: int, block: int) -> NDArray[np.
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
+def cached_filter(
+    key: Key, _j: portfolio.Joint, _v: portfolio.Vol | None = None
+) -> quant.Devolatilised:
+    """``key`` stands for ``_j`` and the filter's options ``_v``."""
+    del key
+    return portfolio.volatility(_j, _v)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
 def cached_paths(
     key: Key,
     fhs: bool,
@@ -1236,20 +1902,36 @@ def cached_paths(
     _j: portfolio.Joint,
     _picks: NDArray[np.int64],
     _w: NDArray[np.float64] | None = None,
+    _f: quant.Devolatilised | None = None,
 ) -> portfolio.Simulation:
     """The summary, fan and histogram; the paths themselves are not kept.
 
     ``_w`` replaces ``_j``'s weights on the same draws; ``key`` stands for it.
+    ``_f`` is the volatility filter when ``fhs``.
     """
     del key
-    growth = portfolio.growth(_j, _picks, fhs=fhs, w=_w)
+    growth = portfolio.growth(_j, _picks, _f if fhs else None, _w)
     return portfolio.simulation(growth, value, *standing)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
-def cached_tails(key: Key, _j: portfolio.Joint) -> portfolio.Tails:
+def cached_tails(
+    key: Key,
+    _j: portfolio.Joint,
+    _f: quant.Devolatilised,
+    _v: portfolio.Vol | None = None,
+) -> portfolio.Tails:
     del key
-    return portfolio.tails(_j)
+    return portfolio.tails(_j, _f, _v)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_density(
+    key: Key, _j: portfolio.Joint, _f: quant.Devolatilised | None
+) -> portfolio.Density:
+    """``key`` stands for ``_j`` and whether ``_f`` is given, and which."""
+    del key
+    return portfolio.density(_j, _f)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1368,10 +2050,10 @@ def pf_subject(p: portfolio.Portfolio, prices: portfolio.Prices) -> Subject:
         key=pf_key(pid),
         label="보유 기록",
         base=p.base,
-        rets=cached_held(pf_key(pid), p, prices.adjusted),
+        rets=cached_held(pf_key(pid), p, prices.close, prices.adjusted),
         w=w,
         value=sum(h.value for h in items if h.ticker in w.index),
-        bench=partial(portfolio.blended, p, prices.adjusted),
+        bench=partial(portfolio.blended, p, prices.close),
         bench_label="혼합 벤치마크",
         notes=(f"제외 (평가액 미확인): {', '.join(unknown)}",) if unknown else (),
     )
@@ -1452,15 +2134,19 @@ def pf_dashboard_series(name: str) -> pd.Series:
     return pf_fetched(name, today, rt.dashboard.refreshes)
 
 
-def pf_rates(base: portfolio.Currency, close: pd.DataFrame) -> tuple[pd.Series, str]:
-    """Annual percent risk-free rates for ``base`` and their name; empty when none."""
+def pf_rates(
+    base: portfolio.Currency, close: pd.DataFrame
+) -> tuple[pd.Series, str, perf.Quote]:
+    """Annual percent risk-free rates for ``base``, their name and their quote.
+
+    Empty when there are none.
+    """
     if base == "KRW":
-        return pf_dashboard_series(PF_CD91), "CD 91일"
+        return pf_dashboard_series(PF_CD91), "CD 91일", "simple"
     if portfolio.RF_USD in close.columns:
-        return cast(
-            "pd.Series", close[portfolio.RF_USD]
-        ).dropna(), "미국 3개월 국채(^IRX)"
-    return pf_empty(), "^IRX"
+        rates = cast("pd.Series", close[portfolio.RF_USD]).dropna()
+        return rates, "미국 3개월 국채(^IRX)", "discount"
+    return pf_empty(), "^IRX", "discount"
 
 
 def pf_rates_key(rates: pd.Series) -> tuple[int, str]:
@@ -1596,6 +2282,7 @@ def pf_selector(book: portfolio.Book) -> portfolio.Portfolio | None:
                 "삭제",
                 icon=":material/delete:",
                 key="pf_delete",
+                type="secondary",
                 on_click=pf_open,
                 args=("delete", chosen),
             )
@@ -1605,16 +2292,18 @@ def pf_selector(book: portfolio.Book) -> portfolio.Portfolio | None:
 # ---- prices
 
 
-def pf_bar(
+def pf_bar(  # noqa: PLR0913 - the bar's inputs
     fetcher: portfolio.Fetcher,
     root: Path,
     book: portfolio.Book,
     missing: list[str],
     extra: Sequence[str] = (),
+    have: Collection[str] = (),
 ) -> None:
-    """When prices were saved, the 가격 갱신 button and a running fetch.
+    """When prices were saved, the 갱신 button and a running fetch.
 
-    ``extra``: tickers outside the book that 가격 갱신 also fetches.
+    ``extra``: tickers outside the book that 갱신 also fetches;
+    ``have``: the saved tickers (``portfolio.wanted``).
     """
     polling = fetcher.progress.running
     tickers = [*portfolio.book_tickers(book), *extra]
@@ -1627,20 +2316,21 @@ def pf_bar(
         saved = portfolio.prices_saved_at(root)
         with st.container(horizontal=True, vertical_alignment="center"):
             st.caption(
-                f"가격 {saved:%Y-%m-%d %H:%M} 저장 · yfinance (Yahoo Finance 비공식"
-                " 데이터)"
+                f"가격 {saved:%Y-%m-%d %H:%M} 저장"
                 if saved
                 else "저장된 가격이 없습니다."
             )
             st.space("stretch")
             if st.button(
-                "가격 갱신",
+                "갱신",
                 icon=":material/refresh:",
+                type="primary",
                 key="pf_refresh",
                 disabled=progress.running or bool(missing) or args.demo or not tickers,
-                help="모든 종목의 가격 이력을 다시 받습니다",
             ):
-                fetcher.start(list(dict.fromkeys([*portfolio.wanted(book), *extra])))
+                fetcher.start(
+                    list(dict.fromkeys([*portfolio.wanted(book, have), *extra]))
+                )
                 st.rerun()
         if progress.running:
             st.caption(
@@ -1656,16 +2346,12 @@ def pf_bar(
                 f"가격을 받으려면 추가 패키지({', '.join(missing)})가 필요합니다:"
                 f" `{portfolio.INSTALL_HINT}`"
             )
-        elif args.demo:
-            st.caption("데모 모드에서는 가격을 받지 않습니다.")
 
     body()
 
 
 def pf_no_prices() -> None:
-    st.info(
-        "가격이 없습니다." + ("" if args.demo else " 위의 **가격 갱신**으로 받습니다.")
-    )
+    st.info("가격이 없습니다.")
 
 
 # ---- holdings and trades
@@ -1711,7 +2397,7 @@ def pf_remove_trades(pid: str, ids: list[str], key: str) -> None:
         lambda book: portfolio.remove_trades(book, pid, chosen)
     )
     if not state.pf_trade_error:
-        state.pf_gen = state.get("pf_gen", 0) + 1
+        state.pf_trades_gen = state.get("pf_trades_gen", 0) + 1
         state.toast = f"거래 {len(chosen)}건을 지웠습니다"
 
 
@@ -1748,7 +2434,7 @@ def pf_prefill() -> None:
         state.pf_price_note = "가격을 찾지 못했습니다"
         return
     state.pf_price = round(price, portfolio.DECIMALS[portfolio.currency(ticker)])
-    state.pf_price_note = f"{day:%m/%d} 종가 기준 · 지연"
+    state.pf_price_note = f"{day:%m/%d} 종가 기준"
 
 
 def pf_trade_form(p: portfolio.Portfolio) -> None:
@@ -1758,72 +2444,71 @@ def pf_trade_form(p: portfolio.Portfolio) -> None:
     if state.get("pf_prefill"):
         state.pf_prefill = False
         pf_prefill()
-    with st.container(border=True):
-        with st.container(horizontal=True, vertical_alignment="bottom"):
-            st.date_input(
-                "날짜",
-                max_value=today,
-                key="pf_day",
-                width=150,
-                on_change=pf_prefill_later,
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        st.date_input(
+            "날짜",
+            max_value=today,
+            key="pf_day",
+            width=150,
+            on_change=pf_prefill_later,
+        )
+        st.text_input(
+            "티커",
+            key="pf_ticker",
+            width=170,
+            on_change=pf_prefill_later,
+        )
+        st.number_input(
+            "수량",
+            min_value=PF_MIN_QUANTITY,
+            step=1.0,
+            format="%.4g",  # whole shares step by 1; fractions can be typed
+            key="pf_quantity",
+            width=130,
+        )
+        st.number_input(
+            "가격",
+            min_value=0.0,
+            value=None,
+            key="pf_price",
+            width=150,
+            help=PF_CURRENCY_HELP,
+        )
+        st.number_input(
+            "수수료", min_value=0.0, key="pf_fee", width=120, help=PF_CURRENCY_HELP
+        )
+        st.text_input(
+            "메모",
+            key="pf_memo",
+            max_chars=portfolio.MEMO_LENGTH,
+            width="stretch",
+        )
+        for side, label in portfolio.SIDES.items():
+            st.button(
+                label,
+                type="primary" if side == "buy" else "secondary",
+                key=f"pf_{side}",
+                width=PF_SIDE_WIDTH,
+                on_click=pf_add_trade,
+                args=(p.id, side),
             )
-            st.text_input(
-                "티커",
-                key="pf_ticker",
-                width=170,
-                on_change=pf_prefill_later,
-            )
-            st.number_input(
-                "수량",
-                min_value=PF_MIN_QUANTITY,
-                step=1.0,
-                format="%.4g",  # whole shares step by 1; fractions can be typed
-                key="pf_quantity",
-                width=130,
-            )
-            st.number_input(
-                "가격",
-                min_value=0.0,
-                value=None,
-                key="pf_price",
-                width=150,
-                help=PF_CURRENCY_HELP,
-            )
-            st.number_input(
-                "수수료", min_value=0.0, key="pf_fee", width=120, help=PF_CURRENCY_HELP
-            )
-            st.text_input(
-                "메모",
-                key="pf_memo",
-                max_chars=portfolio.MEMO_LENGTH,
-                width="stretch",
-            )
-            for side, label in portfolio.SIDES.items():
-                st.button(
-                    label,
-                    type="primary" if side == "buy" else "secondary",
-                    key=f"pf_{side}",
-                    width=PF_SIDE_WIDTH,
-                    on_click=pf_add_trade,
-                    args=(p.id, side),
-                )
-        if state.get("pf_price_note"):
-            st.caption(state.pf_price_note)
-        if state.get("pf_trade_error"):
-            st.error(state.pf_trade_error)
+    if state.get("pf_price_note"):
+        st.caption(state.pf_price_note)
+    if state.get("pf_trade_error"):
+        st.error(state.pf_trade_error)
 
 
 def pf_trade_log(p: portfolio.Portfolio) -> None:
     table, ids = portfolio.trades_table(p)
-    key = f"pf_trades_{state.get('pf_gen', 0)}"
+    key = f"pf_trades_{state.get('pf_trades_gen', 0)}"
     with st.container(horizontal=True, vertical_alignment="center"):
-        st.markdown(f"**거래 {len(ids)}건**")
+        st.caption(f"{len(ids)}건")
         st.space("stretch")
         st.button(
             "선택 삭제",
             icon=":material/delete:",
             key="pf_remove",
-            type="tertiary",
+            type="secondary",
             on_click=pf_remove_trades,
             args=(p.id, ids, key),
         )
@@ -1838,30 +2523,159 @@ def pf_trade_log(p: portfolio.Portfolio) -> None:
     )
 
 
+def pf_trade_open() -> None:
+    state.pf_trade_dialog = True
+
+
+def pf_trade_close() -> None:
+    state.pf_trade_dialog = False
+
+
+def pf_trade_body(p: portfolio.Portfolio) -> None:
+    if state.toast:
+        # A trade was added: only the dialog reran, so rerun the page behind it.
+        st.rerun()
+    pf_trade_form(p)
+
+
+PF_DONUT_SLICES = 8  # more names than this: the largest 7 and 기타
+
+
+def pf_donut(
+    rows: list[tuple[str, float, float]],
+    text: Callable[[float], str],
+    amount: str = "평가액",
+) -> alt.Chart:
+    """Weights as a donut, from (name, weight, ``amount``) rows; ``text`` shows it."""
+    merged: dict[str, tuple[float, float]] = {}
+    for name, weight, value in rows:
+        w, v = merged.get(name, (0.0, 0.0))
+        merged[name] = (w + weight, v + value)
+    ranked = sorted(merged.items(), key=lambda item: item[1][0], reverse=True)
+    if len(ranked) > PF_DONUT_SLICES:
+        rest = ranked[PF_DONUT_SLICES - 1 :]
+        other = (sum(w for _, (w, _) in rest), sum(v for _, (_, v) in rest))
+        ranked = [*ranked[: PF_DONUT_SLICES - 1], ("기타", other)]
+    points = [
+        {"name": name, "weight": w, "value": text(v), "rank": i}
+        for i, (name, (w, v)) in enumerate(ranked)
+    ]
+    return (
+        alt.Chart(alt.Data(values=points))
+        .mark_arc(innerRadius=50, padAngle=0.01)
+        .encode(
+            theta=alt.Theta("weight:Q"),
+            order=alt.Order("rank:Q"),
+            color=alt.Color(
+                "name:N",
+                sort=[name for name, _ in ranked],
+                title=None,
+                legend=alt.Legend(orient="bottom"),
+            ),
+            tooltip=[
+                alt.Tooltip("name:N", title="종목"),
+                alt.Tooltip("weight:Q", title="비중", format=".1%"),
+                alt.Tooltip("value:N", title=amount),
+            ],
+        )
+        .properties(height=CHART_HEIGHT)
+    )
+
+
 def pf_holdings(p: portfolio.Portfolio, prices: portfolio.Prices) -> None:
+    """현황: always shown above the analysis sections."""
     items = portfolio.holdings(p, prices.close)
     held = [h for h in items if h.is_open]
+    with st.container(horizontal=True, vertical_alignment="center"):
+        headed(
+            "**현황**",
+            f"**정의** 보유 종목의 평가액·평가손익·비중과 거래 내역 · {p.base}"
+            " 환산 · 원가: 이동평균",
+        )
+        st.space("stretch")
+        st.button(
+            "거래 추가",
+            icon=":material/add:",
+            key="pf_trade_open",
+            on_click=pf_trade_open,
+        )
+    if not p.trades:
+        st.info("거래를 추가하세요.")
     if held:
         totals = portfolio.totals(items)
-        with st.container(horizontal=True):
-            st.metric("평가액", portfolio.money(totals.value, p.base), border=True)
+        with st.container(horizontal=True, key="pf_now_cards"):
+            st.metric(
+                "평가액",
+                portfolio.money(totals.value, p.base),
+                help=PF_VALUE_HELP,
+                border=True,
+                height="stretch",
+            )
             st.metric(
                 "평가손익",
                 portfolio.money(totals.unrealized, p.base, signed=True),
                 portfolio.percent(totals.open_return, signed=True),
                 delta_color=pf_color(totals.unrealized),
                 delta_arrow="off",
+                help=PF_UNREALIZED_HELP,
                 border=True,
+                height="stretch",
             )
-        pf_table(portfolio.holdings_table(items, p.base), "보유 종목")
-        unknown = portfolio.unpriced(items)
-        if unknown:
-            st.caption(f"평가액 미확인: {', '.join(unknown)} (종가 또는 환율 없음)")
-    elif not p.trades:
-        st.info("거래를 추가하세요. 날짜, 티커, 수량, 가격을 넣습니다.")
-    pf_trade_form(p)
+    if prices.tickers & {t.ticker for t in p.trades}:
+        left, right = st.columns([1, 2])
+        with left, st.container(border=True, height="stretch"):
+            headed(
+                "**비중**",
+                f"**정의** 보유 종목 평가액 비중 · {p.base} 환산\n\n**기준**"
+                f" {PF_DONUT_SLICES}종목 초과 시 상위 {PF_DONUT_SLICES - 1}종목과"
+                " 기타",
+            )
+            w = portfolio.weights(items)
+            if w.empty:
+                st.caption("보유 중인 종목이 없습니다.")
+            else:
+                rows = [
+                    (h.ticker, cast("float", w[h.ticker]), h.value)
+                    for h in held
+                    if h.ticker in w
+                ]
+                st.altair_chart(
+                    pf_donut(rows, partial(portfolio.money, unit=p.base)),
+                    alt="비중",
+                )
+        with right, st.container(border=True, height="stretch"):
+            headed(
+                f"**평가액과 순투입** · {p.base}",
+                "**정의** 평가액: 보유 수량 × 종가 · 순투입: 매수 금액(수수료"
+                " 포함) − 매도 금액(수수료 차감)의 누적\n\n**해석** 평가액 −"
+                " 순투입 = 총손익",
+            )
+            frame = cached_history(pf_key(p.model_dump_json()), p, prices.close)
+            lines = portfolio.value_lines(frame)
+            if len(frame) > 1:
+                st.altair_chart(
+                    pf_line_chart(portfolio.line_points(lines), pf_axis(p.base)),
+                    alt="평가액과 순투입",
+                )
+            else:
+                st.caption(PF_NO_LINE)
+    if held:
+        with st.container(border=True):
+            headed(f"**보유 종목** · {p.base}")
+            pf_table(portfolio.holdings_table(items, p.base), "보유 종목")
+            unknown = portfolio.unpriced(items)
+            if unknown:
+                st.caption(
+                    f"평가액 미확인: {', '.join(unknown)}",
+                    help="**기준** 종가 또는 환율 없음",
+                )
     if p.trades:
-        pf_trade_log(p)
+        with st.expander("거래 내역"):
+            pf_trade_log(p)
+    if state.get("pf_trade_dialog"):
+        st.dialog("거래 추가", width="large", on_dismiss=pf_trade_close)(pf_trade_body)(
+            p
+        )
 
 
 # ---- performance
@@ -1903,7 +2717,7 @@ def pf_contribution_chart(
         alt.Chart(alt.Data(values=points))
         .mark_bar()
         .encode(
-            x=alt.X("pnl:Q", title=base, axis=alt.Axis(format=pf_axis(base))),
+            x=alt.X("pnl:Q", title=None, axis=alt.Axis(format=pf_axis(base))),
             y=alt.Y("ticker:N", sort="-x", title=None),
             color=alt.when(up)
             .then(alt.value(display.UP_COLOR))
@@ -1919,11 +2733,7 @@ def pf_contribution_chart(
 
 PF_DASH = "—"
 PF_SHORT = "기간 부족"
-PF_LUCK = (
-    "운과 매매 시점이 함께 담긴 값이며 실력을 뜻하지 않습니다 · 무매매: 첫 거래일의"
-    " 보유 수량을 그대로 두고, 이후 매수·매도 금액만큼 그 구성을 같은 비율로"
-    " 사고판 경우"
-)
+PF_NO_LINE = "이틀 이상의 가격 기록이 없습니다."  # a line chart's empty state
 
 
 def pf_annual(value: perf.Annualised | None) -> str:
@@ -1973,18 +2783,32 @@ def pf_benchmark_table(
 
 
 def pf_split(split: perf.FxSplit) -> None:
-    with st.container(horizontal=True):
-        for label, value in (
-            ("현지 수익률", split.local),
-            ("환율", split.fx),
-            ("교차항", split.cross),
-            ("합계", split.base),
+    with st.container(horizontal=True, key="pf_split_cards"):
+        for label, value, tip in (
+            (
+                "현지 수익률",
+                split.local,
+                "**정의** 보유분의 현지 통화 기준 연결 수익률",
+            ),
+            (
+                "환율",
+                split.fx,
+                "**정의** 보유 통화의 기준 통화 대비 가치 변화의 연결 기여",
+            ),
+            ("교차항", split.cross, "**정의** 현지 수익률 × 환율"),
+            (
+                "합계",
+                split.base,
+                "**정의** (1 + 현지)(1 + 환율) − 1 · 기준 통화 연결 수익률",
+            ),
         ):
-            st.metric(label, portfolio.percent(value, signed=True), border=True)
-    st.caption(
-        "보유분의 종가 기준 연결 수익률 · (1+합계) = (1+현지)(1+환율),"
-        " 교차항 = 현지 × 환율"
-    )
+            st.metric(
+                label,
+                portfolio.percent(value, signed=True),
+                help=tip,
+                border=True,
+                height="stretch",
+            )
 
 
 def pf_trading(
@@ -1994,12 +2818,14 @@ def pf_trading(
     base: portfolio.Currency,
 ) -> None:
     timing = perf.timing_gap(money, time) if money and time else None
-    with st.container(horizontal=True):
+    with st.container(horizontal=True, key="pf_trade_cards"):
         st.metric(
             "타이밍 차이",
             pf_gap(timing),
-            help="MWR − TWR: 넣고 뺀 금액의 시점이 수익률에 준 차이",
+            help="**정의** MWR − TWR\n\n**해석** 양수면 넣고 뺀 시점이 수익률에 유리 ·"
+            " 음수면 불리\n\n**기준** 1년 이상 연율 차 · 1년 미만 기간 수익률 차",
             border=True,
+            height="stretch",
         )
         if result is not None:
             st.metric(
@@ -2008,16 +2834,21 @@ def pf_trading(
                 portfolio.money(result.actual - result.held, base, signed=True),
                 delta_color=pf_color(result.actual - result.held),
                 delta_arrow="off",
-                help="첫 거래일 구성 그대로였다면의 평가액 · 아래 숫자는 실제 − 무매매",
+                help="**정의** 첫 거래일 보유 수량 유지 · 이후 순유입·순유출만큼 같은"
+                " 구성을 비례 매수·매도한 경우의 평가액\n\n**해석** 아래 값: 실제"
+                " 평가액 − 무매매 평가액 · 양수면 실제 매매가 유리",
                 border=True,
+                height="stretch",
             )
             st.metric(
                 "매매 효과",
                 pf_gap(result.effect),
-                help="실제 MWR − 무매매 MWR",
+                help="**정의** 실제 MWR − 무매매 MWR\n\n**해석** 양수면 종목 교체·비중"
+                " 조절 매매의 기여 · 음수면 손실\n\n**기준** 1년 이상 연율 차 · 1년"
+                " 미만 기간 수익률 차",
                 border=True,
+                height="stretch",
             )
-    st.caption(PF_LUCK)
 
 
 def pf_return_metrics(
@@ -2026,25 +2857,27 @@ def pf_return_metrics(
     money: perf.Annualised | None,
     base: portfolio.Currency,
 ) -> None:
-    with st.container(horizontal=True):
+    with st.container(horizontal=True, key="pf_return_cards"):
         cells = (
             (
                 "평가손익",
                 totals.unrealized,
                 totals.open_return,
-                "보유 종목의 원가 대비",
+                PF_UNREALIZED_HELP,
             ),
             (
                 "실현손익",
                 totals.realized,
                 totals.realized_return,
-                "매도한 주식의 원가 대비",
+                "**정의** Σ(매도 순대금 − 매도 주식 원가) · 순대금: 수수료 차감 ·"
+                " 원가: 이동평균\n\n**해석** 아래 비율: 매도 주식 원가 대비 수익률",
             ),
             (
                 "총손익",
                 totals.pnl,
                 totals.total_return,
-                "누적 매수금액(수수료 포함) 대비",
+                "**정의** 실현손익 + 평가손익\n\n**해석** 아래 비율: 누적"
+                " 매수금액(수수료 포함) 대비 수익률",
             ),
         )
         for label, amount, ratio, note in cells:
@@ -2056,6 +2889,7 @@ def pf_return_metrics(
                 delta_arrow="off",
                 help=note,
                 border=True,
+                height="stretch",
             )
         st.metric(
             "TWR 누적",
@@ -2063,16 +2897,22 @@ def pf_return_metrics(
             pf_annual(time) if time and time.annual is not None else None,
             delta_color="off",
             delta_arrow="off",
-            help="시간가중수익률: 매수·매도 금액의 영향을 뺀 수익률 · 1년 이상이면"
-            " 연환산도 표시",
+            help="**정의** 시간가중수익률 · 일별 (평가액 − 전일 평가액 − 순유입) ÷"
+            " (전일 평가액 + 당일 순유입)의 연결 · 순유출은 장 마감 시점 반영\n\n"
+            "**해석** 넣고 뺀 금액의 영향을 뺀 운용 수익률 · 아래 값: 1년 이상이면"
+            " 연환산\n\n**기준** 배당 제외 종가 · 기준 통화",
             border=True,
+            height="stretch",
         )
         st.metric(
             "MWR",
             pf_annual(money),
-            help="금액가중수익률(XIRR) · 거래 기간이 1년 미만이면 연환산하지 않고"
-            " 기간 수익률",
+            help="**정의** 금액가중수익률 · 매수·매도 현금흐름과 현재 평가액의"
+            " 내부수익률(XIRR, 실제 일수/365)\n\n**해석** 넣고 뺀 시점까지 반영한"
+            " 투자자 수익률\n\n**기준** 거래 기간 1년 미만이면 연환산 없는 기간"
+            " 수익률",
             border=True,
+            height="stretch",
         )
 
 
@@ -2081,25 +2921,44 @@ def pf_realized(
 ) -> None:
     base = p.base
     left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown(f"**종목별 손익** · 실현 + 평가, {base}")
+    with left, st.container(border=True, height="stretch"):
+        headed(
+            f"**종목별 손익** · 실현 + 평가, {base}",
+            "**정의** 종목별 실현손익 + 평가손익 · 전량 매도 종목 포함",
+        )
         points = portfolio.contribution_points(items)
         if points:
             st.altair_chart(pf_contribution_chart(points, base), alt="종목별 손익")
-    with right, st.container(border=True):
-        st.markdown(f"**연도별 실현손익** · {base}")
+        else:
+            st.caption("손익을 계산할 수 있는 종목이 없습니다.")
+    with right, st.container(border=True, height="stretch"):
+        headed(
+            f"**연도별 실현손익** · {base}",
+            "**정의** 매도일 기준 연도별 실현손익 합계 · 월별은 매도 월 기준",
+        )
         sales = portfolio.ledger(p, prices.close).sales
         pf_period_table(sales, base, "연도", monthly=False)
         with st.expander("월별"):
             pf_period_table(sales, base, "월", monthly=True)
     sales = portfolio.ledger(p, prices.close).sales
     if sales:
-        st.markdown(f"**실현손익 내역** · 매도 {len(sales)}건")
-        pf_table(portfolio.realized_table(sales, base), "실현손익 내역")
+        with st.container(border=True):
+            headed(
+                f"**실현손익 내역** · 매도 {len(sales)}건",
+                "**정의** 매도 건별 실현손익 · 평균단가: 이동평균 원가(매수 수수료"
+                " 포함) · 수익률: 매도 주식 원가 대비 · 보유일: 해당 보유분 첫"
+                " 매수일부터 매도일까지 달력일 · 구분: 익절·손절·본전",
+            )
+            pf_table(portfolio.realized_table(sales, base), "실현손익 내역")
     closed = portfolio.closed_table(items, base)
     if closed["종목"]:
-        st.markdown("**전량 매도한 종목**")
-        pf_table(closed, "전량 매도한 종목")
+        with st.container(border=True):
+            headed(
+                "**전량 매도한 종목**",
+                "**정의** 보유 수량 0인 종목의 누적 실현손익 · 원가 대비: 실현손익 ÷"
+                " 매도 주식 원가",
+            )
+            pf_table(closed, "전량 매도한 종목")
 
 
 def pf_returns(p: portfolio.Portfolio, prices: portfolio.Prices) -> None:
@@ -2114,33 +2973,50 @@ def pf_returns(p: portfolio.Portfolio, prices: portfolio.Prices) -> None:
     days = pd.DatetimeIndex(curve.index)
     lines = cached_benchmarks(pf_key(pid, "bench"), p, prices.close, days)
     left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown(f"**누적 수익률** · TWR와 가격지수, {base}")
+    with left, st.container(border=True, height="stretch"):
+        headed(
+            f"**누적 수익률** · TWR와 지수, {base}",
+            "**정의** 포트폴리오 TWR과 지수의 누적 수익률 · 기준 통화 환산 · 표:"
+            " 누적 · 연환산(1년 이상) · TWR − 지수\n\n**기준** "
+            + PF_INDEX_NOTE
+            + "(Yahoo 무료 총수익지수 없음) · 혼합 벤치마크: 전일 종가 기준 한국·미국"
+            " 비중으로 두 지수의 일별 혼합",
+        )
         if len(curve) > 1:
             shown = {"포트폴리오": curve, **lines}
             st.altair_chart(
                 pf_line_chart(portfolio.line_points(shown), "+.1%"), alt="누적 수익률"
             )
             pf_benchmark_table(time, lines)
-            st.caption(
-                "지수는 배당 제외 가격지수를 기준통화로 환산 · 혼합 벤치마크는 전날"
-                " 종가의 한국·미국 비중으로 KOSPI와 S&P 500을 섞음"
-            )
         else:
-            st.caption(portfolio.UNKNOWN)
-    with right, st.container(border=True):
-        st.markdown(f"**누적 손익** · {base}")
+            st.caption(PF_NO_LINE)
+    with right, st.container(border=True, height="stretch"):
+        headed(
+            f"**누적 손익** · {base}",
+            "**정의** 총손익 = 평가액 − 순투입 · 실현손익: 매도 손익 누적 ·"
+            " 평가손익 = 총손익 − 실현손익",
+        )
         frame = cached_history(pf_key(pid), p, prices.close)
         if len(frame) > 1:
             points = portfolio.line_points(portfolio.pnl_lines(frame))
             st.altair_chart(pf_line_chart(points, pf_axis(base)), alt="누적 손익")
         else:
-            st.caption(portfolio.UNKNOWN)
+            st.caption(PF_NO_LINE)
     split, result = cached_flows(pf_key(pid, "flows"), p, prices.close)
     if split is not None:
-        st.markdown("**환율 효과**")
+        headed(
+            "**환율 효과**",
+            "**정의** 보유분 연결 수익률의 현지·환율 분해 · (1 + 합계) = (1 +"
+            " 현지)(1 + 환율) · 교차항 = 현지 × 환율\n\n**해석** 환율 양수: 보유 통화"
+            " 강세의 기여 · 음수: 약세의 손실\n\n**기준** 전일 종가 비중 · 배당 제외"
+            " 종가",
+        )
         pf_split(split)
-    st.markdown("**매매 시점**")
+    headed(
+        "**매매 시점**",
+        "**정의** 넣고 뺀 시점과 매매가 수익률에 준 효과 · 타이밍 차이 · 무매매"
+        " 평가액 · 매매 효과",
+    )
     pf_trading(money, time, result, base)
     pf_realized(p, prices, items)
 
@@ -2199,26 +3075,30 @@ def pf_drawdown(stats: portfolio.Ratios) -> None:
         else None,
         delta_color="off",
         delta_arrow="off",
-        help="고점 → 저점 날짜"
+        help="**정의** 기간 중 고점 대비 가장 깊은 하락 · 1에서 시작한 누적 자산"
+        " 기준\n\n**해석** 0에 가까울수록 얕은 손실 구간 · 아래 날짜: 고점 → 저점"
         + (
-            f" · 회복 {under.recovery:%Y-%m-%d} ({under.recovery_days}일)"
+            f"\n\n**기준** 회복 {under.recovery:%Y-%m-%d}(저점부터"
+            f" {under.recovery_days}일)"
             if under and under.recovery is not None and under.max_drawdown < 0
-            else " · 아직 회복 전"
+            else "\n\n**기준** 미회복"
             if under and under.max_drawdown < 0
             else ""
         ),
         border=True,
+        height="stretch",
     )
     st.metric(
         "고점 아래 기간",
         f"{under.current_days:,}일" if under else PF_DASH,
         help=(
-            f"마지막 고점 이후 달력일 (지금 고점이면 0) · 기간 중 가장 길었던"
-            f" 수중 기간 {under.longest_days:,}일"
+            "**정의** 마지막 고점 이후 달력일 · 지금 고점이면 0\n\n**기준** 기간 중"
+            f" 최장 수중 기간(고점 → 회복 또는 오늘) {under.longest_days:,}일"
             if under
             else None
         ),
         border=True,
+        height="stretch",
     )
 
 
@@ -2230,67 +3110,153 @@ def pf_sharpe(stats: portfolio.Ratios) -> None:
         f"95% {pf_ratio(ci.low)} ~ {pf_ratio(ci.high)}" if ci else PF_SHORT,
         delta_color="off",
         delta_arrow="off",
-        help=f"연환산 · 신뢰구간은 {perf.MIN_OBS}일 이상에서 (Mertens 표준오차)",
+        help="**정의** 일간 초과수익률 평균 ÷ 표준편차(ddof 1) × √(연간 관측일"
+        " 수)\n\n**해석** 높을수록 위험 대비 초과수익 우위 · 연 1 이상 양호 수준으로"
+        " 통용 · 아래 값: 95% 신뢰구간 · 구간 전체가 0 위면 양의 성과 유의\n\n"
+        f"**기준** 신뢰구간: Mertens(2002) 표준오차(왜도·첨도 반영), {perf.MIN_OBS}일"
+        " 이상 · " + PF_YEAR_NOTE,
         border=True,
+        height="stretch",
     )
     enough = stats.days >= perf.MIN_OBS
     st.metric(
         "PSR",
-        portfolio.percent(stats.psr) if stats.psr is not None else PF_SHORT,
-        help="참 샤프 지수가 0보다 클 확률의 추정치 (왜도·첨도 반영)",
+        portfolio.percent(stats.psr) if stats.psr is not None else PF_DASH,
+        None if stats.psr is not None else PF_SHORT,
+        delta_color="off",
+        delta_arrow="off",
+        help="**정의** 참 샤프 지수 > 0 확률(Bailey–López de Prado 2012) · Φ(SR ×"
+        " √(n − 1) ÷ √(1 − 왜도 × SR + (첨도 − 1)/4 × SR²)) · SR: 일간 샤프 지수\n\n"
+        "**해석** 높을수록 양의 샤프 지수 확신 · 95% 이상 통상 유의 수준\n\n"
+        f"**기준** {perf.MIN_OBS}일 이상",
         border=True,
+        height="stretch",
     )
     trl = stats.min_trl
     st.metric(
         "MinTRL",
-        PF_SHORT if not enough else (f"{trl:,.0f}거래일" if trl else PF_DASH),
-        help="PSR 95%에 필요한 최소 기록 길이 · 샤프 지수가 0 이하면 —",
+        f"{trl:,.0f}" if enough and trl else PF_DASH,
+        None if enough else PF_SHORT,
+        delta_color="off",
+        delta_arrow="off",
+        help="**정의** PSR 95% 도달에 필요한 최소 기록 길이(거래일) · 1 + (1 − 왜도 ×"
+        " SR + (첨도 − 1)/4 × SR²) × (z₀.₉₅ ÷ SR)² · SR: 일간 샤프 지수\n\n**해석**"
+        " 실제 일수보다 짧으면 기록 길이 충분 · 길면 부족\n\n**기준**"
+        f" {perf.MIN_OBS}일 이상 · 샤프 지수 0 이하면 —",
         border=True,
+        height="stretch",
     )
 
 
 def pf_advanced(stats: portfolio.Ratios, bench: str) -> None:
-    year = "1년 미만"
-    with st.container(horizontal=True):
-        st.metric("소르티노", pf_ratio_or(stats.sortino), help="연환산", border=True)
+    with st.container(horizontal=True, key="pf_more_cards"):
         st.metric(
-            "칼마", pf_ratio_or(stats.calmar, year), help="1년 이상만", border=True
+            "소르티노",
+            pf_ratio_or(stats.sortino),
+            help="**정의** 일간 초과수익률 평균 ÷ 하방편차 × √(연간 관측일 수) ·"
+            " 하방편차: √(전체 일수의 min(초과수익률, 0)² 평균)\n\n**해석** 높을수록"
+            " 하락 위험 대비 초과수익 우위 · 샤프보다 크면 상승 쪽 변동 우세\n\n"
+            "**기준** 목표수익률: 무위험수익률 · " + PF_YEAR_NOTE,
+            border=True,
+            height="stretch",
         )
         st.metric(
-            "얼서 지수", f"{stats.ulcer:.2f}", help="낙폭의 제곱평균(%)", border=True
+            "칼마",
+            pf_ratio_or(stats.calmar),
+            None if stats.calmar is not None else PF_SHORT,
+            delta_color="off",
+            delta_arrow="off",
+            help="**정의** 연복리 수익률(CAGR) ÷ |기간 최대 낙폭|\n\n**해석** 높을수록"
+            " 최대 낙폭 대비 수익 우위\n\n**기준** 기간 1년(365일) 이상 · 무위험수익률"
+            " 미차감",
+            border=True,
+            height="stretch",
         )
-        st.metric("UPI", pf_ratio_or(stats.upi, year), help="1년 이상만", border=True)
-        st.metric("오메가", pf_ratio_or(stats.omega), border=True)
-        st.metric("CDaR 95%", portfolio.percent(stats.cdar), border=True)
+        st.metric(
+            "얼서 지수",
+            pf_ratio(stats.ulcer) if math.isfinite(stats.ulcer) else PF_DASH,
+            help="**정의** 일별 낙폭(%)의 제곱평균제곱근 · 전체 일수 기준(Martin)\n\n"
+            "**해석** 낮을수록 얕고 짧은 낙폭 · 0이면 낙폭 없음",
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "UPI",
+            pf_ratio_or(stats.upi),
+            None if stats.upi is not None else PF_SHORT,
+            delta_color="off",
+            delta_arrow="off",
+            help="**정의** (연복리 수익률 − 연 무위험수익률) × 100 ÷ 얼서 지수(Martin"
+            " 비율)\n\n**해석** 높을수록 낙폭 부담 대비 초과수익 우위\n\n**기준** 기간"
+            " 1년(365일) 이상 · 연 무위험수익률: 일간 평균의 연복리",
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "오메가",
+            pf_ratio_or(stats.omega),
+            help="**정의** Σ 무위험수익률 초과분 ÷ Σ 무위험수익률 미달분 · 일간"
+            " 기준(Keating–Shadwick 2002)\n\n**해석** 1 초과면 초과분 합 우위 · 1"
+            " 미만이면 미달분 합 우위",
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "CDaR 95%",
+            portfolio.percent(stats.cdar),
+            help="**정의** 일별 낙폭 중 가장 깊은"
+            f" {1 - perf.CDAR_LEVEL:.0%}의 평균(조건부 낙폭 위험, 경계값 비례 반영)\n\n"
+            "**해석** 0에 가까울수록 꼬리 낙폭 완화 · 최대 낙폭과 평균 낙폭 사이 값",
+            border=True,
+            height="stretch",
+        )
         st.metric(
             "추적오차",
-            portfolio.percent(stats.te) if stats.te is not None else PF_SHORT,
-            help=f"{bench} 대비, 연환산",
+            portfolio.percent(stats.te) if stats.te is not None else PF_DASH,
+            None if stats.te is not None else PF_SHORT,
+            delta_color="off",
+            delta_arrow="off",
+            help="**정의** 일간 (수익률 − 벤치마크 수익률) 표준편차 × √(연간 관측일"
+            " 수)\n\n**해석** 낮을수록 벤치마크와 비슷한 움직임\n\n**기준**"
+            f" {bench} · {PF_INDEX_NOTE} · {perf.MIN_OBS}일 이상",
             border=True,
+            height="stretch",
         )
         st.metric(
             "정보비율",
-            pf_ratio_or(stats.ir, PF_SHORT),
-            help=f"{bench} 대비",
+            pf_ratio_or(stats.ir),
+            None if stats.ir is not None else PF_SHORT,
+            delta_color="off",
+            delta_arrow="off",
+            help="**정의** 일간 (수익률 − 벤치마크 수익률) 평균 × 연간 관측일 수 ÷"
+            " 추적오차\n\n**해석** 높을수록 꾸준한 초과수익 · 0.5 이상 양호, 1 이상"
+            " 우수 수준으로 통용(Grinold–Kahn)\n\n**기준**"
+            f" {bench} · {PF_INDEX_NOTE} · {perf.MIN_OBS}일 이상",
             border=True,
+            height="stretch",
         )
 
 
 def pf_stats(s: Subject, prices: portfolio.Prices, months: int) -> None:
     """Risk-adjusted statistics of ``s.rets`` over the window."""
     rets = portfolio.window(s.rets, months)
-    rates, source = pf_rates(s.base, prices.close)
-    rf = portfolio.risk_free(rates, pd.DatetimeIndex(rets.index))
+    rates, source, quote = pf_rates(s.base, prices.close)
+    rf = portfolio.risk_free(rates, pd.DatetimeIndex(rets.index), quote)
     key = (*s.key, months, source, pf_rates_key(rates))
     bench = partial(s.bench, pd.DatetimeIndex(s.rets.index))
     stats = cached_ratios(key, rets, rf, bench)
-    with st.container(horizontal=True):
+    rate_note = f"무위험수익률 {source}" if not rates.empty else "무위험수익률 0"
+    with st.container(horizontal=True, key="pf_risk_cards"):
         st.metric(
             "연 변동성",
             portfolio.percent(stats.volatility)
             if stats.volatility is not None
             else PF_DASH,
+            help="**정의** 일간 초과수익률(수익률 − 무위험수익률) 표준편차 × √(연간"
+            " 관측일 수)\n\n**해석** 높을수록 수익률 변동 확대\n\n**기준**"
+            f" {s.label} 일간 수익률 {stats.days}일 · {rate_note} · " + PF_YEAR_NOTE,
             border=True,
+            height="stretch",
         )
         pf_drawdown(stats)
         pf_sharpe(stats)
@@ -2299,18 +3265,16 @@ def pf_stats(s: Subject, prices: portfolio.Prices, months: int) -> None:
             st.metric(
                 "베타",
                 pf_ratio(beta),
-                help=f"{portfolio.BENCHMARK_LABEL} 대비 Welch 베타, {s.base} 일간",
+                help=f"**정의** {portfolio.BENCHMARK_LABEL} 가격지수"
+                f"({portfolio.BENCHMARK}) 대비 Welch 베타 · {s.base} 일간 수익률\n\n"
+                "**해석** 1이면 지수와 같은 폭 · 1 초과 지수보다 큰 변동 · 0 근처"
+                " 지수와 무관\n\n**기준** "
+                + PF_DECAY_NOTE
+                + " · 한국 종목 보유 시 미표시(종가"
+                " 시각 차이)",
                 border=True,
+                height="stretch",
             )
-    rate_note = (
-        f"무위험수익률 {source}"
-        if not rates.empty
-        else "무위험수익률 자료가 없어 0으로 계산"
-    )
-    st.caption(
-        f"{s.label}의 일간 수익률 {stats.days}일 (수정 종가, {s.base}) · {rate_note}"
-        f" · {perf.MIN_OBS}일 미만은 {PF_SHORT}"
-    )
     more = st.expander("고급", key="pf_advanced", on_change="rerun")
     if more.open:
         with more:
@@ -2320,24 +3284,6 @@ def pf_stats(s: Subject, prices: portfolio.Prices, months: int) -> None:
 def pf_analysis(p: portfolio.Portfolio, prices: portfolio.Prices, months: int) -> None:
     s = pf_subject(p, prices)
     pf_stats(s, prices, months)
-    left, right = st.columns([1, 2])
-    with left, st.container(border=True):
-        st.markdown("**비중**")
-        if s.w.empty:
-            st.caption("보유 중인 종목이 없습니다.")
-        else:
-            st.altair_chart(pf_weight_chart(s.w), alt="비중")
-    with right, st.container(border=True):
-        st.markdown(f"**평가액과 순투입** · {p.base}")
-        frame = cached_history(pf_key(p.model_dump_json()), p, prices.close)
-        lines = portfolio.value_lines(frame)
-        if len(frame) > 1:
-            st.altair_chart(
-                pf_line_chart(portfolio.line_points(lines), pf_axis(p.base)),
-                alt="평가액과 순투입",
-            )
-        else:
-            st.caption(portfolio.UNKNOWN)
     pf_style_box(s, prices, "pf_style")
 
 
@@ -2346,9 +3292,6 @@ def pf_style_box(s: Subject, prices: portfolio.Prices, key: str) -> None:
     if box.open and not s.w.empty:
         with box:
             pf_style_fit(s, prices)
-
-
-PF_STYLE_NOTE = "과거 움직임이 비슷했던 조합이며 실제 보유나 추천이 아닙니다"
 
 
 def pf_style_fit(s: Subject, prices: portfolio.Prices) -> None:
@@ -2367,27 +3310,31 @@ def pf_style_fit(s: Subject, prices: portfolio.Prices) -> None:
         st.rerun()
     w, _, _ = pf_weights(s, prices, PF_LONG_MONTHS)
     fit = cached_style((*s.key, "style"), s.base, prices.adjusted, w)
+    about = (
+        "**정의** 주간 수익률을 가장 가깝게 따르는 비교 지수·현금 조합(Sharpe"
+        " 1992) · 비중 0 이상, 합 100%\n\n**해석** 설명력 R² 높을수록 조합과 비슷한"
+        " 움직임"
+    )
     if fit is None:
-        st.caption(
-            f"지금 비중의 주간 수익률이 {portfolio.WEEKS}주 이상이고 비교 지수가"
-            " 있어야 합니다."
+        headed(
+            "**스타일 비중**",
+            about,
+            [f"**조건** 지금 비중 주간 수익률 {portfolio.WEEKS}주 이상 · 비교 지수"],
         )
         return
     shown = pd.Series(fit.weights, index=list(fit.names), dtype="float64")
     shown = cast("pd.Series", shown[shown > 0.0005])  # noqa: PLR2004 - rounding dust
-    st.altair_chart(pf_weight_chart(shown, "지수"), alt="스타일 비중")
     r2 = f"{fit.r2:.0%}" if fit.r2 is not None else PF_DASH
-    notes = [
-        f"{PF_STYLE_NOTE} · 최근 {fit.weeks}주 {s.base} 주간 수익률 · 설명력 R² {r2}"
-    ]
+    notes = [f"최근 {fit.weeks}주 {s.base} 주간 수익률 · 설명력 R² {r2}"]
     if fit.selection is not None:
         notes.append(
             f"조합 대비 차이(표본 외, {fit.selection_weeks}주 평균) 연"
             f" {portfolio.percent(fit.selection, signed=True)}"
         )
     if fit.dropped:
-        notes.append(f"기간을 채우지 못해 뺀 지수: {', '.join(fit.dropped)}")
-    st.caption(" · ".join(notes))
+        notes.append(f"기간 미달로 뺀 지수 {', '.join(fit.dropped)}")
+    headed("**스타일 비중**", about + "\n\n**기준** " + " · ".join(notes))
+    st.altair_chart(pf_weight_chart(shown, "지수"), alt="스타일 비중")
 
 
 # ---- correlation
@@ -2411,7 +3358,9 @@ def pf_heatmap(matrix: pd.DataFrame) -> alt.LayerChart:
             alt.Tooltip("value:Q", title="상관계수", format=".2f"),
         ],
     )
-    labels = base.mark_text().encode(text=alt.Text("value:Q", format=".2f"))
+    labels = base.mark_text(color=pf_ink()).encode(
+        text=alt.Text("value:Q", format=".2f")
+    )
     size = max(CHART_HEIGHT, 44 * len(order))
     return alt.LayerChart(layer=[cells, labels]).properties(height=size)
 
@@ -2427,13 +3376,18 @@ def pf_joint(
     return cached_joint(key, s.base, months, prices.adjusted, w), share, dropped
 
 
-def pf_dropped(dropped: list[str]) -> None:
+def pf_gaps(dropped: list[str], late: str) -> list[str]:
+    """The "!" lines for holdings left out of a window or starting inside it."""
+    warns: list[str] = []
     if dropped:
         more = " 외" if len(dropped) > PF_HEAT else ""
-        st.caption(
-            f"기간 중 자료가 시작하거나 끝나 뺀 {len(dropped)}종목:"
+        warns.append(
+            f"**자료** 기간 중 자료 시작·종료로 뺀 {len(dropped)}종목 ·"
             f" {', '.join(dropped[:PF_HEAT])}{more}"
         )
+    if late:
+        warns.append(f"**자료** 기간 중 자료 시작 · {late}")
+    return warns
 
 
 def pf_correlation(
@@ -2445,41 +3399,48 @@ def pf_correlation(
     """Holdings' correlation, betas and spread; ``compare`` fills the right panel."""
     j, _, dropped = pf_joint(s, prices, months)
     left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown(f"**보유 종목** · {s.base} 일간 수익률")
+    with left, st.container(border=True, height="stretch"):
+        title = f"**보유 종목** · {s.base} 일간 수익률"
+        about = (
+            "**정의** 보유 종목 일간 수익률의 상관계수\n\n**해석** 1에 가까울수록"
+            " 같은 방향 · 0 근처 무관 · 음수 반대 방향\n\n**기준** 비중 상위"
+            f" {PF_HEAT}종목 · 모든 종목 값이 있는 날 · " + PF_COV_NOTE
+        )
         if j is None or len(j.names) < 2 or len(j.window) < portfolio.MIN_DAYS:  # noqa: PLR2004
-            st.caption("수익률이 있는 보유 종목이 둘 이상이어야 합니다.")
+            names, days = (len(j.names), len(j.window)) if j is not None else (0, 0)
+            headed(
+                title,
+                about,
+                [
+                    "**조건** 수익률 있는 보유 종목 2개 이상 · 모든 종목 값이 있는 날"
+                    f" {portfolio.MIN_DAYS}일 이상 · 현재 {names}종목, {days}일"
+                ],
+            )
         else:
             cov, f, shrink = cached_covariance((*s.key, months, "cov"), j)
             shown = pf_largest(j)
             full = portfolio.correlation_frame(cov, j.names)
             matrix = cast("pd.DataFrame", full.loc[shown, shown])
-            st.altair_chart(pf_heatmap(matrix), alt="종목 상관")
-            notes = [f"{len(j.window)}일 · 모든 종목 값이 있는 날"]
-            if len(shown) < len(j.names):
-                notes.append(f"비중 상위 {len(shown)}종목")
+            notes = [f"{len(j.window)}일"]
             if j.mixed:
-                notes.append(f"한국·미국 종가 시차 보정 (전날 공분산 × {f:.2f})")
+                notes.append(f"시차 보정 f {f:.2f}")
             if len(j.names) > 2:  # noqa: PLR2004 - two names: the target is the sample
                 notes.append(f"Ledoit–Wolf 축소 {shrink:.0%}")
-            if j.late:
-                notes.append(f"자료 시작: {j.late}")
-            st.caption(" · ".join(notes))
-            pf_dropped(dropped)
-    with right, st.container(border=True):
+            headed(title, about + " · " + " · ".join(notes), pf_gaps(dropped, j.late))
+            st.altair_chart(pf_heatmap(matrix), alt="종목 상관")
+    with right, st.container(border=True, height="stretch"):
         compare()
     if j is None or len(j.window) < portfolio.MIN_DAYS:
         return
     left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown(f"**베타** · {s.base} 일간 수익률")
+    with left, st.container(border=True, height="stretch"):
+        headed(f"**베타** · {s.base} 일간 수익률", PF_BETA_HELP)
         shown = set(pf_largest(j))
         rows = portfolio.betas(j)
         pf_betas(
             [b for b in rows if b.name in shown or b.name == portfolio.PORTFOLIO_LABEL]
         )
-    with right, st.container(border=True):
-        st.markdown("**분산** · 지금 비중")
+    with right:
         cov, _, _ = cached_covariance((*s.key, months, "cov"), j)
         pf_spread(j, portfolio.diversification(j, cov))
 
@@ -2498,11 +3459,48 @@ def pf_book_heatmap(
     base: portfolio.Currency,
     months: int,
 ) -> None:
-    st.markdown(f"**포트폴리오와 {portfolio.BENCHMARK_LABEL}** · {base}")
     key = pf_key(book.model_dump_json())
     frame, korean = cached_lineup(key, base, months, book, prices)
-    pf_compare_heatmap((*key, base, months), frame, korean)
-    st.caption("포트폴리오마다 지금 비중으로 계산 · 보유 종목이 없으면 빠짐")
+    pf_compare_heatmap(
+        (*key, base, months),
+        frame,
+        korean,
+        f"**포트폴리오와 {portfolio.BENCHMARK_LABEL}** · {base}",
+        "**정의** 포트폴리오별 지금 비중 일간 수익률과 지수의 상관계수\n\n"
+        "**해석** 1에 가까울수록 같은 방향 · 0 근처 무관\n\n**기준** 보유 종목 없는"
+        " 포트폴리오 제외 · " + PF_INDEX_NOTE + " · " + PF_COV_NOTE,
+    )
+
+
+# Fragments of the tooltips below: each goes in a **기준** paragraph.
+PF_INDEX_NOTE = (
+    f"S&P 500: 배당 재투자 총수익지수({portfolio.TOTAL_RETURN}) · KOSPI: 배당 제외"
+    " 가격지수"
+)
+PF_DECAY_NOTE = (
+    "Welch 가중치: 하루 지날 때마다 e^(−2/256)배 감소, 기간 선택과 무관하게 최근"
+    " 약 1년 중심"
+)
+PF_PROXY_NOTE = (
+    "대체 베타: 저장된 모든 날 같은 가중치(감쇠 없음), 한국 종목의 미국 지수 대체는"
+    f" Dimson · 1 쪽으로 {quant.BETA_PRIOR_DAYS}/(n + {quant.BETA_PRIOR_DAYS}) 축소(n:"
+    f" 사용 일수) · {portfolio.PROXY_MIN_DAYS}일 미만이면 1"
+)
+PF_YEAR_NOTE = (
+    "연환산: 자료의 연간 관측일 수 기준(한국·미국 혼합 약 258일, 미국 약 251일)"
+)
+PF_COV_NOTE = (
+    "공분산: 한국·미국 종가 시차 보정(전날 교차 공분산 × f, 양의 준정부호 유지"
+    " 최대값) · Ledoit–Wolf(2004) 상수상관 축소"
+)
+PF_BETA_HELP = (
+    f"**정의** 일간 수익률의 시장 베타 · {portfolio.BENCHMARK_LABEL}(Welch): 하루"
+    " 수익률을 지수의 −2~4배로 제한한 가중 회귀 기울기 · Dimson: 한국 종목의 같은 날"
+    f" + 전날 {portfolio.BENCHMARK_LABEL} 기울기 합 · KOSPI: 한국 종목의 KOSPI 대비"
+    " Welch 베타\n\n**해석** 1이면 지수와 같은 폭 · 1 초과 지수보다 큰 변동 · 0 근처"
+    f" 지수와 무관\n\n**기준** {portfolio.BENCHMARK_LABEL} 가격지수"
+    f"({portfolio.BENCHMARK}) · 기준 통화 · " + PF_DECAY_NOTE
+)
 
 
 def pf_betas(rows: list[portfolio.Beta]) -> None:
@@ -2519,72 +3517,175 @@ def pf_betas(rows: list[portfolio.Beta]) -> None:
         },
         "베타",
     )
-    st.caption(
-        "Welch: 하루 수익률을 지수의 −2~4배로 제한하고 최근 날에 더 무게 ·"
-        " Dimson: 한국 종목은 같은 날과 전날 S&P 500에 대한 기울기의 합 · KOSPI"
-        " 베타는 한국 종목만"
-    )
 
 
 def pf_spread(j: portfolio.Joint, spread: portfolio.Spread) -> None:
-    with st.container(horizontal=True):
+    with st.container(horizontal=True, key="pf_spread_cards"):
         st.metric(
             "분산 비율",
             pf_ratio(spread.ratio),
-            help="종목 변동성의 가중합 ÷ 포트폴리오 변동성 (1이면 분산 효과 없음)",
+            help="**정의** Σ 비중 × 종목 변동성 ÷ 포트폴리오 변동성(Choueifaty–Coignard"
+            " 2008)\n\n**해석** 1이면 분산 효과 없음 · 높을수록 분산 효과 확대\n\n"
+            "**기준** " + PF_COV_NOTE,
             border=True,
+            height="stretch",
         )
         st.metric(
             "유효 종목 수",
             f"{spread.effective:.1f}",
-            help="1 ÷ 비중 제곱합 (같은 비중 N종목이면 N)",
+            help="**정의** 1 ÷ Σ 비중²(허핀달 지수의 역수)\n\n**해석** 같은 비중"
+            " N종목이면 N · 낮을수록 소수 종목 집중",
             border=True,
+            height="stretch",
         )
-    pf_table(
-        {
-            "종목": list(j.names),
-            "비중": [portfolio.percent(float(v)) for v in j.w],
-            "위험 기여": [portfolio.percent(float(v)) for v in spread.risk],
-        },
-        "위험 기여",
-    )
-    st.caption("위험 기여: 포트폴리오 분산 중 각 종목의 몫 (오일러 분해, 합 100%)")
+    with st.container(border=True, height="stretch"):  # the cards stay outside
+        headed(
+            "**분산** · 지금 비중",
+            "**정의** 위험 기여: 포트폴리오 분산 중 종목 몫 · w_i(Σw)_i ÷"
+            " w′Σw(오일러 분해, 합 100%)\n\n**해석** 비중보다 위험 기여가 크면"
+            " 변동성 집중 종목\n\n"
+            "**기준** " + PF_COV_NOTE,
+        )
+        pf_table(
+            {
+                "종목": list(j.names),
+                "비중": [portfolio.percent(float(v)) for v in j.w],
+                "위험 기여": [portfolio.percent(float(v)) for v in spread.risk],
+            },
+            "위험 기여",
+        )
 
 
-def pf_compare_heatmap(key: Key, frame: pd.DataFrame, korean: list[bool]) -> None:
+def pf_compare_heatmap(
+    key: Key, frame: pd.DataFrame, korean: list[bool], title: str, about: str
+) -> None:
     """Whole portfolios' daily correlation, lag-adjusted and shrunk.
 
-    ``key`` stands for ``frame``.
+    ``key`` stands for ``frame``; ``about`` is the heading's help, ending in
+    its **기준** paragraph.
     """
     found = cached_lagged((*key, "compare"), tuple(korean), frame)
     if found is None:
-        st.caption(
-            f"모두 값이 있는 날이 {portfolio.MIN_DAYS}일 이상인 수익률이 둘 이상이어야"
-            " 합니다."
+        headed(
+            title,
+            about,
+            [
+                f"**조건** 모두 값이 있는 날 {portfolio.MIN_DAYS}일 이상인 수익률 2개"
+                " 이상"
+            ],
         )
         return
-    st.altair_chart(pf_heatmap(found.matrix), alt="포트폴리오 상관")
-    notes = [f"{found.days}일 · 모두 값이 있는 날, 일간 수익률"]
+    notes = [f"{found.days}일 · 모두 값이 있는 날"]
     if any(korean):
         notes.append(
-            f"한국 비중이 절반을 넘는 포트폴리오는 한국 종가로 보고 시차 보정"
-            f" (전날 공분산 × {found.lag:.2f})"
+            "한국 비중 절반 초과 포트폴리오: 한국 종가 기준 시차 보정 f"
+            f" {found.lag:.2f}"
         )
     if len(found.matrix) > 2:  # noqa: PLR2004 - two series: the target is the sample
         notes.append(f"Ledoit–Wolf 축소 {found.shrink:.0%}")
-    st.caption(" · ".join(notes))
+    headed(title, about + " · " + " · ".join(notes))
+    st.altair_chart(pf_heatmap(found.matrix), alt="포트폴리오 상관")
 
 
 # ---- risk
+
+
+PF_FIT_PAD = 0.05  # a fitted value axis: this share of the span either side
+PF_BREAK = "≈"  # at the start of a value axis that does not start at 0
+# Each side's bar, darkest first: Reach field, opacity, then per side (falls,
+# rises) the column header and what the share counts ({} the level).
+PF_SHADES = (
+    (
+        "end",
+        1.0,
+        ("기간 말", "기간 말"),
+        ("끝에 지금 대비 −{} 이하", "끝에 지금 대비 +{} 이상"),
+    ),
+    (
+        "touched",
+        0.6,
+        ("기간 중 도달", "기간 중 도달"),
+        ("지금 대비 한 번이라도 −{} 이하", "지금 대비 한 번이라도 +{} 이상"),
+    ),
+    (
+        "swing",
+        0.3,
+        ("고점 대비", "저점 대비"),
+        ("기간 중 고점에서 {} 이상 하락", "기간 중 저점에서 {} 이상 반등"),
+    ),
+)
+PF_REACH_MIDDLE = 48  # px, half the centre labels' room
+PF_REACH_HEAD = " "  # the row naming the sides and the value columns
+PF_REACH_ROW = 44  # px per row
+PF_REACH_COLUMN = 54  # px per value column beside the bars
+PF_REACH_PAD = 6  # px between the bars and the first value column
+
+
+def pf_fit(low: float, high: float) -> list[float]:
+    """A value axis around ``low``..``high``, ``PF_FIT_PAD`` of the span either side."""
+    pad = PF_FIT_PAD * ((high - low) or abs(high) or 1.0)
+    return [low - pad, high + pad]
+
+
+def pf_break(x: float, y: float, *, angle: int) -> alt.Chart:
+    """``PF_BREAK`` at ``(x, y)``, the start of a value axis that skips 0.
+
+    ``angle`` 0 crosses a vertical axis line, 90 a horizontal one. Nudged
+    along the line off the corner (Vega offsets after rotating: up, or right
+    at 90), clear of the tick labels beside it.
+    """
+    return (
+        alt.Chart(alt.Data(values=[{}]))
+        .mark_text(text=PF_BREAK, angle=angle, fontSize=14, dy=-10)
+        .encode(x=alt.datum(x), y=alt.datum(y))
+    )
+
+
+# Dollars from which amounts show in B/M like investors.dollars: a 13F filer
+# manages at least $100M, a personal portfolio stays below.
+PF_COMPACT = 1e8
+
+
+def pf_compact(base: portfolio.Currency, total: float) -> bool:
+    """Whether amounts up to ``total`` show in B/M (a 13F clone's billions)."""
+    return base == "USD" and abs(total) >= PF_COMPACT
+
+
+def pf_money(
+    value: float, base: portfolio.Currency, *, compact: bool, signed: bool = False
+) -> str:
+    """``portfolio.money``, or ``investors.dollars`` with a sign when ``compact``."""
+    if not compact or not math.isfinite(value):
+        return portfolio.money(value, base, signed=signed)
+    sign = "−" if value < 0 else ("+" if signed and value > 0 else "")
+    return sign + investors.dollars(abs(value))
+
+
+def pf_value_axis(base: portfolio.Currency, high: float) -> alt.Axis:
+    """Amount labels; in B/M when ``pf_compact``, as Vega's SI "G" is not "B"."""
+    if not pf_compact(base, high):
+        return alt.Axis(format=pf_axis(base))
+    return alt.Axis(
+        labelExpr="abs(datum.value) >= 1e9"
+        " ? format(datum.value / 1e9, ',.1~f') + 'B'"
+        " : format(datum.value / 1e6, ',.1~f') + 'M'"
+    )
 
 
 def pf_fan_chart(
     rows: list[dict[str, float]], base: portfolio.Currency
 ) -> alt.LayerChart:
     number = pf_axis(base)
+    low, high = pf_fit(min(r["p5"] for r in rows), max(r["p95"] for r in rows))
     chart = alt.Chart(alt.Data(values=rows)).encode(x=alt.X("day:Q", title="거래일"))
     wide = chart.mark_area(opacity=0.18).encode(
-        y=alt.Y("p5:Q", title=base, axis=alt.Axis(format=number)), y2="p95:Q"
+        y=alt.Y(
+            "p5:Q",
+            title=None,
+            axis=pf_value_axis(base, high),
+            scale=alt.Scale(domain=[low, high], zero=False, nice=False),
+        ),
+        y2="p95:Q",
     )
     mid = chart.mark_area(opacity=0.35).encode(y="p25:Q", y2="p75:Q")
     median = chart.mark_line().encode(
@@ -2597,18 +3698,28 @@ def pf_fan_chart(
             ),
         ],
     )
-    return alt.LayerChart(layer=[wide, mid, median]).properties(height=CHART_HEIGHT)
+    return alt.LayerChart(
+        layer=[wide, mid, median, pf_break(0, low, angle=0)]
+    ).properties(height=CHART_HEIGHT)
 
 
 def pf_end_chart(
     rows: list[dict[str, float]], value: float, base: portfolio.Currency
 ) -> alt.LayerChart:
     number = pf_axis(base)
+    low, high = pf_fit(
+        min(value, *(r["start"] for r in rows)), max(value, *(r["end"] for r in rows))
+    )
     bars = (
         alt.Chart(alt.Data(values=rows))
         .mark_bar(opacity=0.8)
         .encode(
-            x=alt.X("start:Q", title=base, axis=alt.Axis(format=number)),
+            x=alt.X(
+                "start:Q",
+                title=None,
+                axis=pf_value_axis(base, high),
+                scale=alt.Scale(domain=[low, high], zero=False, nice=False),
+            ),
             x2="end:Q",
             y=alt.Y("count:Q", title="경로 수"),
             tooltip=[
@@ -2623,88 +3734,603 @@ def pf_end_chart(
         .mark_rule(strokeDash=[3, 3], color="gray")
         .encode(x="x:Q")
     )
-    return alt.LayerChart(layer=[bars, now]).properties(height=CHART_HEIGHT)
+    return alt.LayerChart(layer=[bars, now, pf_break(low, 0, angle=90)]).properties(
+        height=CHART_HEIGHT
+    )
+
+
+def pf_ink() -> str:
+    """Text marks' colour for the theme; Vega draws text black on either."""
+    return "#fafafa" if st.context.theme.type == "dark" else "#31333f"
+
+
+def pf_reach_chart(paths: perf.PathRisk) -> alt.LayerChart:
+    """Falls left, rises right: per level one bar in three nested shades.
+
+    The shades are adjoining segments, so each reads as its own share from
+    the centre without overlap. Past each side's bars, one column of shares
+    per shade (the darkest nearest), headed by its name and a swatch. Each
+    side has its own x scale, so the centre labels keep their room in px.
+    """
+    ink = pf_ink()
+    longest = max(
+        0.05, *(r.swing for d in (paths.falls, paths.rises) for r in d.values())
+    )
+    middle = PF_REACH_MIDDLE
+    sides = (
+        ("하락", -1, paths.falls, display.DOWN_COLOR, [0, f"width / 2 - {middle}"]),
+        ("상승", 1, paths.rises, display.UP_COLOR, [f"width / 2 + {middle}", "width"]),
+    )
+    rows = [f"{level:.0%}" for level in perf.PATH_LEVELS]
+    y = alt.Y(
+        "row:N",
+        sort=[PF_REACH_HEAD, *rows],
+        axis=None,
+        scale=alt.Scale(paddingInner=0.3),
+    )
+    head = alt.Data(values=[{"row": PF_REACH_HEAD, "x": 0.0}])
+    layers: list[alt.Chart] = []
+    for side, sign, reach, color, span in sides:
+        part = int(sign > 0)
+        x = partial(
+            alt.X,
+            axis=None,
+            scale=alt.Scale(
+                domain=sorted([0.0, sign * longest]),
+                range=[{"expr": str(end)} for end in span],
+            ),
+        )
+        layers.append(
+            alt.Chart(head)
+            .mark_text(
+                text=side,
+                align="left" if sign > 0 else "right",
+                baseline="bottom",
+                dy=22,
+                fontSize=14,
+                fontWeight="bold",
+                color=ink,
+            )
+            .encode(x=x("x:Q"), y=y)
+        )
+        outside = alt.value(0 if sign < 0 else "width")  # the bars' end, in px
+        bars: list[dict[str, object]] = []
+        start = [0.0] * len(rows)
+        for k, (field, alpha, names, means) in enumerate(PF_SHADES):
+            name, mean = names[part], means[part]
+            dx = sign * (PF_REACH_PAD + (k + 0.5) * PF_REACH_COLUMN)
+            values: list[dict[str, object]] = []
+            for i, (row, (level, r)) in enumerate(
+                zip(rows, reach.items(), strict=True)
+            ):
+                stop = float(getattr(r, field))
+                share = display.share(stop)
+                bars.append(
+                    {
+                        "row": row,
+                        "shade": field,
+                        "x": sign * start[i],
+                        "x2": sign * stop,
+                        "name": name,
+                        "mean": mean.format(f"{level:.0%}"),
+                        "share": share,
+                    }
+                )
+                values.append({"row": row, "text": share})
+                start[i] = stop
+            layers += [
+                alt.Chart(alt.Data(values=values))
+                .mark_text(dx=dx, fontSize=13, color=ink)
+                .encode(x=outside, y=y, text="text:N"),
+                alt.Chart(head)
+                .mark_text(
+                    text=name.rsplit(" ", 1),
+                    dx=dx,
+                    dy=-1,
+                    baseline="bottom",
+                    fontSize=12,
+                    lineHeight=14,
+                    color=ink,
+                )
+                .encode(x=outside, y=y),
+                alt.Chart(head)
+                .mark_text(
+                    text="■",
+                    dx=dx,
+                    dy=24,
+                    baseline="bottom",
+                    fontSize=12,
+                    color=color,
+                    opacity=alpha,
+                )
+                .encode(x=outside, y=y),
+            ]
+        layers.append(
+            alt.Chart(alt.Data(values=bars))
+            .mark_bar(color=color)
+            .encode(
+                x=x("x:Q"),
+                x2="x2:Q",
+                y=y,
+                opacity=alt.Opacity(
+                    "shade:N",
+                    scale=alt.Scale(
+                        domain=[field for field, _, _, _ in PF_SHADES],
+                        range=[alpha for _, alpha, _, _ in PF_SHADES],
+                    ),
+                    legend=None,
+                ),
+                tooltip=[
+                    alt.Tooltip("name:N", title="측정"),
+                    alt.Tooltip("mean:N", title="정의"),
+                    alt.Tooltip("share:N", title="경로 비율"),
+                ],
+            )
+        )
+        if sign < 0:  # the centre labels, middle px right of the falls' zero
+            layers.append(
+                alt.Chart(
+                    alt.Data(
+                        values=[
+                            {"row": row, "x": 0.0, "text": f"−{row} | +{row}"}
+                            for row in rows
+                        ]
+                    )
+                )
+                .mark_text(dx=middle, fontSize=13, color=ink)
+                .encode(x=x("x:Q"), y=y, text="text:N")
+            )
+    return (
+        alt.LayerChart(layer=layers)
+        .resolve_scale(x="independent")
+        .properties(height=PF_REACH_ROW * (len(rows) + 1))
+    )
+
+
+def pf_reach_help(paths: perf.PathRisk) -> str:
+    """The 하락·상승 chart's help, with the recovery figures under 기준."""
+    low, mid, high = paths.recovery_low, paths.recovery_median, paths.recovery_high
+    if paths.never == 0 and mid is None:
+        recovery = "전고점 회복: 지금이 고점"
+    else:
+        if low is None:
+            spread = "기간 밖"
+        elif high is None:
+            spread = f"{low}거래일–기간 밖"
+        else:
+            spread = f"{low}–{high}거래일"
+        middle = "기간 밖" if mid is None else f"{mid}거래일"
+        recovery = (
+            f"전고점 회복 중앙값 {middle} · 10–90% {spread} · 기간 내 미회복"
+            f" {display.share(paths.never)}"
+        )
+    levels = "·".join(f"{level * 100:.0f}" for level in perf.PATH_LEVELS)
+    return (
+        f"**정의** {levels}% 하락·상승에 닿은 모의 경로 비율 · 왼쪽 하락 · 오른쪽 상승"
+        " · 막대 하나에 세 겹, 짙을수록 좁은 기준 · 기간 말: 기간 끝 평가액의 지금 대비"
+        " 변화 · 기간 중 도달: 기간 중 한때 지금 대비 도달 · 고점 대비: 그때까지의"
+        " 고점(지금 포함) 대비 하락 · 저점 대비: 그때까지의 저점(지금 포함) 대비 상승 ·"
+        " 숫자: 막대 바깥 열 · 열 머리 색 견본: 해당 겹\n\n**해석** 겹 사이 간격:"
+        " 기간 중 겪었지만 기간 끝에 남지 않은 손실(하락 쪽) · 기회(상승 쪽)\n\n"
+        f"**기준** 평균 수익 0 가정 · 경로 {portfolio.PATHS:,}개 · {recovery}"
+    )
 
 
 PF_THIN = "표본 부족"
+PF_MODELS: dict[str, str] = {"gjr": "GJR-GARCH", "har": "HAR", "pdv": "경로의존(PDV)"}
 
 
-def pf_paths(
+@dataclasses.dataclass(frozen=True, slots=True)
+class PfVol:
+    """The risk section's volatility filter: its options, fit and label.
+
+    ``key`` (model, ranges used, VIX used) stands for ``v`` in the caches.
+    """
+
+    v: portfolio.Vol
+    key: Key
+    f: quant.Devolatilised
+    label: str
+
+
+def pf_vol(
+    key: Key,
+    s: Subject,
+    prices: portfolio.Prices,
+    j: portfolio.Joint,
+    *,
+    inline: bool = False,
+) -> PfVol:
+    """The 변동성 모델 controls and the filter they choose (cached).
+
+    The opens, highs and lows or VIX are fetched only when asked. ``inline``:
+    in the caller's row, not a row of their own.
+    """
+    fetcher = portfolio_fetcher(str(pf_root()))
+    can = not args.demo and not portfolio.missing_packages()
+    row = (
+        contextlib.nullcontext()
+        if inline
+        else st.container(horizontal=True, vertical_alignment="bottom")
+    )
+    with row:
+        picked = st.segmented_control(
+            "변동성 모델",
+            list(PF_MODELS),
+            format_func=PF_MODELS.__getitem__,
+            default="gjr",
+            required=True,
+            key="pf_vol_model",
+            persist_state="page",  # 전망 shows it only under FHS
+            help="**정의** FHS·EVT VaR·ES, FHS 시뮬레이션, FHS·EVT 사후검정의"
+            " 변동성 필터 · GJR-GARCH(1,1): 음의 충격에 더 큰 분산 반응 · HAR: 어제·"
+            "지난주·지난달 평균 분산의 회귀(Corsi 2009) · 경로의존(PDV): 과거 수익률과"
+            " 그 제곱의 지수가중 평균(Guyon–Lekeufack 2023)\n\n**기준** 종목별 최근"
+            f" {quant.FILTER_DAYS:,}거래일 추정 · GJR-GARCH는 {quant.MIN_GARCH}일 이상,"
+            f" 적합 실패 종목은 EWMA(λ={quant.EWMA_LAMBDA})",
+        )
+        model = cast("quant.Filter", picked or "gjr")
+        ranges = vix = False
+        if model != "gjr":
+            with st.container(width="content"):  # the toggles stacked: a narrow row
+                ranges = st.toggle(
+                    "고가·저가 사용",
+                    key="pf_ranges",
+                    persist_state="page",
+                    help="**정의** 필터의 일간 분산 입력을 Garman–Klass(1980) 범위"
+                    " 분산으로 대체 · 시가·고가·저가·종가와 전일 종가(갭 포함)\n\n"
+                    "**해석** 수익률 제곱보다 잡음이 적은 분산 추정\n\n**기준** HAR·PDV"
+                    " 전용 · 자료 없는 날·종목은 수익률 제곱",
+                )
+                vix = model == "har" and st.toggle(
+                    "VIX 포함",
+                    key="pf_vix",
+                    persist_state="page",
+                    help="**정의** 전일 VIX의 일간 분산 환산값((VIX/100)²/252)을 HAR"
+                    " 회귀변수로 추가\n\n**기준** HAR 전용 · 한국 종목은 그 전 미국"
+                    " 종가의 VIX",
+                )
+        absent = portfolio.no_ranges(prices, j.names) if ranges else []
+        running = fetcher.progress.running
+        if (
+            can
+            and absent
+            and st.button(
+                "고가·저가 받기",
+                icon=":material/download:",
+                key="pf_ranges_fetch",
+                disabled=running,
+                help=", ".join(absent),
+            )
+        ):
+            fetcher.start(absent, ranges=True)
+            st.rerun()
+        index = cast("pd.Index", j.full.index[-portfolio.FIT_ROWS :])  # fits read
+        x = portfolio.vix_regressor(prices.adjusted, j.names, index) if vix else None
+        if (
+            can
+            and vix
+            and x is None
+            and st.button(
+                "VIX 받기",
+                icon=":material/download:",
+                key="pf_vix_fetch",
+                disabled=running,
+                help=portfolio.VIX,
+            )
+        ):
+            fetcher.start([portfolio.VIX])
+            st.rerun()
+    proxy = portfolio.range_proxy(prices, j.names, s.base, index) if ranges else None
+    v = portfolio.Vol(model, proxy, x)
+    chosen = (model, proxy is not None, x is not None)
+    f = cached_filter((*key, "filter", *chosen), j, v)
+    label = portfolio.filter_label(j, f)
+    inputs = [n for n, a in (("고가·저가", proxy), ("VIX", x)) if a is not None]
+    if f.model is not None and inputs:
+        label += f" ({', '.join(inputs)})"
+    return PfVol(v, chosen, f, label)
+
+
+def pf_density(d: portfolio.Density, *, fhs: bool) -> None:
+    drawn = (
+        f"필터 추정 기간의 겹치지 않는 {quant.MONTH_DAYS}일 구간마다 첫날 변동성"
+        " 기준 모의"
+        if fhs
+        else f"전체 기간의 겹치지 않는 {quant.MONTH_DAYS}일 구간마다 직전 선택 기간"
+        " 수익률의 평균 수익 0 묶음 재표본(Politis–White 2004, 묶음 길이도 그 기간"
+        " 추정) · 앞에 선택 기간만큼 자료가 있는 구간"
+    )
+    headed(
+        f"**분포 검증** · 1개월, {d.blocks}구간",
+        "**정의** 1개월 수익률 예측 분포의 사후 검증 · PIT: 예측 1개월 수익률"
+        f" {portfolio.DENSITY_PATHS:,}개 중 실제 수익률의 위치 · LR: Berkowitz(2001)"
+        " 우도비, Φ⁻¹(PIT)의 AR(1)이 평균 0·분산 1·자기상관 0인지 검정(χ²(3))\n\n"
+        "**해석** p가 작을수록(통상 0.05 미만) 예측 분포의 위치·폭·자기상관"
+        f" 불일치\n\n**기준** 예측: {drawn} · 구간 {quant.MIN_MONTHS}개 이상",
+        []
+        if d.test is not None
+        else [f"**조건** 1개월 구간 {quant.MIN_MONTHS}개 이상 · 현재 {d.blocks}구간"],
+    )
+    if d.test is None:
+        return
+    pf_table(
+        {
+            "구간": [f"{d.blocks}개"],
+            "LR": [f"{d.test.lr:.2f}"],
+            "p": [f"{d.test.p:.2f}"],
+        },
+        "분포 검증",
+    )
+
+
+PF_RESAMPLE = "resample"
+PF_GEN_CHUNK = 2000  # paths per generator call: (2000, 252, 6) is 24 MB
+PF_GEN_HISTORY = 20  # recent days handed to SigCWGAN (it reads its last p)
+PF_RETRAIN = "설정 > 생성 모델 학습에서 재학습"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PfGens:
+    """Trained generators the subject can use, and why the others cannot."""
+
+    usable: dict[str, generative.Generator]
+    blocked: dict[str, str]  # label: reason
+    base: portfolio.Currency
+    adjusted: pd.DataFrame  # SigCWGAN's recent returns come from here
+
+
+def pf_gen_stamp(folder: Path) -> tuple[int, ...]:
+    files = (folder / generative.WEIGHTS, folder / generative.META)
+    return tuple(n for f in files for n in (f.stat().st_mtime_ns, f.stat().st_size))
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def cached_generator(
+    folder: str, stamp: tuple[int, ...]
+) -> generative.Generator | None:
+    """A generator's weights, read once per file stamp; read-only."""
+    del stamp
+    return generative.load(Path(folder))
+
+
+def pf_gens(
+    j: portfolio.Joint, base: portfolio.Currency, adjusted: pd.DataFrame
+) -> PfGens:
+    """Ready generators whose tickers hold every name, and USD/KRW if needed."""
+    root = gen_root()
+    usable: dict[str, generative.Generator] = {}
+    blocked: dict[str, str] = {}
+    foreign = any(portfolio.currency(n) != base for n in j.names)
+    for s in generative.status(root):
+        label = GEN_LABELS[s.model]
+        if s.model == "kronos":
+            blocked[label] = generative.IN_PROGRESS if s.ready else s.note
+            continue
+        folder = root / s.model
+        gen = cached_generator(str(folder), pf_gen_stamp(folder)) if s.ready else None
+        if gen is None:
+            blocked[label] = f"{s.note} · {PF_RETRAIN}"
+            continue
+        missing = [n for n in j.names if n not in gen.tickers]
+        if foreign and portfolio.FX not in gen.tickers:
+            missing.append(portfolio.FX)
+        if missing:
+            blocked[label] = f"{', '.join(missing)} 없음 · {PF_RETRAIN}"
+        else:
+            usable[s.model] = gen
+    return PfGens(usable, blocked, base, adjusted)
+
+
+def pf_generator_controls(gens: PfGens) -> generative.Generator | None:
+    """경로 생성; the picked generator, None for resampling."""
+    if state.get("pf_gen", PF_RESAMPLE) not in (PF_RESAMPLE, *gens.usable):
+        del state["pf_gen"]  # the subject changed: back to resampling
+    picked = st.segmented_control(
+        "경로 생성",
+        [PF_RESAMPLE, *gens.usable],
+        format_func=lambda m: "재표본" if m == PF_RESAMPLE else GEN_LABELS[m],
+        default=PF_RESAMPLE,
+        required=True,
+        key="pf_gen",
+        help="**정의** 시뮬레이션 경로 생성 방식 · 재표본: 과거 수익률"
+        " 재표본(FHS 선택 가능) · Tail-GAN(Cont 외) · SigCWGAN(Liao 외 2020) ·"
+        " 신경망 SDE(Issa 외 2023): data/models의 학습된 생성 모델 경로\n\n"
+        "**기준** 보유 종목을 모두 담은 모델 · 학습: 설정 > 생성 모델 학습",
+    )
+    return gens.usable.get(picked or PF_RESAMPLE)
+
+
+def pf_blocked_generators(gens: PfGens) -> None:
+    """The generators this subject cannot use, shown disabled."""
+    if gens.blocked:
+        st.segmented_control(
+            "학습 필요",
+            list(gens.blocked),
+            disabled=True,
+            key="pf_gen_off",
+            help="**정의** 이 구성에 쓸 수 없는 생성 모델\n\n**기준** "
+            + " · ".join(f"{label}: {why}" for label, why in gens.blocked.items()),
+        )
+
+
+def pf_history(adjusted: pd.DataFrame, gen: generative.Generator) -> pd.DataFrame:
+    """SigCWGAN's condition: its tickers' latest simple returns, days all traded."""
+    if gen.method != "sigcwgan":
+        return pd.DataFrame()
+    prices = adjusted.reindex(columns=list(gen.tickers)).dropna(how="any")
+    return cast("pd.DataFrame", (prices / prices.shift() - 1).iloc[1:]).tail(
+        PF_GEN_HISTORY
+    )
+
+
+def pf_gen_key(gen: generative.Generator) -> Key:
+    return (gen.method, *pf_gen_stamp(gen_root() / gen.method))
+
+
+def pf_gen_note(
+    gen: generative.Generator,
+    base: portfolio.Currency,
+    j: portfolio.Joint,
+    recent: bool,
+) -> str:
+    """How the generator's paths are drawn, for the method notes."""
+    span = f"{gen.meta.get('train_start', '?')}–{gen.meta.get('train_end', '?')}"
+    how = (
+        f"{gen.window}일 단위 독립 생성 뒤 연결"
+        if gen.window is not None
+        else (
+            "최근 수익률 조건의 일별 생성"
+            if recent
+            else "학습 자료 마지막 날들 조건의 일별 생성"
+        )
+    )
+    fx = (
+        f" · 다른 통화 종목은 같은 경로의 {portfolio.FX}로 {base} 환산"
+        if any(portfolio.currency(n) != base for n in j.names)
+        else ""
+    )
+    return (
+        f"{GEN_LABELS[gen.method]}({span} 학습) 생성 경로 {portfolio.PATHS:,}개,"
+        f" {how}{fx} · 평균 수익 0 가정 · 지금 비중 매일 재조정"
+    )
+
+
+def pf_generated(
+    gen: generative.Generator,
+    j: portfolio.Joint,
+    base: portfolio.Currency,
+    days: int,
+    history: pd.DataFrame | None,
+) -> NDArray[np.float64]:
+    """``portfolio.PATHS`` generated paths as daily portfolio returns in ``base``.
+
+    Drawn ``PF_GEN_CHUNK`` at a time from seed ``quant.SEED``, so only the
+    (paths, days) portfolio returns are kept.
+    """
+    rng = np.random.default_rng(quant.SEED)
+    columns = [gen.tickers.index(n) for n in j.names]
+    fx = gen.tickers.index(portfolio.FX) if portfolio.FX in gen.tickers else None
+    parts: list[NDArray[np.float64]] = []
+    for done in range(0, portfolio.PATHS, PF_GEN_CHUNK):
+        drawn = gen.paths(min(PF_GEN_CHUNK, portfolio.PATHS - done), days, rng, history)
+        rates = None if fx is None else drawn[..., fx]
+        parts.append(portfolio.generated_returns(j, drawn[..., columns], rates, base))
+    return np.concatenate(parts)
+
+
+@st.cache_data(show_spinner="생성 모델 경로 계산 중…", max_entries=8)
+def cached_generated(
+    key: Key,
+    base: portfolio.Currency,
+    days: int,
+    value: float,
+    standing: tuple[float, float],
+    _gen: generative.Generator,
+    _j: portfolio.Joint,
+    _history: pd.DataFrame | None,
+) -> portfolio.Simulation:
+    """``cached_paths`` for a generator; ``key`` stands for it, ``_j`` and history."""
+    del key
+    daily = pf_generated(_gen, _j, base, days, _history)
+    return portfolio.simulation(portfolio.path_growth(daily), value, *standing)
+
+
+def pf_paths(  # noqa: PLR0913 - the section's inputs
     key: Key,
     j: portfolio.Joint,
     value: float,
-    base: portfolio.Currency,
-    held: pd.Series,
+    s: Subject,
+    vol: PfVol | None,
+    gen: generative.Generator | None,
+    adjusted: pd.DataFrame,
+    warns: list[str],
 ) -> None:
     """Monte Carlo of today's weights; the draws are shared across weights.
 
-    ``key`` stands for ``j`` and ``held``.
+    ``key`` stands for ``j`` and ``s.rets``; ``vol`` is the filter under FHS,
+    None for plain resampling; ``gen`` the generator drawing the paths
+    instead, its recent returns from ``adjusted``; ``warns`` the "!" lines
+    for the first heading.
     """
-    with st.container(horizontal=True, vertical_alignment="bottom"):
-        picked = st.segmented_control(
-            "기간",
-            list(portfolio.HORIZONS),
-            default="1M",
-            required=True,
-            key="pf_horizon",
-        )
-        fhs = st.toggle("현재 변동성 반영 (FHS)", key="pf_fhs")
-    label = picked or "1M"
+    base, held = s.base, s.rets
+    label = state.get("pf_horizon") or "1M"  # 전망 기간, in the top row
     days = portfolio.HORIZONS[label]
-    block = portfolio.mean_block(j)
-    n = len(j.window)
-    picks = cached_draws(state.get("pf_prices_stamp", ()), n, days, block)
     standing = portfolio.standing(held)
-    sim = cached_paths((*key, days, block), fhs, value, standing, j, picks)
-    ten, twenty = (sim.losses[level] for level in portfolio.LOSS_LEVELS)
-    st.markdown(
-        f"**{label} 뒤** · 모의 경로 100개 중 약 {round(ten * 100)}개가 10% 이상,"
-        f" {round(twenty * 100)}개가 20% 이상 손실"
-    )
-    with st.container(horizontal=True):
-        st.metric("10% 이상 손실 경로 비율", portfolio.percent(ten), border=True)
-        st.metric("20% 이상 손실 경로 비율", portfolio.percent(twenty), border=True)
-        for level, odds in sim.paths.drawdown_odds.items():
-            st.metric(
-                f"기간 중 −{level:.0%} 낙폭",
-                portfolio.percent(odds),
-                help="기간 안에 지금 또는 그 뒤 고점에서 이만큼 넘게 떨어진 경로 비율",
-                border=True,
-            )
-        pf_recovery(sim.paths)
+    if gen is not None:
+        history = pf_history(adjusted, gen)
+        sim = cached_generated(
+            (
+                *key,
+                *pf_gen_key(gen),
+                str(cast("object", history.index.max())) if len(history) else "",
+            ),
+            base,
+            days,
+            value,
+            standing,
+            gen,
+            j,
+            history if len(history) else None,
+        )
+        method = pf_gen_note(gen, base, j, len(history) > 0)
+    else:
+        f = None if vol is None else vol.f
+        block = 1 if vol else portfolio.mean_block(j)  # residuals: independent days
+        n = len(j.window)
+        picks = cached_draws(state.get("pf_prices_stamp", ()), n, days, block)
+        chosen = () if vol is None else vol.key
+        sim = cached_paths(
+            (*key, days, block, *chosen), f is not None, value, standing, j, picks, _f=f
+        )
+        first = cast("pd.Timestamp", j.window.index[0]).date()
+        last = cast("pd.Timestamp", j.window.index[-1]).date()
+        drawn = (
+            f"같은 날 수익률의 평균 {block:.1f}일 묶음(Politis–White 2004)"
+            if f is None
+            else "같은 날 잔차의 하루 단위"
+        )
+        method = (
+            f"평균 수익 0 가정 · 과거 {n}거래일({first}–{last}) {drawn} 재표본"
+            f"(경로 {portfolio.PATHS:,}개) · 지금 비중 매일 재조정"
+            + (f" · {pf_fhs_note(vol)}" if vol else "")
+        )
+    with st.container(border=True):
+        headed(f"**하락·상승 경로 비율** · {label}", pf_reach_help(sim.paths), warns)
+        st.altair_chart(pf_reach_chart(sim.paths), alt="하락·상승")
     left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown("**시뮬레이션 범위** · 5–95%, 25–75%, 중앙값")
+    with left, st.container(border=True, height="stretch"):
+        headed(
+            f"**시뮬레이션 범위** · 5–95%, 25–75%, 중앙값, {base}",
+            "**정의** 날짜별 모의 평가액의 5·25·50·75·95 백분위\n\n**기준** "
+            + method
+            + "".join(f" · {note}" for note in s.notes),
+        )
         st.altair_chart(pf_fan_chart(sim.fan, base), alt="범위")
-    with right, st.container(border=True):
-        st.markdown(f"**{label} 뒤 평가액 분포** · 점선은 지금")
+    with right, st.container(border=True, height="stretch"):
+        headed(
+            f"**{label} 뒤 평가액 분포** · {base}",
+            f"**정의** 기간 끝 모의 평가액의 히스토그램({portfolio.BINS}구간) ·"
+            " 점선: 지금 평가액",
+        )
         st.altair_chart(pf_end_chart(sim.ends, value, base), alt="분포")
-    first = cast("pd.Timestamp", j.window.index[0]).date()
-    last = cast("pd.Timestamp", j.window.index[-1]).date()
-    st.caption(
-        f"평균 수익 0 가정 · 과거 {n}거래일({first}–{last})의 같은 날 수익률을 평균"
-        f" {block}일 묶음으로 재표본(경로 {portfolio.PATHS:,}개) · 지금 비중으로 매일"
-        " 재조정"
-        + (" · FHS: 지금 변동성에서 시작해 장기 수준으로 돌아감" if fhs else "")
-        + " · 예측이 아닙니다"
-    )
 
 
-def pf_recovery(paths: perf.PathRisk) -> None:
-    if paths.never == 0 and paths.recovery_median is None:
-        st.metric("전고점 회복", "지금이 고점", border=True)
-        return
-    middle = paths.recovery_median
-    low, high = paths.recovery_low, paths.recovery_high
-    st.metric(
-        "전고점 회복 (중앙값)",
-        f"{middle}거래일" if middle is not None else "기간 내 미회복",
-        f"10–90%: {low if low is not None else '—'}–"
-        f"{high if high is not None else '기간 밖'}",
-        delta_color="off",
-        delta_arrow="off",
-        help=f"기간 안에 회복하지 못한 경로 {portfolio.percent(paths.never)}",
-        border=True,
+def pf_fhs_note(vol: PfVol) -> str:
+    """How simulated volatility moves under the filter, for the method notes."""
+    f = vol.f
+    head = f"FHS {vol.label}: 지금 변동성 출발"
+    if f.model is not None:
+        return (
+            f"{head} · 처음 {quant.FEEDBACK_DAYS}일 경로별"
+            f" {portfolio.MODEL_NAMES[f.model.kind]} 분산식 갱신 · 그 뒤 기댓값 경로"
+        )
+    if not f.garch.any():
+        return f"{head} · 장기 수준 회귀"
+    rest = "" if f.garch.all() else " · EWMA 종목은 장기 수준 회귀"
+    return (
+        f"{head} · 처음 {quant.FEEDBACK_DAYS}일 경로별 GARCH 분산식 갱신 · 그 뒤"
+        f" 기댓값 경로로 장기 수준 수렴{rest}"
     )
 
 
@@ -2718,9 +4344,19 @@ def pf_tail_table(t: portfolio.Tails, value: float, base: portfolio.Currency) ->
         loss = pf_loss(x)
         return PF_THIN if loss is None else portfolio.percent(loss, dec=2)
 
+    compact = pf_compact(base, value)
+
     def amount(x: float | None) -> str:
         loss = pf_loss(x)
-        return PF_THIN if loss is None else portfolio.money(loss * value, base)
+        return (
+            PF_THIN if loss is None else pf_money(loss * value, base, compact=compact)
+        )
+
+    def span(ci: tuple[float, float] | None) -> str:
+        if ci is None:
+            return PF_DASH
+        high = "∞" if math.isinf(ci[1]) else pct(ci[1])
+        return f"{pct(ci[0])}–{high}"
 
     pf_table(
         {
@@ -2728,133 +4364,218 @@ def pf_tail_table(t: portfolio.Tails, value: float, base: portfolio.Currency) ->
             "신뢰수준": [f"{r.level:.1%}".replace(".0%", "%") for r in t.rows],
             "VaR": [pct(r.var) for r in t.rows],
             f"VaR ({base})": [amount(r.var) for r in t.rows],
+            "VaR 신뢰구간": [span(r.var_ci) for r in t.rows],
             "ES": [pct(r.es) for r in t.rows],
             f"ES ({base})": [amount(r.es) for r in t.rows],
+            "ES 신뢰구간": [span(r.es_ci) for r in t.rows],
         },
         "VaR·ES",
-    )
-    st.caption(
-        "1일 손실 · 최소 표본: 95% 250일, 97.5% 400일, 99% 1,000일 · FHS는 종목마다"
-        " 과거 수익률을 그날 변동성으로 나눈 뒤 지금 변동성을 곱함 · 이익이면 0"
     )
 
 
 def pf_tails(
-    key: Key, j: portfolio.Joint, value: float, base: portfolio.Currency
+    t: portfolio.Tails,
+    j: portfolio.Joint,
+    value: float,
+    base: portfolio.Currency,
 ) -> None:
-    """``key`` stands for ``j``."""
-    t = cached_tails((*key, "tails"), j)
-    head = portfolio.tail_of(t, "역사적", quant.TAIL_LEVEL)
-    es = pf_loss(head.es)
-    with st.container(horizontal=True):
-        st.metric(
-            "ES 97.5% (1일)",
-            portfolio.money(es * value, base) if es is not None else PF_THIN,
-            portfolio.percent(es, dec=2) if es is not None else None,
-            delta_color="off",
-            delta_arrow="off",
-            help=(
-                f"90% 범위 {portfolio.percent(max(t.band[0], 0), dec=2)}–"
-                f"{portfolio.percent(max(t.band[1], 0), dec=2)} (재표본)"
-                if t.band
-                else "역사적 기준, 최악 2.5% 날의 평균 손실"
-            ),
-            border=True,
+    """``t``: ``j``'s tails, below the VaR·ES box."""
+    with st.container(border=True):
+        headed(
+            f"**사후검정** · 95% VaR·ES, 최근 {quant.BACKTEST_DAYS}일"
+            + (f", 직전 {t.lookback:,}일 기준" if t.lookback else ""),
+            f"**정의** 최근 {quant.BACKTEST_DAYS}일 각각의 95% VaR·ES 예측과"
+            " 실제 손실의 비교 · 초과 횟수: 손실 > 그날 VaR인 날 · 기대: 일수 × 5% ·"
+            " Kupiec p: 초과 빈도의 우도비 검정(χ²(1)) · Christoffersen p: 초과의 연속"
+            " 몰림 검정(χ²(1)) · ES Z2: 1 − Σ(초과일 손실 ÷ 그날 ES) ÷ (일수 × 5%),"
+            " Acerbi–Székely(2014) · Z2 p: 단측 · U p: 누적 초과 크기, Du–Escanciano"
+            f"(2017) 양측 · C p: 누적 초과의 1–{quant.DE_LAGS}일 시차 자기상관(같은"
+            " 논문) · 신호등: 초과 횟수의 이항 누적확률"
+            f" {quant.GREEN:.0%} 미만 녹색, {quant.YELLOW:.2%} 미만 황색, 그 이상"
+            " 적색\n\n**해석** p가 작을수록(통상 0.05 미만) 95% 가정과 불일치 · Z2 0"
+            " 미만이면 ES 과소 추정 · 신호등 기준: Basel(250일 99%면 0–4·5–9·10회"
+            " 이상)\n\n**기준** 예측: 직전 선택 기간과 같은 일수(FHS는 그 잔차 × 그날"
+            f" 변동성, EVT는 FHS 예측의 손실 상위 {quant.GPD_SHARE:.0%}를 일반화"
+            " 파레토 분포로 대체), 기간"
+            f" {quant.min_samples(quant.BACKTEST_LEVEL)}일 미만이거나"
+            f" 그만큼 앞선 자료가 없으면 직전 {quant.BACKTEST_DAYS}일 · FHS 필터: 검정"
+            " 기간 전 자료로 추정 · Z2·U·C p: 예측 분포 모의"
+            f" {quant.ES_SIMS:,}회",
+            pf_backtest_notes(t),
         )
-        month = t.month
-        for label, part in (("겹치는 21일", 0), ("√21 환산", 1)):
-            loss = pf_loss(month[part]) if month else None
-            st.metric(
-                f"1개월 VaR 95% · {label}",
-                portfolio.percent(loss) if loss is not None else PF_THIN,
-                border=True,
-            )
-    if month and min(month) > 0 and max(month) / min(month) > portfolio.WIDE_MONTH:
-        st.caption(
-            "1개월 VaR의 두 계산이 크게 다릅니다 · 겹치는 21일은 독립 표본이"
-            f" {t.days // portfolio.MONTH_DAYS}개 남짓이고, √21 환산은 날마다"
-            " 독립이라고 가정합니다"
-        )
-    pf_tail_table(t, value, base)
-    left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown("**사후검정** · 95% VaR, 최근 250일")
         pf_backtest(t)
     if len(j.names) == 1:  # one holding: its ES share is the whole ES
         return
-    with right, st.container(border=True):
-        st.markdown("**종목별 ES 기여** · 97.5%")
-        if t.component is None:
-            st.caption(PF_THIN)
-        else:
+    with st.container(border=True):
+        headed(
+            "**종목별 ES 기여** · 97.5%",
+            "**정의** Tasche 성분 ES · 포트폴리오가 가장 나빴던"
+            f" {1 - quant.TAIL_LEVEL:.1%} 날의 종목별 평균 손실 × 비중 · 합계 ="
+            f" 포트폴리오 ES {quant.TAIL_LEVEL:.1%}\n\n**해석** 클수록 꼬리 손실 기여"
+            " 확대 · 음수면 꼬리 구간 손실 상쇄",
+            []
+            if t.component is not None
+            else [
+                f"**조건** 기간 수익률 {quant.min_samples(quant.TAIL_LEVEL):,}일 이상 ·"
+                f" 현재 {t.days:,}일"
+            ],
+        )
+        if t.component is not None:
             pf_table(
                 {
                     "종목": list(j.names),
                     "ES 기여": [
                         portfolio.percent(float(c), dec=2) for c in t.component
                     ],
-                    f"({base})": [
-                        portfolio.money(float(c) * value, base) for c in t.component
+                    f"ES 기여 ({base})": [
+                        pf_money(
+                            float(c) * value, base, compact=pf_compact(base, value)
+                        )
+                        for c in t.component
                     ],
                 },
                 "종목별 ES",
             )
-            st.caption("포트폴리오가 가장 나빴던 2.5% 날에 각 종목이 낸 평균 손실")
 
 
-PF_LIGHTS: dict[str, tuple[str, Literal["green", "orange", "red"]]] = {
-    "green": ("녹색", "green"),
-    "yellow": ("황색", "orange"),
-    "red": ("적색", "red"),
-}
+PF_LIGHTS: dict[str, str] = {"green": "녹색", "yellow": "황색", "red": "적색"}
+
+
+def pf_backtest_notes(t: portfolio.Tails) -> list[str]:
+    if not t.backtests:
+        return [f"**조건** 전체 기간 수익률 500일 이상 · 현재 {t.history:,}일"]
+    if t.backtests.get("FHS") and not t.backtests.get("EVT"):
+        days = quant.MIN_EXCESSES / quant.GPD_SHARE
+        return [
+            f"**조건** EVT: 예측 기준 일수 {days:,.0f}일 이상 · 현재 {t.lookback:,}일"
+        ]
+    return []
 
 
 def pf_backtest(t: portfolio.Tails) -> None:
-    bt = t.backtest
-    if bt is None:
-        st.caption(f"{PF_THIN} (전체 기간 수익률 {t.history}일, 500일 이상 필요)")
+    if not t.backtests:
         return
-    name, color = PF_LIGHTS[bt.light]
-    with st.container(horizontal=True, vertical_alignment="center"):
-        st.metric("초과 횟수", f"{bt.exceptions}회", f"기대 {bt.expected:.1f}회",
-                  delta_color="off", delta_arrow="off", border=True)  # fmt: skip
-        st.metric("Kupiec p", f"{bt.kupiec:.2f}", border=True)
-        st.metric("Christoffersen p", f"{bt.christoffersen:.2f}", border=True)
-        st.badge(f"신호등 {name}", color=color)
-    st.caption(
-        "최근 250일 중 직전 250일로 구한 VaR보다 손실이 컸던 날 · p가 작으면 초과 빈도"
-        "(Kupiec)나 몰림(Christoffersen)이 95% 가정과 맞지 않는다는 뜻"
+    rows = list(t.backtests.items())
+
+    def cells(show: Callable[[quant.Backtest], str]) -> list[str]:
+        return [PF_THIN if bt is None else show(bt) for _, bt in rows]
+
+    pf_table(
+        {
+            "방법": [method for method, _ in rows],
+            "초과 횟수": cells(lambda bt: f"{bt.exceptions}회"),
+            "기대": cells(lambda bt: f"{bt.expected:.1f}회"),
+            "Kupiec p": cells(lambda bt: f"{bt.kupiec:.2f}"),
+            "Christoffersen p": cells(lambda bt: f"{bt.christoffersen:.2f}"),
+            "ES Z2": cells(lambda bt: pf_ratio(bt.z2)),
+            "Z2 p": cells(lambda bt: f"{bt.es:.2f}"),
+            "U p": cells(lambda bt: f"{bt.de_u:.2f}"),
+            "C p": cells(lambda bt: f"{bt.de_c:.2f}"),
+            "신호등": cells(lambda bt: PF_LIGHTS[bt.light]),
+        },
+        "사후검정",
     )
 
 
-def pf_risk(s: Subject, prices: portfolio.Prices, months: int) -> None:
+def pf_risk_inputs(
+    s: Subject, prices: portfolio.Prices, months: int
+) -> tuple[Key, portfolio.Joint, float, list[str]] | None:
+    """The tail and outlook sections' joint returns (cached).
+
+    Last, the "!" lines for the section's first heading.
+    """
     j, share, dropped = pf_joint(s, prices, months)
     if j is None:
         st.info("가격이 확인된 보유 종목이 없습니다.")
-        return
+        return None
     value = s.value * share
-    st.caption(
-        f"과거 일간 수익률을 바탕으로 한 모의 결과이며 예측이 아닙니다 · 지금 비중,"
-        f" {len(j.window)}일"
-    )
-    for note in s.notes:
-        st.caption(note)
-    pf_dropped(dropped)
-    if j.late:
-        st.caption(f"자료 시작이 늦어 모든 종목에 값이 있는 날만 씀: {j.late}")
     if len(j.window) < portfolio.MIN_DAYS:
         st.info(f"모든 보유 종목의 수익률이 있는 날이 {len(j.window)}일뿐입니다.")
-        return
+        return None
     key = (*s.key, months)
-    pf_paths(key, j, value, s.base, s.rets)
-    st.markdown("**VaR·ES** · 지금 비중, 1일")
-    pf_tails(key, j, value, s.base)
+    return key, j, value, pf_gaps(dropped, j.late)
+
+
+def pf_tail(
+    s: Subject, prices: portfolio.Prices, months: int, row: DeltaGenerator
+) -> None:
+    """``row``: the 추정 기간 row, which the 변동성 모델 control joins."""
+    found = pf_risk_inputs(s, prices, months)
+    if found is None:
+        return
+    key, j, value, warns = found
+    with row:
+        vol = pf_vol(key, s, prices, j, inline=True)
+    f = vol.f
+    t = cached_tails((*key, "tails", *vol.key), j, vol.f, vol.v)
+    excesses = quant.MIN_EXCESSES / quant.GPD_SHARE
+    with st.container(border=True):
+        headed(
+            "**VaR·ES** · 지금 비중, 1일",
+            "**정의** 지금 비중 포트폴리오의 1일 손실 · VaR: 손실 상위 n × (1 −"
+            " 신뢰수준)번째 값 · ES: 그 상위 손실의 평균(경계값 비례 반영) · 역사적:"
+            " 기간 수익률 그대로 · FHS: 종목마다 과거 수익률 ÷ 그날 변동성 × 지금"
+            f" 변동성 · EVT: FHS 손실 상위 {quant.GPD_SHARE:.0%}에 일반화 파레토 분포"
+            " 적합 뒤 그 너머 외삽(McNeil–Frey 2000)\n\n**해석** VaR: 신뢰수준만큼의"
+            " 날에 넘지 않는 손실 · ES: VaR 너머 손실의 평균 · 신뢰구간: 추정의"
+            f" {quant.CI_LEVEL:.0%} 범위, 위 끝 ∞는 자료로 상한 미정(EVT) · 이익이면"
+            f" 0\n\n**기준** 최소 표본: VaR 너머 날 {quant.MIN_TAIL}일 이상("
+            + ", ".join(
+                f"{level:.1%}".replace(".0%", "%") + f" {quant.min_samples(level):,}일"
+                for level in portfolio.VAR_LEVELS
+            )
+            + f"), EVT는 상위 {quant.GPD_SHARE:.0%} 손실 {quant.MIN_EXCESSES}일 이상"
+            f"({excesses:,.0f}일) · 변동성 필터 {vol.label}(최근"
+            f" {len(f.z):,}거래일로 추정) · 신뢰구간: 역사적·FHS는 정상 블록"
+            " 부트스트랩(Politis–Romano 1994, 평균 블록 Politis–White 2004)"
+            f" {quant.BOOT_PATHS:,}회의 백분위, EVT는 프로파일 우도"
+            "(McNeil–Frey–Embrechts 2015), 임계값 초과 손실 비율의 이항 불확실성"
+            " 포함, 지금 변동성은 주어진 값"
+            + "".join(f" · {note}" for note in s.notes),
+            warns,
+        )
+        pf_tail_table(t, value, s.base)
+    pf_tails(t, j, value, s.base)
+
+
+def pf_outlook(s: Subject, prices: portfolio.Prices, months: int) -> None:
+    found = pf_risk_inputs(s, prices, months)
+    if found is None:
+        return
+    key, j, value, warns = found
+    gens = pf_gens(j, s.base, prices.adjusted)
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        gen = pf_generator_controls(gens)
+        fhs = gen is None and st.toggle(
+            "현재 변동성 반영 (FHS)",
+            key="pf_fhs",
+            persist_state="page",  # kept while a generator hides it
+            help="**정의** 필터 잔차 재표본(Filtered Historical Simulation) ·"
+            " 오늘 변동성에서 시작하는 경로\n\n**해석** 끄면 과거 수익률 묶음"
+            " 재표본 · 켜면 지금 변동성 수준 반영\n\n**기준** 필터: 옆 변동성 모델"
+            " · 재표본 전용",
+        )
+        # the filter only for FHS, its controls next to the toggle
+        vol = pf_vol(key, s, prices, j, inline=True) if fhs else None
+        pf_blocked_generators(gens)
+    pf_paths(key, j, value, s, vol, gen, gens.adjusted, warns)
+    if gen is not None:  # a generator drew the paths: no density check
+        return
+    f = None if vol is None else vol.f
+    chosen = ("resample",) if vol is None else ("fhs", *vol.key)
+    with st.container(border=True):
+        pf_density(cached_density((*key, "density", *chosen), j, f), fhs=fhs)
 
 
 # ---- stress
 
 
-def pf_scenario_table(rows: list[portfolio.Replayed], base: portfolio.Currency) -> None:
+def pf_scenario_table(
+    rows: list[portfolio.Replayed], base: portfolio.Currency, value: float
+) -> None:
+    """``value``: the holdings' worth, which decides B/M amounts."""
+    compact = pf_compact(base, value)
+
     def note(r: portfolio.Replayed) -> str:
         parts: list[str] = []
         if r.window is None:
@@ -2866,7 +4587,8 @@ def pf_scenario_table(rows: list[portfolio.Replayed], base: portfolio.Currency) 
         if r.proxied:
             more = len(r.proxied) - 3
             named = [
-                f"{t} β{b:.2f}" for t, b in zip(r.proxied, r.proxy_betas, strict=False)
+                f"{t} β{pf_ratio(b)}"
+                for t, b in zip(r.proxied, r.proxy_betas, strict=False)
             ] or list(r.proxied)
             shown = ", ".join(named[:3]) + (f" 외 {more}종목" if more > 0 else "")
             parts.append(f"지수×베타로 대체: {shown}")
@@ -2878,12 +4600,12 @@ def pf_scenario_table(rows: list[portfolio.Replayed], base: portfolio.Currency) 
             "구간": [
                 f"{r.window[0]} → {r.window[1]}" if r.window else PF_DASH for r in rows
             ],
-            "구간 끝": [portfolio.percent(r.change, signed=True) for r in rows],
-            "최악": [portfolio.percent(r.worst, signed=True) for r in rows],
-            "환율 몫": [portfolio.points(r.fx) for r in rows],
-            f"평가액 변화 ({base})": [
-                portfolio.money(r.pnl, base, signed=True) for r in rows
+            "최대 하락": [portfolio.percent(r.worst, signed=True) for r in rows],
+            f"최대 하락 ({base})": [
+                pf_money(r.pnl, base, compact=compact, signed=True) for r in rows
             ],
+            "구간 끝": [portfolio.percent(r.change, signed=True) for r in rows],
+            "환율 배율": [portfolio.percent(r.fx, signed=True) for r in rows],
             portfolio.BENCHMARK_LABEL: [
                 portfolio.percent(r.sp500, signed=True) for r in rows
             ],
@@ -2915,47 +4637,71 @@ def pf_shocks(
         ]
         return ", ".join(parts)
 
-    pf_table(
-        {
-            "충격": [s.name for s, _ in rows],
-            "가정": [moves(s) for s, _ in rows],
-            holding: [portfolio.percent(v, signed=True) for _, v in rows],
-            f"평가액 변화 ({base})": [
-                portfolio.money(v * total, base, signed=True) for _, v in rows
-            ],
-        },
-        "가상 충격",
-    )
+    compact = pf_compact(base, total)
+    with st.container(border=True):
+        headed(
+            f"**가상 충격** · {holding}",
+            "**정의** 지수·환율 가상 충격 시 보유분 평가액 변화 · 종목 등락 = 자기"
+            " 지수(한국 KOSPI, 그 밖 S&P 500) 등락 × 현지 통화 베타, 그 뒤 환율"
+            " 반영\n\n**기준** 베타: Welch, 1 쪽으로"
+            f" {quant.BETA_PRIOR_DAYS}/(n + {quant.BETA_PRIOR_DAYS}) 축소(n: Welch"
+            " 가중치의 유효 표본 수 (Σw)²/Σw², 6M 약 117·1Y 약 193·3Y 약 255일) · "
+            + PF_DECAY_NOTE,
+        )
+        pf_table(
+            {
+                "충격": [s.name for s, _ in rows],
+                "가정": [moves(s) for s, _ in rows],
+                holding: [portfolio.percent(v, signed=True) for _, v in rows],
+                f"평가액 변화 ({base})": [
+                    pf_money(v * total, base, compact=compact, signed=True)
+                    for _, v in rows
+                ],
+            },
+            "가상 충격",
+        )
     fall = portfolio.reverse(values, betas)
-    st.metric(
-        f"−{portfolio.REVERSE_LOSS:.0%} 손실에 필요한 지수 하락폭",
-        portfolio.percent(fall) if fall is not None else "−100%에서도 미도달",
-        help="KOSPI와 S&P 500이 같은 폭으로 떨어지고 환율은 그대로라고 볼 때",
-        border=True,
-    )
-    st.caption(
-        "종목마다 자기 지수(한국 KOSPI, 그 밖 S&P 500)에 대한 현지 통화 베타(Welch)를"
-        " 1 쪽으로 n/(n+250)만큼 당겨 씀 · 지수 등락 × 베타 뒤 환율 반영"
-    )
+    with st.container(horizontal=True, key="pf_reverse_cards"):  # outside the box
+        st.metric(
+            f"−{portfolio.REVERSE_LOSS:.0%} 손실에 필요한 지수 하락폭",
+            portfolio.percent(fall) if fall is not None else "−100%에서도 미도달",
+            help="**정의** KOSPI·S&P 500 동일 폭 하락 시 보유분"
+            f" −{portfolio.REVERSE_LOSS:.0%} 손실에 필요한 지수 하락폭 · 종목 등락 ="
+            " 지수 등락 × 베타\n\n**해석** 절댓값이 작을수록 지수 하락에 민감한"
+            " 보유분\n\n**기준** 환율 고정 · 베타: 가상 충격과 같은 값",
+            border=True,
+            height="stretch",
+        )
 
 
 def pf_turbulence(s: Subject, prices: portfolio.Prices, names: tuple[str, ...]) -> None:
     now = cached_turbulence((*s.key, "turbulence"), s.base, names, prices.adjusted)
     if now is None:
-        st.caption(
-            f"보유 종목이 둘 이상이고 모두 값이 있는 주가 {portfolio.WEEKS}주를 넘어야"
-            " 합니다."
+        headed(
+            "**이번 주 이례 정도** · 보유 종목 주간 수익률",
+            "**정의** 보유 종목 주간 수익률의 Mahalanobis 거리 ÷ 종목"
+            " 수(Kritzman–Li 2010)",
+            [
+                f"**조건** 보유 종목 2개 이상 · 모두 값이 있는 주 {portfolio.WEEKS}주"
+                f" 초과 · 현재 {len(names)}종목"
+            ],
         )
         return
-    with st.container(horizontal=True):
+    with st.container(horizontal=True, key="pf_turbulence_cards"):
         st.metric(
             "이번 주 이례 정도",
             f"{now.level:.2f}",
             f"과거 {now.weeks:,}주 중 {portfolio.percent(now.rank, dec=0)} 수준 이하",
             delta_color="off",
             delta_arrow="off",
-            help="1이면 평소 수준",
+            help="**정의** 보유 종목 주간 수익률의 Mahalanobis 거리 ÷ 종목"
+            " 수(Kritzman–Li 2010) · 평균·공분산: 직전"
+            f" {portfolio.WEEKS}주(Ledoit–Wolf 축소),"
+            f" {portfolio.TURBULENCE_REFIT}주마다 재추정\n\n**해석** 1이면 평소"
+            " 수준 · 클수록 이례적인 주간 움직임 · 아래"
+            f" 값: 과거 주 중 이하 비율\n\n**기준** {now.week} 주 · 진행 중인 주 포함",
             border=True,
+            height="stretch",
         )
         st.metric(
             "상관 이례도",
@@ -2965,13 +4711,12 @@ def pf_turbulence(s: Subject, prices: portfolio.Prices, names: tuple[str, ...]) 
             else None,
             delta_color="off",
             delta_arrow="off",
-            help="종목끼리 함께 움직이는 방식이 평소와 다른 정도 (1이면 평소)",
+            help="**정의** 이례 정도 ÷ 상관 무시(대각 공분산) 부분 · 종목 간 상관"
+            " 구조만의 이례 정도\n\n**해석** 1이면 평소 상관 · 1 초과면 평소와 다른"
+            " 동조 방식 · 아래 값: 과거 주 중 백분위",
             border=True,
+            height="stretch",
         )
-    st.caption(
-        f"{now.week} 주 · 보유 종목 주간 수익률을 직전 {portfolio.WEEKS}주의 평균·"
-        "공분산과 견준 거리 (Kritzman–Li) · 과거 기준의 설명이며 앞날을 말하지 않습니다"
-    )
 
 
 def pf_stress_section(s: Subject, prices: portfolio.Prices, months: int) -> None:
@@ -2981,32 +4726,38 @@ def pf_stress_section(s: Subject, prices: portfolio.Prices, months: int) -> None
         return
     older = pf_dashboard_series(PF_DEXKOUS)
     fx = portfolio.long_fx(prices.adjusted, older)
-    st.markdown(f"**과거 구간 재현** · {s.holding} · 각 구간 첫날부터 그대로 보유")
-    for note in s.notes:
-        st.caption(note)
     key = (*s.key, "replay", len(older))
     rows = cached_replays(key, s.base, values, prices.adjusted, fx)
-    pf_scenario_table(rows, s.base)
     notes = [
-        "구간: 지수마다 적힌 고점·저점 ±90일에서 찾은 고점 중 이른 날 → 저점 중"
-        " 늦은 날 · 최악: 구간 안 고점 대비 가장 깊은 하락 · 환율 몫:"
-        " (1+구간 끝)/(1+현지 통화 기준) − 1"
+        "지수×베타: 첫날 가격 없는 종목(구간 안 상장 포함)은 구간 내내 지수 등락 ×"
+        " 베타, 환율은 종목 자신의 통화 · " + PF_PROXY_NOTE
     ]
     if any(r.window is None for r in rows):
         notes.append(
-            "지수 자료 없음: 가격 갱신 때 1987년부터의 지수·환율 이력을 한 번 받음"
+            f"지수 자료 없음: 가격 갱신 때 {portfolio.LONG_START.year}년부터의"
+            " 지수·환율 이력 1회 수신"
         )
     if any(r.no_fx for r in rows):
         notes.append("환율 미반영: 2003년 이전 원/달러는 FRED DEXKOUS(키 필요)")
-    st.caption(" · ".join(notes))
+    notes.extend(s.notes)
     names = tuple(portfolio.labels(pd.Series(values)))
     bad = cached_bad_prints((*s.key, "bad"), names, prices.adjusted)
-    if bad:
-        listed = ", ".join(
-            f"{t} ({', '.join(str(d) for d in days[:3])})" for t, days in bad.items()
+    listed = ", ".join(
+        f"{t} ({', '.join(str(d) for d in days[:3])})" for t, days in bad.items()
+    )
+    with st.container(border=True):
+        headed(
+            f"**과거 구간 재현** · {s.holding}",
+            "**정의** 지금 보유분을 과거 위기 구간 첫날부터 그대로 보유한 결과 ·"
+            f" 구간: 지수별 기록 고점·저점 ±{quant.SEARCH_DAYS}일 안에서 찾은 고점 중"
+            " 이른 날 → 저점 중 늦은 날\n\n**해석** 최대 하락: 구간 안 고점 대비 가장"
+            " 깊은 하락, 금액은 지금 평가액 × 그 비율 · 구간 끝: 첫날 대비 마지막"
+            " 날(반등 시 최대 하락보다 작은 값) · 환율 배율: (1 + 구간 끝)/(1 + 현지"
+            " 통화 기준) − 1, 곱해지는 몫 · S&P 500·KOSPI: 같은 구간 지수 자체"
+            " 등락(현지 통화)\n\n**기준** " + " · ".join(notes),
+            [f"**자료** 튄 뒤 바로 돌아온 가격 · {listed}"] if bad else [],
         )
-        st.caption(f"튀었다 바로 돌아온 가격 (계산에 그대로 포함): {listed}")
-    st.markdown(f"**가상 충격** · {s.holding}")
+        pf_scenario_table(rows, s.base, s.value)
     betas = cached_betas((*s.key, "betas"), months, names, prices.adjusted)
     pf_shocks(
         pd.Series(values, dtype="float64").reindex(list(names)),
@@ -3023,93 +4774,22 @@ def pf_stress_section(s: Subject, prices: portfolio.Prices, months: int) -> None
             pf_turbulence(s, prices, tuple(portfolio.labels(long)))
 
 
-# ---- method
-
-
-def pf_method(p: portfolio.Portfolio, prices: portfolio.Prices, window: str) -> None:
-    rate, day = portfolio.last_close(prices.close, portfolio.FX)
-    fx = f"₩{rate:,.2f} ({day})" if day else portfolio.UNKNOWN
-    base, fill = p.base, portfolio.FILL_LIMIT
-    paths, seed = portfolio.PATHS, portfolio.SEED
-    lines = (
-        f"기준통화 {base} · 환율 {portfolio.FX} 최근 {fx} · 외화 거래는 거래일 환율",
-        "원가: 이동평균법. 매수 수수료는 원가에 더하고 매도 수수료는 매도금액에서 뺌",
-        "평가·손익: 입력한 거래가격과 종가(분할 반영, 배당 미반영). 종가일이 오늘이면"
-        " 장중 시세일 수 있음",
-        "총수익률 = 총손익 ÷ 누적 매수금액(수수료 포함) · TWR·MWR(XIRR)은 기간이"
-        " 1년 미만이면 연환산하지 않고 기간 수익률",
-        "TWR: 같은 날 매수·매도는 상계합니다. 순유입은 그날 시작부터, 순유출은"
-        " 그날 끝에 반영합니다. 일간 수익률을 이어 붙임 (배당 제외)",
-        "벤치마크: 배당 제외 가격지수(S&P 500, KOSPI)를 기준통화로 환산. 혼합"
-        " 벤치마크는 전날 종가의 한국·미국 비중으로 두 지수를 섞음",
-        "환율 효과: 보유분의 종가 수익률을 현지·환율·교차항으로 나눔"
-        " ((1+기준) = (1+현지)(1+환율), 교차항 = 현지 × 환율)",
-        "타이밍 차이 = MWR − TWR · 무매매: 첫 거래일 보유 수량을 그대로 두고 이후"
-        " 매수·매도 금액만큼 그 구성을 사고판 경우 · 매매 효과 = 실제 MWR − 무매매"
-        " MWR. 운과 시점이 섞인 값",
-        "보유일: 수량이 0에서 다시 산 첫 매수일부터",
-        f"위험 지표·상관·시뮬레이션: 수정 종가(배당·분할 반영) 일간 수익률, {window},"
-        f" 연 {portfolio.TRADING_DAYS}거래일",
-        "무위험수익률: 원화는 CD 91일(한국은행 ECOS), 달러는 미국 3개월 국채(^IRX)."
-        " 자료가 없으면(데모, 키 없음) 0 · 첫 금리 전의 날은 뺌",
-        f"샤프 지수 95% 신뢰구간(Mertens 2002 표준오차), PSR·MinTRL(Bailey–López de"
-        f" Prado 2012, 왜도·첨도 반영): {perf.MIN_OBS}일 미만은 {PF_SHORT} ·"
-        " 소르티노는 모든 날의 하방편차 · 칼마·UPI는 1년 이상 · CDaR 95%: 가장 깊은"
-        " 5% 낙폭의 평균 · 추적오차·정보비율: 혼합 벤치마크 대비",
-        f"휴장일 정렬에만 직전 종가를 최대 {fill}행 이어 씀. 더 긴 공백은 미확인",
-        "상관: 모든 보유 종목 값이 있는 날. 한국 종가는 같은 날 미국 개장 전이라"
-        " 한국 종목과 전날 미국 종목의 공분산을 더하고(행렬이 성립하는 만큼),"
-        " Ledoit–Wolf 2004 상수상관 축소 · 포트폴리오끼리는 지금 비중의 일간"
-        " 수익률(기간 중 자료가 시작하거나 끝난 종목은 빼고 재조정)로 같은 방법,"
-        " 한국 비중이 절반을 넘는 포트폴리오는 한국 종가로 봄",
-        "베타: Welch(하루 수익률을 지수의 −2~4배로 제한, 최근 날 가중), 한국 종목은"
-        " Dimson 1979(같은 날 + 전날 S&P 500)와 KOSPI 베타도 · 분산: 오일러 위험"
-        " 기여, 분산 비율, 유효 종목 수(1/HHI)",
-        f"몬테카를로: Politis–Romano 1994 정상 부트스트랩. 같은 날의 종목 수익률을"
-        f" 함께, 평균 n^(1/3)일 묶음(5~20일, 한국·미국 혼합은 10일 이상, n/10 이하)."
-        f" 경로 {paths:,}개, 시드 {seed}, 평균 수익 0, 지금 비중으로 매일 재조정 ·"
-        " FHS: EWMA(λ 0.94)로 나눈 잔차에 지금 변동성을 곱하고 하루 0.985씩 장기"
-        " 수준으로 돌아감 · 낙폭·회복은 기간 안에서",
-        "VaR·ES: 역사적·FHS, 95%·97.5%·99%, 최소 250·400·1,000일(아니면 표본"
-        " 부족) · ES 97.5% 범위는 부트스트랩 1,000회의 5–95% · 1개월 VaR은 겹치는"
-        " 21일과 √21 환산 둘 다 · 종목별 ES 기여(Tasche) · 이익이면 0",
-        "사후검정: 최근 250일, 날마다 직전 250일의 역사적 95% VaR과 비교."
-        " Kupiec 1995, Christoffersen 1998, Basel 신호등(이항 누적확률 95%·99.99%"
-        " 기준) · 전체 수익률 500일 미만은 표본 부족",
-        "스트레스: 지수마다 적힌 고점·저점 ±90일에서 찾아 이른 고점 → 늦은 저점."
-        " 지금 보유분을 첫날부터 보유해 구간 끝과 최악(구간 안 최대 낙폭), 환율 몫을"
-        " 계산. 구간 자료가 없는 종목은 KOSPI(한국) 또는 S&P 500(그 밖, 1987은"
-        " 모두)의 일간 등락 × 베타로 대신함. 베타는 그 종목의 저장된 전체 기간에서"
-        " 같은 시장 지수엔 Welch, 한국 종목을 S&P 500으로 대신할 땐 Dimson으로 구해"
-        " n/(n+250)만큼 1 쪽으로 당김,"
-        f" 겹치는 날이 {portfolio.PROXY_MIN_DAYS}일 미만이면 1 · 지수·환율은"
-        " 1987년부터(KOSPI는 Yahoo 자료가 있는 때부터) 한 번 받아 둠 · 2003년 12월"
-        " 이전 원/달러는 FRED DEXKOUS, 키가 없으면 환율 미반영 · 튀었다 바로"
-        " 돌아온 가격은 표시만 하고 그대로 씀",
-        "가상 충격: 종목마다 자기 지수에 대한 현지 통화 Welch 베타를 n/(n+250)만큼"
-        " 1 쪽으로 당겨 지수 충격에 곱하고 환율 반영 · 역스트레스: 모든 지수가 같은"
-        " 폭으로 떨어질 때 −30%가 되는 폭",
-        f"난기류: 주간 수익률, 직전 {portfolio.WEEKS}주 평균·공분산(Ledoit–Wolf,"
-        f" {portfolio.TURBULENCE_REFIT}주마다 재추정)과의 마할라노비스 거리"
-        " (Kritzman–Li 2010) · 상관 이례도 = 거리 ÷ 상관을 무시한 거리",
-        f"스타일: 수익률 기반 스타일 분석(Sharpe 1992), 최근 {portfolio.WEEKS}주"
-        f" {base} 주간 수익률, 비교 지수 {', '.join(portfolio.STYLE_PROXIES)}와 현금,"
-        " 비중 0 이상·합 1 · 기간을 못 채운 지수는 뺌 · 비교 지수는 버튼을 눌러야"
-        " 받음",
-    )
-    with st.expander("방법·가정", icon=":material/info:"):
-        st.markdown("\n".join(f"- {line}" for line in lines))
-
-
 # ---- one stock, and adding it to a portfolio
 
 STOCK_SECTIONS = {
     "analysis": "위험지표",
-    "risk": "시뮬레이션·VaR",
+    "tail": "꼬리위험",
+    "outlook": "전망",
     "stress": "스트레스",
-    "whatif": "넣으면 어떻게 되나",
+    "whatif": "편입 효과",
 }
-STOCK_INDICES = (portfolio.FX, portfolio.BENCHMARK, portfolio.KOSPI, portfolio.RF_USD)
+STOCK_INDICES = (
+    portfolio.FX,
+    portfolio.BENCHMARK,
+    portfolio.TOTAL_RETURN,
+    portfolio.KOSPI,
+    portfolio.RF_USD,
+)
 WHATIF_PERCENT = (1, 30, 5)  # slider: least, most, first shown
 
 
@@ -3117,7 +4797,6 @@ def stock_choose(ticker: str) -> None:
     state.stock_error = ""
     if ticker != state.get("stock_ticker"):
         state.stock_ticker = ticker
-        state.stock_base = portfolio.currency(ticker)
 
 
 def stock_enter() -> None:
@@ -3131,6 +4810,7 @@ def stock_enter() -> None:
         state.stock_error = str(error)
         return
     state.stock_held = None
+    state.stock_retry = True
     stock_choose(ticker)
 
 
@@ -3154,17 +4834,29 @@ def stock_owned(book: portfolio.Book, prices: portfolio.Prices) -> list[str]:
 
 
 def stock_fetch(
-    fetcher: portfolio.Fetcher, ticker: str, prices: portfolio.Prices
+    fetcher: portfolio.Fetcher,
+    ticker: str,
+    prices: portfolio.Prices,
+    *,
+    retry: bool,
 ) -> None:
-    """A ticker without saved prices, with the indices, fetched once; then rerun."""
+    """A ticker without saved prices, with the indices, fetched once; then rerun.
+
+    ``retry``: 분석 was pressed, so a ticker an earlier fetch missed is tried again.
+    """
     todo = fetcher.untried([ticker, *STOCK_INDICES], prices.tickers)
+    if retry and ticker not in todo:
+        todo = [ticker, *todo]
     if ticker not in todo:
         return
     with st.spinner(f"{ticker} 가격 받는 중…"):
         try:
-            fetcher.fetch_now(todo)
+            saved = fetcher.fetch_now(todo)
         except Exception as error:  # noqa: BLE001 - shown on the page
             state.stock_error = f"가격을 받지 못했습니다: {type(error).__name__}"
+        else:
+            if ticker not in saved.tickers:
+                state.stock_error = f"{ticker} 가격을 받지 못했습니다."
     st.rerun()
 
 
@@ -3183,7 +4875,7 @@ def stock_subject(
     """The stock alone: weight 1, amounts for one share."""
     rets = portfolio.asset_returns(prices.adjusted, [ticker], base)
     value = stock_share(ticker, base, prices)
-    index = portfolio.stand_in(ticker)
+    index = portfolio.benchmark_of(ticker)
     return Subject(
         key=pf_key("stock", ticker, base),
         label=ticker,
@@ -3203,9 +4895,18 @@ def stock_betas(s: Subject, prices: portfolio.Prices, months: int) -> None:
     j, _, _ = pf_joint(s, prices, months)
     if j is None or len(j.window) < portfolio.MIN_DAYS:
         return
-    with st.container(border=True):
-        st.markdown(f"**베타** · {s.base} 일간 수익률")
-        pf_betas(portfolio.betas(j)[:1])
+    b = portfolio.betas(j)[0]
+    left, _ = st.columns(2)
+    with left, st.container(border=True):
+        headed(f"**베타** · {s.base} 일간 수익률", PF_BETA_HELP)
+        pf_table(
+            {
+                f"{portfolio.BENCHMARK_LABEL} (Welch)": [pf_ratio(b.welch)],
+                "Dimson": [pf_ratio(b.dimson) if math.isfinite(b.dimson) else PF_DASH],
+                "KOSPI": [pf_ratio(b.kospi) if math.isfinite(b.kospi) else PF_DASH],
+            },
+            "베타",
+        )
 
 
 def stock_change(before: float, after: float, text: Callable[[float], str]) -> str:
@@ -3236,32 +4937,46 @@ def whatif_metric(
         delta_arrow="off",
         help=tip,
         border=True,
+        height="stretch",
     )
 
 
 def whatif_risk(a: portfolio.Added, ticker: str) -> None:
     vol, beta, ratio, es = a.vol, a.beta, a.ratio, a.es
-    with st.container(horizontal=True):
+    with st.container(horizontal=True, key="pf_whatif_cards"):
         whatif_metric(
-            "연 변동성", vol, portfolio.percent, portfolio.points(vol[1] - vol[0])
+            "연 변동성",
+            vol,
+            portfolio.percent,
+            portfolio.points(vol[1] - vol[0]),
+            "**정의** 지금 비중 → 추가 후 비중의 연 변동성 · √(w′Σw × 연간 관측일"
+            " 수)\n\n**기준** " + PF_COV_NOTE,
         )
         whatif_metric(
             "베타",
             beta,
             pf_ratio,
             stock_signed(beta[1] - beta[0]),
-            f"{portfolio.BENCHMARK_LABEL} 대비, 한국 종목은 Dimson",
+            "**정의** 비중 가중 베타 Σ w × β · β:"
+            f" {portfolio.BENCHMARK_LABEL} 가격지수 대비, 한국 종목은 Dimson, 그 밖"
+            " Welch\n\n**해석** 1 초과 지수보다 큰 변동\n\n**기준** " + PF_DECAY_NOTE,
         )
         whatif_metric(
             "분산 비율",
             ratio,
             pf_ratio,
             stock_signed(ratio[1] - ratio[0]),
-            "종목 변동성의 가중합 ÷ 포트폴리오 변동성",
+            "**정의** Σ 비중 × 종목 변동성 ÷ 포트폴리오 변동성\n\n**해석** 높을수록"
+            " 분산 효과 확대 · 1이면 분산 효과 없음\n\n**기준** " + PF_COV_NOTE,
         )
         if es is None:
             st.metric(
-                "ES 97.5% (1일)", PF_THIN, help="400일 이상 (기간 3Y)", border=True
+                "ES 97.5% (1일)",
+                PF_THIN,
+                help=f"**정의** 1일 ES {quant.TAIL_LEVEL:.1%}\n\n**기준**"
+                f" {quant.min_samples(quant.TAIL_LEVEL):,}일 이상(기간 3Y)",
+                border=True,
+                height="stretch",
             )
         else:
             whatif_metric(
@@ -3269,18 +4984,31 @@ def whatif_risk(a: portfolio.Added, ticker: str) -> None:
                 es,
                 stock_es,
                 portfolio.points(es[1] - es[0]),
-                "가장 나쁜 2.5% 날의 평균 손실 · 변화는 증분 ES",
+                f"**정의** 1일 ES {quant.TAIL_LEVEL:.1%}: 기간 중 가장 나쁜"
+                f" {1 - quant.TAIL_LEVEL:.1%} 날의 평균 손실 · 아래 값: 증분 ES(같은 날"
+                " 수익률로 전체 재평가)\n\n**해석** 증분 ES 음수면 꼬리 손실 완화",
             )
         st.metric(
             f"추가 후 ES 중 {ticker} 몫",
             portfolio.percent(a.es_share) if a.es_share is not None else PF_THIN,
-            help="포트폴리오가 가장 나빴던 2.5% 날의 손실 중 이 종목 몫 (Tasche)",
+            help="**정의** 추가 후 포트폴리오가 가장 나빴던"
+            f" {1 - quant.TAIL_LEVEL:.1%} 날의 손실 중 이 종목 몫 · Tasche 성분 ES ÷"
+            " ES\n\n**해석** 추가 비중보다 크면 꼬리 손실 집중",
             border=True,
+            height="stretch",
         )
-    st.markdown(
-        f"이 종목과 포트폴리오 상관이 **{a.threshold:.2f}**보다 낮으면 변동성이"
-        f" 줄어듭니다 · 지금 상관 {a.correlation:.2f} (조금 더할 때 기준)"
-    )
+        st.metric(
+            "포트폴리오와 상관",
+            pf_ratio(a.correlation),
+            f"기준 {pf_ratio(a.threshold)}",
+            delta_color="off",
+            delta_arrow="off",
+            help="**정의** 후보 종목과 지금 포트폴리오 일간 수익률의 상관계수 · 기준:"
+            " 포트폴리오 변동성 ÷ 후보 변동성\n\n**해석** 기준보다 낮으면 소량 추가 시"
+            " 변동성 감소 · 높으면 증가\n\n**기준** " + PF_COV_NOTE,
+            border=True,
+            height="stretch",
+        )
 
 
 def whatif_paths(
@@ -3303,16 +5031,24 @@ def whatif_paths(
         _picks=picks,
         _w=portfolio.mixed_in(j, ticker, fraction),
     )
-    ten = portfolio.LOSS_LEVELS[0]
+    ten = perf.PATH_LEVELS[0]
+    falls = (before.paths.falls, after.paths.falls)
     pairs = [
-        (f"{label} 뒤 10% 이상 손실 경로 비율", before.losses[ten], after.losses[ten]),
+        (f"{label} 뒤 10% 이상 손실 경로 비율", falls[0][ten].end, falls[1][ten].end),
         *(
-            (f"기간 중 −{level:.0%} 낙폭", odds, after.paths.drawdown_odds[level])
-            for level, odds in before.paths.drawdown_odds.items()
+            (f"기간 중 −{level:.0%} 낙폭", reach.swing, falls[1][level].swing)
+            for level, reach in falls[0].items()
         ),
     ]
     mid = (before.fan[-1]["p50"] - 1, after.fan[-1]["p50"] - 1)
-    with st.container(horizontal=True):
+    headed(
+        f"**몬테카를로** · {label}",
+        "**정의** 추가 전 → 후 모의 경로 지표 · 손실 경로 비율 · 기간 중 낙폭"
+        " 경로 비율 · 기간 끝 중앙값 수익률\n\n**기준** 평균 수익 0 가정 · 추가 전후"
+        f" 같은 재표본 경로 {portfolio.PATHS:,}개, 평균 {block:.1f}일 묶음 · 매일 같은"
+        " 비중 재조정",
+    )
+    with st.container(horizontal=True, key="pf_whatif_path_cards"):
         for name, old, new in pairs:
             whatif_metric(
                 name, (old, new), portfolio.percent, portfolio.points(new - old)
@@ -3323,10 +5059,6 @@ def whatif_paths(
             partial(portfolio.percent, signed=True),
             portfolio.points(mid[1] - mid[0]),
         )
-    st.caption(
-        f"평균 수익 0 가정 · 추가 전후 같은 재표본 경로 {portfolio.PATHS:,}개, 평균"
-        f" {block}일 묶음 · 매일 같은 비중으로 재조정 · 예측이 아닙니다"
-    )
 
 
 def whatif_stress(
@@ -3352,8 +5084,8 @@ def whatif_stress(
             return PF_DASH
         at = r.proxied.index(ticker)
         if at < len(r.proxy_betas):
-            return f"{ticker} 지수×베타 {r.proxy_betas[at]:.2f}로 대체"
-        return f"{ticker} 지수로 대체"
+            return f"지수×베타로 대체: {ticker} β{pf_ratio(r.proxy_betas[at])}"
+        return f"지수×베타로 대체: {ticker}"
 
     def ends(rows: list[portfolio.Replayed]) -> list[str]:
         return [portfolio.percent(r.change, signed=True) for r in rows]
@@ -3364,17 +5096,17 @@ def whatif_stress(
     pf_table(
         {
             "시나리오": [r.scenario.name for r in before],
+            "구간": [
+                f"{r.window[0]} → {r.window[1]}" if r.window else PF_DASH
+                for r in before
+            ],
+            "최대 하락": lows(before),
+            "최대 하락 · 추가 후": lows(after),
             "구간 끝": ends(before),
             "구간 끝 · 추가 후": ends(after),
-            "최악": lows(before),
-            "최악 · 추가 후": lows(after),
             "비고": [note(r) for r in after],
         },
         "스트레스 추가 전후",
-    )
-    st.caption(
-        "스트레스 섹션과 같은 재현 · 자료가 없는 구간은 KOSPI(한국) 또는 S&P 500의"
-        " 일간 등락 × 1 쪽으로 당긴 베타로"
     )
 
 
@@ -3405,13 +5137,8 @@ def stock_whatif(
             format="%d%%",
             key="whatif_percent",
             width=280,
-        )
-        picked = st.segmented_control(
-            "시뮬레이션 기간",
-            list(portfolio.HORIZONS),
-            default="1M",
-            required=True,
-            key="whatif_horizon",
+            help="**정의** 지금 평가액 대비 후보 종목 매수 비중 · 기존 보유분 비례"
+            " 축소",
         )
     p = cast("portfolio.Portfolio", book.get(state.whatif_pf))
     s = pf_subject(p, prices)
@@ -3429,38 +5156,51 @@ def stock_whatif(
         return
     amount = fraction * s.value
     notes = [
-        f"평가액의 {fraction:.0%} ({portfolio.money(amount, p.base)}, 약"
-        f" {amount / stock_share(ticker, p.base, prices):,.1f}주)를 {ticker}에 넣고"
-        " 기존 보유분을 비중대로 줄인 경우"
+        f"{ticker}에 평가액의 {fraction:.0%} ({portfolio.money(amount, p.base)}, 약"
+        f" {amount / stock_share(ticker, p.base, prices):,.1f}주) 추가"
     ]
     if ticker in s.w.index:
-        now = portfolio.percent(float(cast("float", s.w[ticker])))
-        notes.append(f"이미 보유 중: 지금 비중 {now}에 더함")
-    notes.append(f"{len(j.window)}일 · 모든 종목 값이 있는 날, {p.base} 일간 수익률")
-    if j.late:
-        notes.append(f"자료 시작이 늦어 기간이 짧아짐: {j.late}")
-    st.caption(" · ".join(notes))
-    for note in s.notes:
-        st.caption(note)
+        held = float(cast("float", s.w[ticker]))
+        mixed = (1 - fraction) * held + fraction
+        notes.append(
+            f"이미 보유 중: 비중 {portfolio.percent(held)} → {portfolio.percent(mixed)}"
+        )
+    basis = [
+        f"{len(j.window)}일 · 모든 종목 값이 있는 날, {p.base} 일간 수익률",
+        *s.notes,
+    ]
+    headed(
+        "**위험 지표** · " + " · ".join(notes),
+        "**정의** 추가 후 비중 · 기존 보유분: 지금 비중 × (1 − 추가 비중) · 이미"
+        " 보유한 종목: (1 − 추가 비중) × 지금 비중 + 추가 비중\n\n**기준** "
+        + " · ".join(basis),
+        [f"**자료** 기간 중 자료 시작 · {j.late}"] if j.late else [],
+    )
     cov, _, _ = cached_covariance((*key, "cov"), j)
     whatif_risk(cached_added((*key, "added"), fraction, ticker, j, cov), ticker)
-    st.markdown(f"**몬테카를로** · {picked or '1M'}")
-    whatif_paths(key, j, ticker, fraction, picked or "1M")
-    st.markdown("**과거 구간 재현** · 지금 보유분과 추가 후")
-    whatif_stress(s, prices, j, ticker, fraction)
+    whatif_paths(key, j, ticker, fraction, state.get("whatif_horizon") or "1M")
+    with st.container(border=True):
+        headed(
+            "**과거 구간 재현** · 지금 보유분과 추가 후",
+            "**정의** 지금 보유분과 추가 후 보유분의 과거 위기 구간 재현 · 스트레스"
+            " 탭과 같은 방식\n\n**기준** 자료 없는 구간: KOSPI(한국) 또는 S&P 500 일간"
+            " 등락 × 베타 · " + PF_PROXY_NOTE,
+        )
+        whatif_stress(s, prices, j, ticker, fraction)
 
 
-def stock_section(
+def stock_section(  # noqa: PLR0913 - the view's inputs
     section: str,
     ticker: str,
     book: portfolio.Book,
     prices: portfolio.Prices,
     months: int,
+    row: DeltaGenerator,
 ) -> None:
     if section == "whatif":
         stock_whatif(ticker, book, prices, months)
         return
-    s = stock_subject(ticker, state.stock_base or portfolio.currency(ticker), prices)
+    s = stock_subject(ticker, portfolio.currency(ticker), prices)
     if len(s.rets) < 2:  # noqa: PLR2004
         pf_no_prices()
     elif section == "analysis":
@@ -3468,32 +5208,12 @@ def stock_section(
         if portfolio.korean(ticker):
             stock_betas(s, prices, months)
         pf_style_box(s, prices, "stock_style")
-    elif section == "risk":
-        pf_risk(s, prices, months)
+    elif section == "tail":
+        pf_tail(s, prices, months, row)
+    elif section == "outlook":
+        pf_outlook(s, prices, months)
     else:
         pf_stress_section(s, prices, months)
-
-
-def stock_method() -> None:
-    lines = (
-        "가격: 수정 종가(배당·분할 반영). 저장된 가격이 없는 티커는 처음 고를 때 지수·"
-        f"환율과 함께 한 번 받아 `{portfolio.DATA_DIR}/`에 저장",
-        "기준통화: 종목의 거래 통화가 기본, 일별 USD/KRW로 환산 · 금액은 1주 기준",
-        "벤치마크: 한국 종목은 KOSPI, 그 밖은 S&P 500 (배당 제외 가격지수)",
-        "위험지표·시뮬레이션·VaR·스트레스: 내 포트폴리오와 같은 방법, 이 종목 100%."
-        " 상관·분산 비율·유효 종목 수·종목별 ES 기여·난기류는 한 종목에서 뜻이 없어"
-        " 뺌",
-        "넣으면 어떻게 되나: 평가액의 일정 비율을 이 종목에 넣고 기존 보유분을 비중대로"
-        " 줄여 마련(이미 보유하면 지금 비중에 더함) · 보유 종목과 이 종목이 모두 값이"
-        " 있는 날의 일간 수익률을 포트폴리오 기준통화로, 시차 보정과 Ledoit–Wolf 축소"
-        " 공분산 · 변동성 기준: 상관 ρ < σp/σc이면 조금 더할 때 변동성이 줄어듦"
-        " (σp 포트폴리오, σc 이 종목) · 베타는 종목 베타의 가중합(한국 종목은 Dimson)"
-        " · ES 97.5% 변화는 같은 날들로 추가 전후 포트폴리오를 다시 계산한 증분 ES"
-        " (완전 재평가), 400일 이상 · 몬테카를로는 추가 전후 같은 재표본 날짜 ·"
-        " 과거 구간 재현은 스트레스 섹션과 같은 방법",
-    )
-    with st.expander("방법·가정", icon=":material/info:"):
-        st.markdown("\n".join(f"- {line}" for line in lines))
 
 
 def stock_view(
@@ -3505,24 +5225,30 @@ def stock_view(
     owned = stock_owned(book, prices)
     with st.container(horizontal=True, vertical_alignment="bottom"):
         st.text_input("티커", key="stock_input", width=170, on_change=stock_enter)
-        st.button("분석", key="stock_go", on_click=stock_enter)
+        st.button("분석", type="primary", key="stock_go", on_click=stock_enter)
         if owned:
             st.pills("보유 종목", owned, key="stock_held", on_change=stock_held)
     if state.get("stock_error"):
         st.error(state.stock_error)
     ticker: str | None = state.get("stock_ticker")
     blocked = args.demo or bool(missing)
+    retry = bool(state.pop("stock_retry", False))
     if ticker and ticker not in prices.tickers and not blocked:
-        stock_fetch(fetcher, ticker, prices)
-    pf_bar(fetcher, pf_root(), book, missing, [ticker] if ticker else [])
+        stock_fetch(fetcher, ticker, prices, retry=retry)
+    pf_bar(
+        fetcher, pf_root(), book, missing, [ticker] if ticker else [], prices.tickers
+    )
     if not ticker:
-        st.info("티커를 넣거나 보유 종목을 고릅니다.")
+        if not state.get("stock_error"):
+            st.info("분석할 종목이 없습니다. 티커를 입력하세요.")
         return
     if ticker not in prices.tickers:
-        st.info(f"{ticker}의 저장된 가격이 없습니다.")
+        if not state.get("stock_error"):  # the error above already says why
+            st.info(f"{ticker}의 저장된 가격이 없습니다.")
         return
     if not blocked:
         fetcher.deepen(prices)  # stress windows back to 1987, once
+    headed(f"**{ticker}**")  # no name here: the book and prices carry tickers only
     section = st.segmented_control(
         "보기",
         list(STOCK_SECTIONS),
@@ -3532,36 +5258,22 @@ def stock_view(
         key="stock_section",
         label_visibility="collapsed",
     )
-    with st.container(horizontal=True, vertical_alignment="bottom"):
-        state.setdefault("stock_base", portfolio.currency(ticker))
-        st.segmented_control(
-            "기준통화",
-            ["KRW", "USD"],
-            required=True,
-            key="stock_base",
-            disabled=section == "whatif",  # the portfolio's own base there
-        )
-        window = st.segmented_control(
-            "기간",
-            list(portfolio.WINDOWS),
-            default="3Y",
-            required=True,
-            key="pf_window",
-        )
-    months = portfolio.WINDOWS[window or "3Y"]
-    stock_section(section or "analysis", ticker, book, prices, months)
-    stock_method()
+    horizons = {"outlook": "pf_horizon", "whatif": "whatif_horizon"}
+    row = st.container(horizontal=True, vertical_alignment="bottom")
+    with row:
+        months = pf_periods(horizons.get(section or "analysis"))
+    stock_section(section or "analysis", ticker, book, prices, months, row)
 
 
 # ---- famous investors (SEC 13F)
 
 PF_MODES = {"mine": "내 포트폴리오", "stock": "종목 분석", "investors": "유명 투자자"}
 INV_SECTIONS = {
-    "holdings": "보유",
     "returns": "수익률",
     "analysis": "위험지표",
     "correlation": "상관·분산",
-    "risk": "시뮬레이션·VaR",
+    "tail": "꼬리위험",
+    "outlook": "전망",
     "stress": "스트레스",
     "compare": "비교",
 }
@@ -3570,10 +5282,9 @@ INV_VARIANTS = {
     "top": f"상위 {investors.CONVICTION}종목 복제",
 }
 INV_THEORY = "이론값 (분기말)"
-INV_THEORY_NOTE = "공개 전 정보 사용, 실제로 따라 할 수 없음"
-INV_LIMITS = (
-    "13F는 미국 상장 주식 롱 포지션만 보여줍니다. 공매도·옵션·채권·현금·분기 중"
-    " 매매는 빠져 있어 실제 펀드 수익률과 다릅니다."
+INV_COVER_NOTE = (
+    f"편입 범위: 보고 가치 상위 {investors.COVER_SHARE:.0%} 또는"
+    f" {investors.COVER_MAX}종목까지 중 티커·가격 확인 종목"
 )
 INV_CHANGE_STYLE = {"신규": display.UP_COLOR, "증가": display.UP_COLOR}
 INV_CHANGE_STYLE["감소"] = display.DOWN_COLOR
@@ -3710,6 +5421,9 @@ def inv_selector(
             format_func=labels.__getitem__,
             key="inv_selected",
             width=560,
+            help="**정의** SEC 13F 보고 기관투자자 · 미국 상장 주식 롱 포지션\n\n"
+            "**기준** 분기 말 보유 · 분기 종료 후"
+            f" {investors.DEADLINE_DAYS}일 안 제출 · 옵션·원금 단위(PRN) 행 제외",
         )
         st.button(
             "CIK 추가",
@@ -3744,8 +5458,7 @@ def inv_bar(  # noqa: PLR0913 - the bar shows both fetchers
         filer = investors.load_filer(root, cik)
         with st.container(horizontal=True, vertical_alignment="center"):
             st.caption(
-                f"SEC EDGAR 13F {filer.fetched:%Y-%m-%d %H:%M} 확인 · 티커 OpenFIGI"
-                " · 섹터·가격 yfinance (Yahoo Finance 비공식 데이터)"
+                f"13F {filer.fetched:%Y-%m-%d %H:%M} 확인"
                 if filer
                 else "저장된 13F가 없습니다."
             )
@@ -3756,7 +5469,6 @@ def inv_bar(  # noqa: PLR0913 - the bar shows both fetchers
                 type="primary",
                 key="inv_refresh",
                 disabled=progress.running or bool(blocked),
-                help="새 13F 제출, 티커·섹터, 보유 종목 가격을 받습니다",
             ):
                 fetcher.start(cik, agent)
                 state.inv_reprice = cik
@@ -3772,8 +5484,8 @@ def inv_bar(  # noqa: PLR0913 - the bar shows both fetchers
                 st.success(progress.message)
         if pricing:
             st.caption(":material/progress_activity: 가격 받는 중")
-        if blocked:
-            st.caption(blocked)
+        if blocked and not args.demo:
+            st.info(blocked)
 
     body()
 
@@ -3791,7 +5503,13 @@ def inv_prices(
     """
     if blocked:
         return
-    wanted = [*names, portfolio.BENCHMARK, portfolio.FX, portfolio.RF_USD]
+    wanted = [
+        *names,
+        portfolio.BENCHMARK,
+        portfolio.TOTAL_RETURN,
+        portfolio.FX,
+        portfolio.RF_USD,
+    ]
     if state.get("inv_reprice") == cik:
         if pfetch.start(wanted):
             state.inv_reprice = ""
@@ -3813,10 +5531,10 @@ def inv_weight_history(points: list[tuple[object, float]]) -> alt.Chart:
         .mark_bar()
         .encode(
             x=alt.X("period:N", title=None),
-            y=alt.Y("weight:Q", title=None, axis=alt.Axis(format=".1%")),
+            y=alt.Y("weight:Q", title=None, axis=alt.Axis(format=".0%")),
             tooltip=[
                 alt.Tooltip("period:N", title="분기 말"),
-                alt.Tooltip("weight:Q", title="비중", format=".2%"),
+                alt.Tooltip("weight:Q", title="비중", format=".1%"),
             ],
         )
         .properties(height=CHART_HEIGHT)
@@ -3827,13 +5545,25 @@ def inv_stock_body(
     found: list[investors.Quarter], row: dict[str, object], prices: portfolio.Prices
 ) -> None:
     st.caption(f"{row['sector']} · CUSIP {row['cusip']}")
+    with st.container(horizontal=True, key="inv_stock_cards"):
+        weight = cast("float", row["weight"])
+        for label, value in (
+            ("가치", investors.dollars(cast("float", row["value"]))),
+            ("비중", portfolio.percent(weight) if math.isfinite(weight) else PF_DASH),
+            ("주식 수", portfolio.shares(cast("float", row["shares"]))),
+            ("직전 분기 대비", str(row["change"])),
+        ):
+            st.metric(label, value, border=True, height="stretch")
     left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown("**분기별 비중** · 보고 가치 기준")
+    with left, st.container(border=True, height="stretch"):
+        headed(
+            "**분기별 비중** · 보고 가치 기준",
+            "**정의** 분기별 보고 가치 중 이 종목 비중 · 미보유 분기 0",
+        )
         history = investors.weight_history(found, str(row["cusip"]))
         st.altair_chart(inv_weight_history(list(history)), alt="분기별 비중")
-    with right, st.container(border=True):
-        st.markdown("**1년 주가** · 종가, USD")
+    with right, st.container(border=True, height="stretch"):
+        headed("**1년 주가** · 종가, USD")
         ticker = str(row["ticker"])
         if ticker in prices.close.columns:
             series = portfolio.window(
@@ -3842,7 +5572,7 @@ def inv_stock_body(
             points = portfolio.line_points({"종가": series})
             st.altair_chart(pf_line_chart(points, ",.2f"), alt=f"{ticker} 1년 주가")
         else:
-            st.caption(portfolio.UNKNOWN)
+            st.caption("저장된 가격이 없습니다.")
 
 
 def inv_open_stock(
@@ -3861,26 +5591,22 @@ def inv_holdings(
     cusips: dict[str, investors.Link],
     sectors: dict[str, investors.Sector],
     prices: portfolio.Prices,
+    warns: list[str],
 ) -> None:
+    """현황: the reported quarter, always shown above the analysis sections.
+
+    ``warns``: ``inv_flags``, the "!" beside the heading.
+    """
     periods = [q.period for q in found]
     labels = {q.period: investors.quarter_label(q) for q in found}
     if state.get("inv_quarter") not in periods:
         state.inv_quarter = periods[0]
-    st.selectbox(
-        "분기", periods, format_func=labels.__getitem__, key="inv_quarter", width=360
-    )
     at = periods.index(state.inv_quarter)
     q = found[at]
     before = found[at + 1] if at + 1 < len(found) else None
     frame = investors.holdings_frame(q, before, cusips, sectors)
     priced = float(cast("float", inv_priced(q, cusips, prices).sum()))
     excluded = investors.excluded_share(q.rows)
-    with st.container(horizontal=True):
-        st.metric("보고 가치", investors.dollars(q.value), border=True)
-        st.metric("종목 수", f"{len(q.rows):,}", border=True)
-        st.metric(
-            "상위 10 비중", portfolio.percent(investors.top_share(q.rows)), border=True
-        )
     left_out: list[str] = []
     if q.options:
         left_out.append(f"옵션 {q.options}건 ({investors.dollars(q.options_value)})")
@@ -3896,8 +5622,73 @@ def inv_holdings(
         *([f"미포함 비중 {portfolio.percent(excluded)}"] if excluded > 0 else []),
         f"가격 미연결 비중 {portfolio.percent(1 - excluded - priced)}",
     ]
-    st.caption(" · ".join(notes))
+    with st.container(horizontal=True, vertical_alignment="center"):
+        headed(
+            "**현황**",
+            "**정의** 고른 분기 13F 보고 종목의 가치·비중·직전 분기 대비 변화 · USD"
+            "\n\n**기준** " + " · ".join(notes),
+            warns,
+        )
+        st.space("stretch")
+        st.selectbox(
+            "분기",
+            periods,
+            format_func=labels.__getitem__,
+            key="inv_quarter",
+            width=360,
+            label_visibility="collapsed",
+        )
+    with st.container(horizontal=True, key="inv_now_cards"):
+        st.metric(
+            "보고 가치",
+            investors.dollars(q.value),
+            help="**정의** 해당 분기 13F 보고 가치 합계(USD) · 옵션·PRN 제외",
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "종목 수",
+            f"{len(q.rows):,}",
+            help="**정의** 보고 종목(CUSIP) 수 · 옵션·PRN 제외",
+            border=True,
+            height="stretch",
+        )
+        st.metric(
+            "상위 10 비중",
+            portfolio.percent(investors.top_share(q.rows)),
+            help="**정의** 보고 가치 상위 10종목의 비중 합\n\n**해석** 높을수록 소수"
+            " 종목 집중",
+            border=True,
+            height="stretch",
+        )
     records = cast("list[dict[str, object]]", frame.to_dict("records"))
+    left, right = st.columns([1, 2])
+    with left, st.container(border=True, height="stretch"):
+        headed(
+            "**비중** · 보고 가치 기준",
+            "**정의** 보고 가치 기준 종목 비중\n\n**기준**"
+            f" {PF_DONUT_SLICES}종목 초과 시 상위 {PF_DONUT_SLICES - 1}종목과 기타",
+        )
+        rows = [
+            (
+                str(r["ticker"]) or str(r["name"]),
+                cast("float", r["weight"]),
+                cast("float", r["value"]),
+            )
+            for r in records
+            if math.isfinite(cast("float", r["weight"]))
+        ]
+        st.altair_chart(pf_donut(rows, investors.dollars, "가치"), alt="비중")
+    with right, st.container(border=True, height="stretch"):
+        headed(
+            "**섹터 비중** · 보고 가치 기준",
+            "**정의** 보고 가치 기준 섹터별 비중 합 · 섹터: yfinance\n\n**기준**"
+            f" {investors.EXCLUDED}: 상위 보유 범위(가치 {investors.COVER_SHARE:.0%}"
+            f" 또는 {investors.COVER_MAX}종목) 밖 · {investors.UNKNOWN}: 섹터 미수신",
+        )
+        st.altair_chart(
+            pf_weight_chart(investors.sector_weights(frame), "섹터"), alt="섹터 비중"
+        )
     shown = pd.DataFrame(
         {
             "티커": [str(r["ticker"]) or "—" for r in records],
@@ -3909,25 +5700,30 @@ def inv_holdings(
             "직전 분기 대비": [str(r["change"]) for r in records],
         }
     )
-    event = st.dataframe(
-        shown.style.map(inv_style, subset=["직전 분기 대비"]),
-        hide_index=True,
-        height=420,
-        on_select="rerun",
-        selection_mode="single-cell",
-        key=f"inv_table_{state.get('inv_gen', 0)}",
-        column_config={"종목": st.column_config.TextColumn(width="medium")},
-        alt="보유 종목",
-    )
-    left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown("**섹터 비중** · 보고 가치 기준")
-        st.altair_chart(
-            pf_weight_chart(investors.sector_weights(frame), "섹터"), alt="섹터 비중"
+    with st.container(border=True):
+        headed("**보유 종목** · USD")
+        event = st.dataframe(
+            shown.style.map(inv_style, subset=["직전 분기 대비"]),
+            hide_index=True,
+            height=LIST_HEIGHT,
+            on_select="rerun",
+            selection_mode="single-cell",
+            key=f"inv_table_{state.get('inv_gen', 0)}",
+            column_config={
+                "종목": st.column_config.TextColumn(width="medium"),
+                "직전 분기 대비": st.column_config.TextColumn(
+                    help="**정의** 직전 분기 대비 주식 수 변화 · "
+                    + " · ".join(investors.CHANGES)
+                ),
+            },
+            alt="보유 종목",
         )
-    with right, st.container(border=True):
-        gone = investors.sold_out(q, before)
-        st.markdown(f"**청산** · 직전 분기 대비 {len(gone)}종목")
+    gone = investors.sold_out(q, before)
+    with st.container(border=True):
+        headed(
+            f"**청산** · 직전 분기 대비 {len(gone)}종목",
+            "**정의** 직전 분기 보유 중 이번 분기 보고에 없는 종목",
+        )
         if gone:
             pf_table(
                 {
@@ -3937,6 +5733,8 @@ def inv_holdings(
                 },
                 "청산 종목",
             )
+        else:
+            st.caption("직전 분기 대비 청산한 종목이 없습니다.")
     for index, column in event.selection.cells:
         if column in {"티커", "종목"}:
             inv_open_stock(found, records[index], prices)
@@ -3987,19 +5785,14 @@ def inv_label(top: bool, equal: bool) -> str:
     return f"{label} · 같은 비중" if equal else label
 
 
-def inv_controls(section: str) -> int:
-    """기간 (not on 수익률) and the clone; returns the window in months."""
-    with st.container(horizontal=True, vertical_alignment="bottom"):
-        window = (
-            st.segmented_control(
-                "기간",
-                list(portfolio.WINDOWS),
-                default="3Y",
-                required=True,
-                key="pf_window",
-            )
+def inv_controls(section: str) -> tuple[int, DeltaGenerator]:
+    """추정·전망 기간 (not on 수익률) and the clone: the window in months, the row."""
+    row = st.container(horizontal=True, vertical_alignment="bottom")
+    with row:
+        months = (
+            pf_periods("pf_horizon" if section == "outlook" else None)
             if section != "returns"
-            else None
+            else portfolio.WINDOWS["3Y"]
         )
         picked = st.segmented_control(
             "복제",
@@ -4008,11 +5801,22 @@ def inv_controls(section: str) -> int:
             default="filed",
             required=True,
             key="inv_variant",
-            help="제출일 복제: 제출이 공개된 날 종가에 보고 비중으로 삼",
+            help="**정의** 13F 보고 비중을 따라 산 가상 포트폴리오 · 제출일 복제: 제출"
+            " 공개 후 첫 종가(뉴욕 16시 이후·접수 시각 없는 제출은 다음 거래일)에 보고"
+            " 비중 매수 · 상위"
+            f" {investors.CONVICTION}종목 복제: 보고 비중 상위"
+            f" {investors.CONVICTION}종목\n\n**기준** 다음 제출까지 보유 · "
+            + INV_COVER_NOTE
+            + " · 편입 종목 비중 합 100%로 재조정",
         )
         if picked == "top":
-            st.toggle("같은 비중", key="inv_equal")
-    return portfolio.WINDOWS[window or "3Y"]
+            st.toggle(
+                "같은 비중",
+                key="inv_equal",
+                help=f"**정의** 상위 {investors.CONVICTION}종목을 보고 비중 대신 같은"
+                " 비중으로 매수",
+            )
+    return months, row
 
 
 def inv_sp500(adjusted: pd.DataFrame, days: pd.DatetimeIndex) -> pd.Series:
@@ -4087,10 +5891,6 @@ def inv_steps(steps: tuple[portfolio.Step, ...]) -> None:
         },
         "리밸런싱",
     )
-    st.caption(
-        "회전율: 직전 보유가 가격대로 변한 비중과 새 비중의 차이 합의 절반(편도) ·"
-        " 첫 매수는 —"
-    )
 
 
 def inv_returns(  # noqa: PLR0913 - the view's inputs
@@ -4113,45 +5913,60 @@ def inv_returns(  # noqa: PLR0913 - the view's inputs
     today = datetime.now().astimezone().date()
     turns = [s.turnover for s in made.steps if s.turnover is not None]
     start = cast("pd.Timestamp", filed.index[0])
-    with st.container(horizontal=True):
+    time = portfolio.time_weighted(filed)
+    with st.container(horizontal=True, key="inv_return_cards"):
         st.metric(
             f"누적 · {label}",
             portfolio.percent(portfolio.last(filed), signed=True),
-            help=f"{start.date()}부터, USD",
+            pf_annual(time) if time and time.annual is not None else None,
+            delta_color="off",
+            delta_arrow="off",
+            help=f"**정의** {label} 누적 수익률 · {start.date()}부터 · USD\n\n"
+            "**해석** 아래 값: 1년 이상이면 연환산\n\n"
+            "**기준** 수정 종가 · 제출마다 새 비중 매수 뒤 다음 제출까지 보유",
             border=True,
+            height="stretch",
         )
         st.metric(
             "종목 수",
             f"{len(made.weights):,}",
-            help="지금 들고 있는 종목 (가격이 이어지는 것)",
+            help="**정의** 복제가 지금 보유 중인 종목 수 · 가격이 이어지는 종목",
             border=True,
+            height="stretch",
         )
         st.metric(
             "가격 연결 비중",
             portfolio.percent(
                 float(cast("float", inv_priced(q, cusips, prices).sum()))
             ),
-            help=f"{q.period} 보고 가치 중 가격으로 계산한 몫",
+            help=f"**정의** {q.period} 보고 가치 중 가격으로 계산한 종목의 몫\n\n"
+            "**기준** " + INV_COVER_NOTE + " · 보고 가치 전체 대비",
             border=True,
+            height="stretch",
         )
         st.metric(
             "분기말 이후 경과일",
             f"{(today - q.period).days:,}일",
-            help=f"최근 보고 {q.period} 기준 · 분기 말에서 제출까지"
+            help=f"**정의** 최근 보고 분기 말({q.period})부터 오늘까지 달력일\n\n"
+            "**해석** 길수록 오래된 보유 정보\n\n**기준** 분기 말에서 제출까지"
             f" {(q.filed - q.period).days}일",
             border=True,
+            height="stretch",
         )
         st.metric(
             "평균 회전율",
             portfolio.percent(sum(turns) / len(turns)) if turns else PF_DASH,
-            help="리밸런싱마다 바꾼 비중, 편도",
+            help="**정의** 리밸런싱별 편도 회전율의 평균 · ½Σ|새 비중 − 직전 보유의"
+            " 가격 변동 반영 비중|\n\n**해석** 높을수록 분기마다 큰 비중 교체",
             border=True,
+            height="stretch",
         )
     gap = portfolio.points(portfolio.last(filed) - portfolio.last(theory))
-    st.markdown(
-        f":gray[{INV_THEORY} 누적"
-        f" {portfolio.percent(portfolio.last(theory), signed=True)} · 차이 {gap}"
-        f" · {INV_THEORY_NOTE}]"
+    st.caption(
+        f"{INV_THEORY} 누적"
+        f" {portfolio.percent(portfolio.last(theory), signed=True)} · 차이 {gap}",
+        help=f"**정의** {INV_THEORY}: 분기 말 종가에 보고 비중으로 매수한 경우의 누적"
+        " 수익률 · 차이: 복제 − 이론값\n\n**해석** 차이 음수: 제출 지연 동안의 손실",
     )
     days = pd.DatetimeIndex(filed.index)
     lines = {
@@ -4165,19 +5980,30 @@ def inv_returns(  # noqa: PLR0913 - the view's inputs
             usd = inv_usd(p)
             twr = cached_twr(pf_key(usd.model_dump_json()), usd, prices.close)
             lines[f"{p.name} TWR"] = portfolio.since(twr, start)
-    with st.container(border=True):
-        st.markdown(f"**누적 수익률** · USD, {start.date()}부터")
-        st.altair_chart(inv_chart(lines, theory), alt="복제 수익률")
-    st.caption(
-        f"복제: 수정 종가 · 회색 점선은 {INV_THEORY}: 분기 말 종가에 샀다고 본 값 ·"
-        " 내 포트폴리오는 TWR(종가, 배당 제외)을 일별 USD/KRW로 환산 · 늦게 시작한"
-        " 선은 첫 날이 0%"
-    )
     missing = investors.untimed(filer)
-    if missing:
-        st.caption(f"접수 시각이 없는 제출 {missing}건은 다음 거래일 종가에 삽니다")
-    st.markdown(f"**리밸런싱** · {len(made.steps)}회")
-    inv_steps(made.steps)
+    left, right = st.columns(2)
+    with left, st.container(border=True, height="stretch"):
+        headed(
+            f"**누적 수익률** · USD, {start.date()}부터",
+            f"**정의** 복제·{portfolio.BENCHMARK_LABEL}·내 포트폴리오 TWR의 누적"
+            f" 수익률 · USD · 회색 점선: {INV_THEORY}\n\n**기준**"
+            f" {portfolio.BENCHMARK_LABEL}: 총수익지수({portfolio.TOTAL_RETURN}) · 내"
+            " 포트폴리오: TWR의 일별 USD/KRW 환산"
+            + (
+                f" · 접수 시각 없는 제출 {missing}건: 다음 거래일 종가 매수"
+                if missing
+                else ""
+            ),
+        )
+        st.altair_chart(inv_chart(lines, theory), alt="복제 수익률")
+    with right, st.container(border=True, height="stretch"):
+        headed(
+            f"**리밸런싱** · {len(made.steps)}회",
+            "**정의** 제출별 매수일 · 종목 수 · 회전율\n\n**기준** 회전율: ½Σ|새"
+            " 비중 − 직전 보유의 가격 변동 반영 비중|(편도) · 첫 매수·현금 보유 뒤"
+            " 매수 —",
+        )
+        inv_steps(made.steps)
 
 
 # ---- correlation and the investors side by side
@@ -4225,7 +6051,6 @@ def inv_lineup(
     prices: portfolio.Prices,
     months: int,
 ) -> None:
-    st.markdown(f"**투자자·내 포트폴리오·{portfolio.BENCHMARK_LABEL}** · USD")
     book_key = pf_key(book.model_dump_json())
     frame, flags = cached_lineup(book_key, "USD", months, book, prices)
     frame, korean = frame.copy(), [*flags]
@@ -4236,10 +6061,16 @@ def inv_lineup(
             frame[person.name] = portfolio.weighted(their_rets, w)
             korean.append(False)
             keys.append(their)
-    pf_compare_heatmap((*keys, "USD", months, "investors"), frame, korean)
-    st.caption(
-        "투자자는 최근 분기 보고 비중, 내 포트폴리오는 지금 비중으로 계산 · 받은"
-        " 13F가 없는 투자자는 빠짐"
+    pf_compare_heatmap(
+        (*keys, "USD", months, "investors"),
+        frame,
+        korean,
+        f"**투자자·내 포트폴리오·{portfolio.BENCHMARK_LABEL}** · USD",
+        "**정의** 투자자 복제·내 포트폴리오·지수의 일간 수익률 상관계수 · USD\n\n"
+        "**해석** 1에 가까울수록 같은 방향 · 0 근처 무관\n\n**기준** 투자자: 최근 분기"
+        " 보고 비중 고정 · 내 포트폴리오: 지금 비중 · " + PF_INDEX_NOTE + " · 한국"
+        " 비중 절반 초과 포트폴리오: 한국 종가 기준 시차 보정 · 셋 이상:"
+        " Ledoit–Wolf 축소",
     )
 
 
@@ -4261,18 +6092,34 @@ def inv_league(
             series[person.label] = portfolio.window(daily, months)
             keys.append(their)
     label = inv_label(top, equal)
-    st.markdown(f"**투자자 비교** · {label}, USD, {state.get('pf_window') or '3Y'}")
+    title = f"**투자자 비교** · {label}, USD, {state.get('pf_window') or '3Y'}"
+    about = (
+        "**정의** 투자자별 복제의 기간 수익률·연 샤프 지수 · 축소 샤프: 경험적"
+        " 베이즈 축소, 평균 + τ²/(τ² + SE²) × (값 − 평균) · τ² = max(0, 샤프 분산 − SE²"
+        " 평균) · SE: Mertens 표준오차\n\n**해석** 표준오차가 클수록 평균 쪽으로 큰"
+        " 축소 · 축소 샤프: 운의 영향을 줄인 비교\n\n**기준** 일간 초과수익률로"
+        " 계산 후 연환산 · 일수: 무위험수익률이 있는 날"
+    )
     if not series:
-        st.caption("가격이 있는 복제가 없습니다.")
+        headed(title, about, ["**조건** 가격이 있는 투자자 복제 1개 이상"])
         return
     days = (
         pd.DatetimeIndex(pd.concat(list(series.values())).index).unique().sort_values()
     )
-    rates, source = pf_rates("USD", prices.close)
-    rf = portfolio.risk_free(rates, days)
+    rates, source, quote = pf_rates("USD", prices.close)
+    rf = portfolio.risk_free(rates, days, quote)
     key = (*keys, top, equal, months, source, pf_rates_key(rates))
     found = cached_peers(key, series, rf)
     pooled = found.count > 1
+    notes = ["무위험수익률 " + (source if not rates.empty else "0")]
+    if pooled:
+        dsr = (
+            portfolio.percent(found.deflated)
+            if found.deflated is not None
+            else f"{PF_SHORT} ({perf.MIN_OBS}일 미만)"
+        )
+        notes.append(f"{found.count}명 중 최고값의 운 이상 확률(DSR) {dsr}")
+    st.markdown(title, help=about + " · " + " · ".join(notes))
     table = {
         "투자자": [r.name for r in found.rows],
         "기간 수익률": [portfolio.percent(r.total, signed=True) for r in found.rows],
@@ -4283,20 +6130,6 @@ def inv_league(
         "일수": [f"{r.days:,}" for r in found.rows],
     }
     pf_table(table, "투자자 비교")
-    notes = ["샤프 순 · 무위험수익률 " + (source if not rates.empty else "0")]
-    if pooled:
-        dsr = (
-            portfolio.percent(found.deflated)
-            if found.deflated is not None
-            else f"{PF_SHORT} ({perf.MIN_OBS}일 미만)"
-        )
-        notes.append(
-            "축소 샤프: 각 값을 표준오차만큼 여럿의 평균 쪽으로 당긴 값(경험적 베이즈)"
-        )
-        notes.append(
-            f"{found.count}명 중 최고값이 운으로 나올 수준을 넘는지 (DSR): {dsr}"
-        )
-    st.caption(" · ".join(notes))
 
 
 def inv_correlation(  # noqa: PLR0913 - the view's inputs
@@ -4311,7 +6144,8 @@ def inv_correlation(  # noqa: PLR0913 - the view's inputs
 ) -> None:
     compare = partial(inv_lineup, book, people, prices, months)
     pf_correlation(s, prices, months, compare)
-    inv_league(people, prices, months, top=top, equal=equal)
+    with st.container(border=True):
+        inv_league(people, prices, months, top=top, equal=equal)
 
 
 # ---- compare
@@ -4322,43 +6156,50 @@ def inv_ratios(
 ) -> portfolio.Ratios:
     """``key`` stands for ``rets``; over the S&P 500 in dollars."""
     window = portfolio.window(rets, months)
-    rates, source = pf_rates("USD", prices.close)
-    rf = portfolio.risk_free(rates, pd.DatetimeIndex(window.index))
+    rates, source, quote = pf_rates("USD", prices.close)
+    rf = portfolio.risk_free(rates, pd.DatetimeIndex(window.index), quote)
     bench = partial(inv_sp500, prices.adjusted, pd.DatetimeIndex(window.index))
     tag = (*key, months, "sp500", source, pf_rates_key(rates))  # not the blended one
     return cached_ratios(tag, window, rf, bench)
 
 
-def inv_overlap(theirs: pd.Series, mine: pd.Series, period: object) -> None:
+def inv_overlap(theirs: pd.Series, mine: pd.Series) -> None:
     us = portfolio.us_sleeve(mine)
     total = float(cast("float", theirs.sum()))
     their = theirs / total if total > 0 else theirs
     share = 1 - perf.active_share(their, us) if not us.empty else None
-    st.metric(
-        "보유 겹침",
-        portfolio.percent(share) if share is not None else PF_DASH,
-        help=(
-            f"액티브 셰어 {portfolio.percent(1 - share)} (= 1 − 겹침)"
-            if share is not None
-            else "내 포트폴리오에 미국 주식이 없습니다"
-        ),
-        border=True,
-    )
-    shared = investors.overlap(their, us)
-    if shared:
-        pf_table(
-            {
-                "티커": [t for t, _, _ in shared],
-                "투자자 비중": [portfolio.percent(a) for _, a, _ in shared],
-                "내 미국 주식 중": [portfolio.percent(b) for _, _, b in shared],
-            },
-            "겹치는 종목",
+    with st.container(horizontal=True, key="inv_overlap_cards"):
+        st.metric(
+            "보유 겹침",
+            portfolio.percent(share) if share is not None else PF_DASH,
+            help=(
+                "**정의** Σ 종목별 작은 쪽 비중 = 1 − 액티브 셰어\n\n**해석** 1에"
+                " 가까울수록 같은 구성 · 0이면 공통 종목 없음\n\n**기준** 액티브 셰어"
+                f" {portfolio.percent(1 - share)}"
+                if share is not None
+                else "**정의** Σ 종목별 작은 쪽 비중\n\n**기준** 내 포트폴리오 미국"
+                " 주식 없음"
+            ),
+            border=True,
+            height="stretch",
         )
-    st.caption(
-        f"내 포트폴리오의 미국 주식만(지금 평가액, 합 100%)과 투자자 {period} 보고"
-        " 비중(티커가 연결된 종목, 합 100%) · 겹침 = Σ 종목마다 작은 쪽 비중 ="
-        " 1 − 액티브 셰어(½Σ|비중 차이|) · 실력이나 성과를 재는 지표가 아닙니다"
-    )
+    shared = investors.overlap(their, us)
+    with st.container(border=True):
+        headed(
+            f"**겹치는 종목** · {len(shared)}종목",
+            "**정의** 투자자 보고 비중과 내 미국 주식에 함께 있는 종목 · 각각 합 100%",
+        )
+        if shared:
+            pf_table(
+                {
+                    "티커": [t for t, _, _ in shared],
+                    "투자자 비중": [portfolio.percent(a) for _, a, _ in shared],
+                    "내 미국 주식 중": [portfolio.percent(b) for _, _, b in shared],
+                },
+                "겹치는 종목",
+            )
+        else:
+            st.caption("겹치는 종목이 없습니다.")
 
 
 def inv_compare(
@@ -4371,7 +6212,7 @@ def inv_compare(
     _, found, cusips, _ = data
     mine = {p.id: p.name for p in book.portfolios if p.trades}
     if not mine:
-        st.info("비교할 내 포트폴리오가 없습니다. **내 포트폴리오**에서 만듭니다.")
+        st.info("비교할 내 포트폴리오가 없습니다.")
         return
     if state.get("inv_mine") not in mine:
         state.inv_mine = next(iter(mine))
@@ -4385,25 +6226,41 @@ def inv_compare(
     p = book.get(state.inv_mine)
     if p is None:
         return
-    left, right = st.columns(2)
-    with left, st.container(border=True):
-        st.markdown("**보유 겹침** · 미국 주식")
-        theirs = investors.weights(found[0].rows, cusips)
-        own = portfolio.weights(portfolio.holdings(p, prices.close))
-        inv_overlap(theirs, own, found[0].period)
-    with right, st.container(border=True):
-        st.markdown(f"**위험 지표** · USD, {state.get('pf_window') or '3Y'}")
+    headed(
+        "**보유 겹침** · 미국 주식",
+        "**정의** 내 미국 주식(지금 평가액)과 투자자 보고 비중의 겹침 · 각각"
+        " 합 100% · 겹침 = Σ 종목별 작은 쪽 비중 = 1 − 액티브 셰어\n\n**해석** 1에"
+        " 가까울수록 같은 구성 · 0이면 공통 종목 없음\n\n**기준** 투자자"
+        f" {found[0].period} 보고 · 티커 확인 종목",
+    )
+    theirs = investors.weights(found[0].rows, cusips)
+    own = portfolio.weights(portfolio.holdings(p, prices.close))
+    inv_overlap(theirs, own)
+    korean: set[str] = {p.name} if portfolio.korean_weight(own) else set()
+    with st.container(border=True):
+        headed(
+            f"**위험 지표** · USD, {state.get('pf_window') or '3Y'}",
+            "**정의** 투자자 복제·내 포트폴리오·지수의 기간 수익률·연 변동성·최대"
+            " 낙폭·샤프 지수·베타 · USD\n\n**기준** 투자자: "
+            f"{s.label} · 내 포트폴리오: 보유 기록 수익률(비중은 종가, 등락은 수정"
+            " 종가)"
+            f" · {portfolio.BENCHMARK_LABEL} 행: 총수익지수({portfolio.TOTAL_RETURN}) ·"
+            f" 베타: {portfolio.BENCHMARK_LABEL} 가격지수 대비 Welch, "
+            + PF_DECAY_NOTE
+            + (" · 한국 종목 보유 시 베타 —(종가 시각 차이)" if korean else ""),
+        )
         usd = inv_usd(p)
-        held = cached_held(pf_key(usd.model_dump_json()), usd, prices.adjusted)
-        sp_days = portfolio.trading_days(prices.adjusted, [portfolio.BENCHMARK])
+        held = cached_held(
+            pf_key(usd.model_dump_json()), usd, prices.close, prices.adjusted
+        )
+        sp_days = portfolio.trading_days(prices.adjusted, [portfolio.TOTAL_RETURN])
+        sp500 = inv_sp500(prices.adjusted, sp_days).dropna()
         rows = {
             s.label: (s.key, s.rets),
             p.name: (pf_key(usd.model_dump_json()), held),
-            portfolio.BENCHMARK_LABEL: (
-                pf_key("benchmark"),
-                inv_sp500(prices.adjusted, sp_days).dropna(),
-            ),
         }
+        if not sp500.empty:  # none until ^SP500TR is fetched
+            rows[portfolio.BENCHMARK_LABEL] = (pf_key("benchmark"), sp500)
         stats = {
             name: inv_ratios(key, rets, prices, months)
             for name, (key, rets) in rows.items()
@@ -4412,7 +6269,6 @@ def inv_compare(
             name: portfolio.window(rets, months).dropna().to_numpy(dtype="float64")
             for name, (_, rets) in rows.items()
         }
-        korean: set[str] = {p.name} if portfolio.korean_weight(own) else set()
         betas = {
             name: portfolio.market_beta(
                 portfolio.window(rets, months), prices.adjusted, "USD"
@@ -4427,7 +6283,7 @@ def inv_compare(
                 "기간 수익률": [
                     portfolio.percent(float((1 + w).prod()) - 1, signed=True)
                     if len(w)
-                    else portfolio.UNKNOWN
+                    else PF_DASH
                     for w in windows.values()
                 ],
                 "연 변동성": [
@@ -4448,81 +6304,19 @@ def inv_compare(
             },
             "위험 지표 비교",
         )
-        st.caption(
-            f"투자자는 {s.label}, 내 포트폴리오는 보유 기록의 수정 종가 수익률 ·"
-            f" 샤프는 무위험수익률 차감 · 베타는 {portfolio.BENCHMARK_LABEL} 대비"
-            " Welch"
-            + (" · 한국 종목이 있으면 베타 — (종가 시각 차이)" if korean else "")
-        )
-
-
-# ---- method
-
-
-def inv_method() -> None:
-    lines = (
-        f"출처: SEC EDGAR 13F-HR·13F-HR/A 정보표, 최근 {investors.QUARTERS}개 분기 ·"
-        " 티커는 OpenFIGI(CUSIP → 미국 종합 티커) · 섹터·가격은 yfinance",
-        f"가치: {investors.DOLLARS_FROM} 이후 제출분은 달러, 이전 제출분은 천 달러로"
-        " 보고되어 달러로 환산",
-        "같은 CUSIP의 여러 행(운용역별)은 주식 수와 가치를 합산 · 풋·콜 옵션과 원금"
-        " 단위(PRN) 행은 보유에서 제외",
-        "정정: RESTATEMENT는 그 분기를 바꾸고 NEW HOLDINGS는 더함. 유형을 알 수 없거나"
-        " 정보표가 없는 정정은 반영하지 않음 · 기밀 처리된 종목은 빠져 있다가 나중에"
-        " 정정으로 공개될 수 있음",
-        "직전 분기 대비: 주식 수 비교(분할 미조정) · 비중: 보고 가치 기준",
-        f"가격·섹터는 분기마다 가치가 큰 종목부터 보고 가치의"
-        f" {investors.COVER_SHARE:.0%}까지(최대 {investors.COVER_MAX}종목)만 받음."
-        " 나머지는 미포함 비중으로 표시하고 표에는 모두 나옴",
-        "미포함이거나 티커를 찾지 못했거나 가격이 없는 종목은 수익률·위험 계산에서"
-        " 빼고 나머지를 100%로 재조정 (가격 미연결 비중으로 표시)",
-        f"{INV_VARIANTS['filed']}: EDGAR 접수 시각(뉴욕)이 16:00 전이면 그날, 16:00"
-        " 이후면 다음날 종가에 보고 비중으로 사서 다음 제출까지 보유(비중은 가격대로"
-        " 변함). 휴장이면 다음 거래일, 접수 시각이 없으면 제출일 다음 거래일. 정정도"
-        " 그 접수 시각에 반영하고, 더 최근 분기가 공개된 뒤의 옛 분기 정정은 무시",
-        f"{INV_VARIANTS['top']}: 같은 날, 보고 비중이 큰 {investors.CONVICTION}종목만"
-        " 보고 가치 비중대로(또는 같은 비중으로) 삼 · 회전율: 직전 보유가 가격대로 변한"
-        " 비중과 새 비중의 차이 합의 절반",
-        f"보고 중단: 마감(분기 말 + {investors.DEADLINE_DAYS}일)이 지난 최근 분기보다"
-        f" {investors.STALE_QUARTERS}개 분기 이상 늦은 마지막 보고 · 13F-NT는 다른"
-        " 운용사가 대신 보고했다는 신고",
-        f"{INV_THEORY}: 분기 말(휴장이면 다음 거래일) 종가에 산 값. {INV_THEORY_NOTE}",
-        "수정 종가(배당·분할 반영), USD. 기간 중 가격이 끊긴 종목(인수·상장폐지)은"
-        " 마지막 가격에 현금으로 둠. 가격 기록이 없는 종목은 빠져 생존 편향이 있음",
-        "내 포트폴리오는 일별 USD/KRW로 USD 환산 (포트폴리오 페이지와 같은 방식)",
-        "위험지표·상관·시뮬레이션·VaR·스트레스: 내 포트폴리오와 같은 방법. 복제의"
-        " 일간 수익률로 샤프·PSR·낙폭을, 지금 비중(마지막 매수 뒤 가격대로 변한 비중)"
-        " 으로 상관·몬테카를로·VaR·스트레스를 계산. 기간 중 자료가 시작하거나 끝난"
-        " 종목은 빼고 재조정 · 무위험수익률은 미국 3개월 국채(^IRX), 벤치마크는"
-        " S&P 500",
-        "포트폴리오 비교 상관: 투자자는 최근 분기 보고 비중, 내 포트폴리오는 지금"
-        " 비중의 일간 수익률을 모두 값이 있는 날에 맞춤. 한국 비중이 절반을 넘는"
-        " 포트폴리오는 한국 종가로 보고 시차 보정, Ledoit–Wolf 축소",
-        "투자자 비교: 복제의 샤프를 표준오차(Mertens)만큼 여럿의 평균 쪽으로 당긴"
-        " 경험적 베이즈 값을 함께 표시 · DSR(Bailey–López de Prado 2014): 비교한"
-        f" 수만큼의 운에서 기대되는 최고 샤프를 넘을 확률, {perf.MIN_OBS}일 이상",
-        "보유 겹침: 미국 주식 부분만 비교, 1 − 액티브 셰어(Cremers–Petajisto 2009)",
-        f"티커 조회는 OpenFIGI 무키 한도(요청당 {investors.FIGI_JOBS}건, 분당 25회)를"
-        f" 지키고, 찾지 못한 CUSIP은 {investors.MISS_RETRY_DAYS}일 뒤에 다시 조회",
-    )
-    with st.expander("방법·가정", icon=":material/info:"):
-        st.markdown("\n".join(f"- {line}" for line in lines))
 
 
 # ---- the view
 
 
-def inv_flags(filer: investors.Filer | None) -> None:
-    """보고 중단 and 13F-NT, when they apply."""
+def inv_flags(filer: investors.Filer | None) -> list[str]:
+    """보고 중단 and 13F-NT, when they apply: the 현황 heading's "!"."""
     stopped = investors.stale(filer, datetime.now().astimezone().date())
-    notice = investors.notice(filer)
-    if not stopped and not notice:
-        return
-    with st.container(horizontal=True, vertical_alignment="center"):
-        if stopped:
-            st.badge(f"보고 중단 · 마지막 {stopped}", color="orange")
-        if notice:
-            st.caption(f"최근 분기 보고 없음 ({notice.form}, {notice.filed})")
+    late = investors.notice(filer)
+    return [
+        *([f"**보고 중단** 마지막 보고 분기 {stopped}"] if stopped else []),
+        *([f"**최근 분기 보고 없음** {late.form}, {late.filed}"] if late else []),
+    ]
 
 
 def inv_section(  # noqa: PLR0913 - the view's inputs
@@ -4533,11 +6327,7 @@ def inv_section(  # noqa: PLR0913 - the view's inputs
     data: InvData,
     prices: portfolio.Prices,
 ) -> None:
-    _, found, cusips, sectors = data
-    if section == "holdings":
-        inv_holdings(found, cusips, sectors, prices)
-        return
-    months = inv_controls(section)
+    months, row = inv_controls(section)
     top, equal = inv_variant()
     if section == "returns":
         inv_returns(key, data, book, prices, top=top, equal=equal)
@@ -4550,8 +6340,10 @@ def inv_section(  # noqa: PLR0913 - the view's inputs
         pf_style_box(s, prices, "inv_style")
     elif section == "correlation":
         inv_correlation(s, book, people, prices, months, top=top, equal=equal)
-    elif section == "risk":
-        pf_risk(s, prices, months)
+    elif section == "tail":
+        pf_tail(s, prices, months, row)
+    elif section == "outlook":
+        pf_outlook(s, prices, months)
     elif section == "stress":
         pf_stress_section(s, prices, months)
     else:
@@ -4582,30 +6374,25 @@ def inv_view(
     inv_bar(fetcher, pfetch, root, cik, agent, blocked)
     stamp = investors.stamp(root, cik)  # before loading, like the prices
     data = inv_load(str(root), cik, stamp)
-    inv_flags(data[0])
     found = data[1]
     if not found:
         if not fetcher.progress.running:
-            st.info(
-                "저장된 13F 자료가 없습니다."
-                + ("" if blocked else " **갱신**으로 받습니다.")
-            )
+            st.info("저장된 13F 자료가 없습니다.")
         return
     hold = bool(blocked) or fetcher.progress.running
     inv_prices(pfetch, hold, cik, investors.tickers(found, data[2]), prices)
-    st.info(INV_LIMITS, icon=":material/info:")
+    inv_holdings(found, data[2], data[3], prices, inv_flags(data[0]))
     section = st.segmented_control(
         "보기",
         list(INV_SECTIONS),
         format_func=INV_SECTIONS.__getitem__,
-        default="holdings",
+        default="returns",
         required=True,
         key="inv_section",
         label_visibility="collapsed",
     )
     key = pf_key(cik, stamp)
-    inv_section(section or "holdings", key, book, people, data, prices)
-    inv_method()
+    inv_section(section or "returns", key, book, people, data, prices)
 
 
 # ---- page sections
@@ -4617,19 +6404,15 @@ def pf_section(
     p: portfolio.Portfolio,
     prices: portfolio.Prices,
 ) -> None:
-    if not p.trades:
-        st.info("거래를 추가하세요. **보유·거래**에서 넣습니다.")
-        return
     if not prices.tickers & {t.ticker for t in p.trades}:
         pf_no_prices()
         return
     if section == "returns":
         pf_returns(p, prices)
         return
-    window = st.segmented_control(
-        "기간", list(portfolio.WINDOWS), default="3Y", required=True, key="pf_window"
-    )
-    months = portfolio.WINDOWS[window or "3Y"]
+    row = st.container(horizontal=True, vertical_alignment="bottom")
+    with row:
+        months = pf_periods("pf_horizon" if section == "outlook" else None)
     if section == "analysis":
         pf_analysis(p, prices, months)
         return
@@ -4639,8 +6422,10 @@ def pf_section(
         pf_correlation(s, prices, months, compare)
     elif section == "stress":
         pf_stress_section(s, prices, months)
+    elif section == "tail":
+        pf_tail(s, prices, months, row)
     else:
-        pf_risk(s, prices, months)
+        pf_outlook(s, prices, months)
 
 
 # ---------------------------------------------------------------- pages
@@ -4668,27 +6453,73 @@ def schedule() -> None:
     provenance(data)
 
 
+def screen_help(name: str, c: screen.Criteria) -> str:
+    """The data line's tooltip, as the criteria in force set it."""
+    years = screen.SEC_YEARS
+    liquidity = c.kept(
+        {
+            "min_bars": f"일봉 {c.min_bars}개 미만",
+            "min_price": f"주가 ${c.min_price:g} 미만",
+            "illiquid": f"20일 평균 거래대금 하위 {c.illiquid_share:.0%}",
+        }
+    )
+    checks = c.kept(screen.DQ_NAMES)
+    hold = c.kept(
+        {
+            "peak": "정점 이익",
+            "tailwind": f"업황 순풍(TTM 영업이익률 ≥ {years}년 중앙값 ×"
+            f" {c.tailwind_ratio:g} 그리고 ≥ 중앙값 + {c.tailwind_gap * 100:g}%p)",
+        }
+    )
+    rules = [
+        f"유동성 제외: {' · '.join(liquidity.values())}" if liquidity else "",
+        *screen.chart_rules(c),
+        f"퀄리티·밸류에이션 경계: 업종 백분위 {c.split:.0%}",
+        f"결격 {len(checks)}개: {'·'.join(checks.values())}" if checks else "",
+        f"은행 TCE/TA {screen.percent(c.bank_tce_floor)}" if c.on("dq_fcf") else "",
+        f"보류: {' · '.join(hold.values())}" if hold else "",
+        f"{years}년 중앙값: SEC 10-K, {years}년 미만이거나 SEC_USER_AGENT 없음이면"
+        f" 야후(약 4년, {screen.MARGIN_YEARS}년 이상)",
+        "SEC 중앙값 종목의 TTM: SEC 분기 4개, 없으면 야후",
+    ]
+    return (
+        f"**정의** {name} 구성 종목의 유동성·결격·기술 점수·퀄리티·밸류에이션"
+        " 기준 분류\n\n"
+        "**기준** " + " · ".join(rule for rule in rules if rule)
+    )
+
+
 def screening() -> None:
-    st.header("S&P 500 스크리닝", anchor="screen")
-    root = resolve_settings(args.settings).parent / screen.SNAPSHOT_DIR
-    screen_bar(screen_updater(str(root)), root)
+    key = state.setdefault("screen_universe", "sp500") or "sp500"
+    universe = screen.UNIVERSES[key]
+    criteria = crit_state()
+    st.segmented_control(
+        "유니버스",
+        list(screen.UNIVERSES),
+        format_func=lambda k: screen.UNIVERSES[k].name,
+        required=True,
+        key="screen_universe",
+        label_visibility="collapsed",
+    )
+    root = (
+        resolve_settings(args.settings).parent / screen.SNAPSHOT_DIR / universe.folder
+    )
+    screen_bar(
+        screen_updater(str(root), key), root, screen_help(universe.name, criteria)
+    )
+    criteria_panel(criteria)
     try:
-        table = screen_table(str(root), screen.stamp(root))
+        table = screen_table(str(root), screen.stamp(root), criteria)
     except (OSError, ValueError, KeyError) as error:
         st.error(f"`{screen.SNAPSHOT_DIR}/`의 파일을 읽지 못했습니다: {error}")
         return
     if table is None:
-        st.info(
-            "아직 받은 데이터가 없습니다. **갱신**을 누르면 S&P 500 종목을 받아"
-            f" `{screen.SNAPSHOT_DIR}/`에 저장합니다. 처음에는 시세와 재무를 모두"
-            " 받아 오래 걸립니다."
-        )
+        st.info("아직 받은 데이터가 없습니다.")
         return
-    screen_results(root, table)
+    screen_results(root, table, criteria)
 
 
 def portfolio_page() -> None:
-    st.header("포트폴리오", anchor="portfolio")
     root = pf_root()
     try:
         book = portfolio.load_book(root)
@@ -4720,24 +6551,23 @@ def portfolio_page() -> None:
         return
     p = pf_selector(book)
     pf_dialogs(p)
-    pf_bar(fetcher, root, book, missing)
+    pf_bar(fetcher, root, book, missing, have=prices.tickers)
     if p is None:
-        st.info("포트폴리오가 없습니다. **새로 만들기**로 시작합니다.")
+        st.info("포트폴리오가 없습니다.")
+        return
+    pf_holdings(p, prices)
+    if not p.trades:
         return
     section = st.segmented_control(
         "보기",
         list(PF_SECTIONS),
         format_func=PF_SECTIONS.__getitem__,
-        default="holdings",
+        default="returns",
         required=True,
         key="pf_section",
         label_visibility="collapsed",
     )
-    if section in {None, "holdings"}:
-        pf_holdings(p, prices)
-    else:
-        pf_section(section, book, p, prices)
-    pf_method(p, prices, state.get("pf_window") or "3Y")
+    pf_section(section or "returns", book, p, prices)
 
 
 # ---------------------------------------------------------------- app
@@ -4747,7 +6577,7 @@ with st.container(horizontal=True, vertical_alignment="center"):
     st.space("stretch")
     clock_slot = st.empty()
     open_settings = st.button("설정", icon=":material/tune:", shortcut="S")
-    st.button("새로고침", icon=":material/refresh:", type="primary", on_click=refresh)
+    st.button("갱신", icon=":material/refresh:", type="primary", on_click=refresh)
 
 if state.toast:
     st.toast(state.toast)
@@ -4758,6 +6588,9 @@ with st.spinner("공개 API에서 받는 중…"):
 
 with clock_slot:
     clocks(data.generated_at)
+
+if not args.demo:
+    _ = trainer(str(gen_root()))  # resumes or stops a job a restart left behind
 
 if open_settings:
     for v in data.views:
@@ -4788,6 +6621,7 @@ page_panels = next(
 notices(data)
 page.run()
 
+st.html(CARDS_CSS)
 st.html(AI_CSS.format(bg="#0e1117" if st.context.theme.type == "dark" else "#fff"))
 with st.container(key="ai_fab"):
     st.button(

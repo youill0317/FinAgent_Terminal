@@ -1,3 +1,6 @@
+# Tooltip text is split across lines.
+# pyright: reportImplicitStringConcatenation=false
+
 from __future__ import annotations
 
 import asyncio
@@ -300,6 +303,22 @@ def _regime(rows: Mapping[str, IndicatorRow]) -> tuple[RegimeCell, ...]:
             signed=True,
         ),
     )
+
+
+# The 국면 요약 cards' tooltips, by label; ``rule`` stays the short form the
+# analysis document quotes.
+REGIME_HELP: Final = {
+    "물가": "**정의** 근원 PCE 물가 전년 대비 상승률(PCEPILFE, %)\n\n**해석**"
+    f" {CORE_PCE_LOW}~{CORE_PCE_HIGH}% 목표 부근 · {CORE_PCE_HIGH}% 초과 목표 상회"
+    f" · {CORE_PCE_LOW}% 미만 목표 하회\n\n**기준** 연준 물가 목표 2%",
+    "고용": "**정의** 실시간 삼 룰(SAHMREALTIME) · 실업률 3개월 평균 − 직전 12개월 중"
+    f" 3개월 평균 최저치(%p)\n\n**해석** {SAHM_TRIGGER:.2f}%p 이상 침체 신호 ·"
+    f" {SAHM_WATCH:.2f}%p 이상 주의 구간 · 그 아래 침체 신호 없음",
+    "금리곡선": "**정의** 미 국채 10년물 − 2년물 수익률 차(T10Y2Y, %p)\n\n**해석**"
+    " 0 미만 장단기 역전 · 0 이상 정상 기울기",
+    "금융여건": "**정의** 시카고 연은 전국 금융여건지수(NFCI) · 평균 0, 표준편차 1로"
+    " 표준화한 값\n\n**해석** 0 초과 평균보다 긴축 · 0 이하 평균보다 완화",
+}
 
 
 def _cell(  # noqa: PLR0913

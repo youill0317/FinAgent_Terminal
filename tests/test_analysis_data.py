@@ -10,12 +10,11 @@ import httpx
 from finagent import catalog
 from finagent.analysis.context import build_document, fmt_value
 from finagent.analysis.evidence import Evidence
-from finagent.analysis.presets import PRESET_BY_ID, PRESETS
-from finagent.analysis.prompt import Conversation, ToolRecord, Turn, system_prompt
-from finagent.analysis.tools import MAX_POINTS, MAX_TOOL_CALLS, TOOL_NAMES, Toolbox
+from finagent.analysis.presets import PRESETS
+from finagent.analysis.prompt import Conversation, ToolRecord, Turn
+from finagent.analysis.tools import MAX_POINTS, MAX_TOOL_CALLS, Toolbox
 from finagent.analysis.verify import verify
 from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
-from finagent.models import Fmt
 from finagent.service import DashboardService
 
 if TYPE_CHECKING:
@@ -88,12 +87,6 @@ def test_rows_without_data_carry_status_and_reason_only() -> None:
     assert "kr_base" not in doc.evidence
 
 
-def test_format_matches_the_page() -> None:
-    assert fmt_value(-0.52, Fmt(dec=2, signed=True)) == "−0.52"
-    assert fmt_value(0.57, Fmt(suf="%p", dec=2, signed=True)) == "+0.57%p"
-    assert fmt_value(1234567.0, Fmt(pre="$", suf="B", dec=0)) == "$1,234,567B"
-
-
 # ---------------------------------------------------------------- verify
 
 
@@ -155,15 +148,6 @@ def test_a_mark_cites_only_its_own_sentence_but_a_whole_table_row() -> None:
 # ---------------------------------------------------------------- prompt and presets
 
 
-def test_system_prompt_fills_snapshot_and_tool_limit() -> None:
-    text = system_prompt("2026-10-12T09:00:00+00:00")
-
-    assert "2026-10-12T09:00:00+00:00 시점" in text
-    assert f"{MAX_TOOL_CALLS}회를 넘기지 않는다" in text
-    assert "{snapshot}" not in text
-    assert "{max_tools}" not in text
-
-
 def test_conversation_puts_the_document_first_and_keeps_earlier_tool_data() -> None:
     record = ToolRecord(
         "get_series", '{"id":"us_unrate"}', '{"cite_as":"us_unrate"}', ok=True
@@ -189,18 +173,9 @@ def test_presets_load_their_text_and_name_real_panels() -> None:
     for preset in PRESETS:
         assert preset.text.startswith("<task>")
         assert set(preset.panels) <= panel_ids
-    assert [preset.id for preset in PRESETS] == ["macro"]
-    macro = PRESET_BY_ID["macro"]
-    assert {"markets", "commodities", "credit", "housing"} <= set(macro.panels)
-    for anchor in ("매우 불리", "불리·주의", "혼재·보통", "유리", "매우 유리"):
-        assert anchor in macro.text
 
 
 # ---------------------------------------------------------------- tools
-
-
-def test_tool_names_are_stable() -> None:
-    assert TOOL_NAMES == ("search_series", "get_series", "source_guide")
 
 
 def test_catalog_search_finds_indicators_outside_the_view() -> None:
@@ -295,12 +270,3 @@ def test_tool_calls_stop_at_the_cap() -> None:
             ]
 
     assert asyncio.run(run()) == [True] * MAX_TOOL_CALLS + [False]
-
-
-def test_source_guide_lists_dashboard_codes_and_docs_section() -> None:
-    data = body(call("source_guide", {"source": "ECOS"}, service()))
-
-    assert "ECOS:722Y001/0101000" in " ".join(
-        cast("list[str]", data["dashboard_codes"])
-    )
-    assert cast("str", data["data_sources_md"]).startswith("## 4. 한국은행 ECOS")

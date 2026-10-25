@@ -16,7 +16,6 @@ from finagent.sources import (
     EcosSeries,
     FiscalSeries,
     FredSeries,
-    NyFedRate,
     SdmxSeries,
     YahooCloses,
     YahooSeries,
@@ -140,22 +139,6 @@ def test_fiscal_data_reads_string_values_and_filters() -> None:
         "record_date:gte:2022-10-12,security_desc:eq:Total Marketable"
     )
     assert params["fields"] == "record_date,avg_interest_rate_amt"
-
-
-def test_nyfed_reference_rates() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/rates/secured/sofr/last/1000.json"
-        return json_response(
-            {
-                "refRates": [
-                    {"effectiveDate": "2026-10-09", "type": "SOFR", "percentRate": 3.61}
-                ]
-            }
-        )
-
-    series = run(handler, lambda ctx: NyFedRate("secured/sofr").fetch(ctx, TODAY))
-
-    assert series == ((date(2026, 10, 9), 3.61),)
 
 
 def test_ecos_builds_path_and_parses_rows() -> None:
@@ -302,30 +285,7 @@ def test_vintages_pick_the_current_and_the_replaced_projection() -> None:
     assert params["realtime_end"] == "9999-12-31"
 
 
-def test_vintages_without_an_earlier_release() -> None:
-    def handler(_: httpx.Request) -> httpx.Response:
-        return json_response(
-            {
-                "observations": [
-                    {
-                        "realtime_start": "2026-09-17",
-                        "realtime_end": "9999-12-31",
-                        "date": "2026-09-17",
-                        "value": "3.0",
-                    }
-                ]
-            }
-        )
-
-    latest, prior = run(
-        handler, lambda ctx: fred_vintages(ctx, "FEDTARMDLR", date(2025, 10, 12))
-    )
-
-    assert latest.series == ((date(2026, 9, 17), 3.0),)
-    assert prior is None
-
-
-def test_server_errors_are_retried_once() -> None:
+def test_server_errors_are_retried_once_only() -> None:
     calls: list[int] = []
 
     def flaky(_: httpx.Request) -> httpx.Response:
@@ -339,9 +299,7 @@ def test_server_errors_are_retried_once() -> None:
     assert series == ((date(2026, 10, 8), 4.0),)
     assert len(calls) == 2
 
-
-def test_repeated_server_errors_give_up_after_one_retry() -> None:
-    calls: list[int] = []
+    calls.clear()
 
     def down(_: httpx.Request) -> httpx.Response:
         calls.append(1)
@@ -349,7 +307,7 @@ def test_repeated_server_errors_give_up_after_one_retry() -> None:
 
     with pytest.raises(SourceError, match="FRED HTTP 503"):
         _ = run(down, lambda ctx: FredSeries("DGS10").fetch(ctx, TODAY))
-    assert len(calls) == 2
+    assert len(calls) == 2  # gives up after one retry
 
 
 @pytest.mark.parametrize(

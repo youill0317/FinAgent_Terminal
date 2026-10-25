@@ -1,0 +1,8 @@
+# Colab (T4) packages for training/; torch, numpy, scipy, scikit-learn,
+# matplotlib, tqdm, cython and numba come with the Colab image.
+torchsde==0.2.6
+# Built from source against the installed numpy/Cython, so setup_colab.sh
+# installs these two with --no-build-isolation:
+#   iisignature==0.24 (checks the SigCWGAN signature stand-in)
+#   sigkernel from crispitagorico/sigkernel at
+#   40a583155ea8d2194af0e90dddab37e2659cfcfd (no wheel; setup.py imports Cython)

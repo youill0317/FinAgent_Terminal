@@ -5,9 +5,10 @@ outcomes; nothing ranks, picks or suggests weights. "Not computable" (too
 few observations, zero spread, no sign change) is ``None``.
 
 Conventions: Sharpe is per period, mean excess ÷ std (ddof=1), annualised by
-√252 only for display. Kurtosis is raw (normal = 3). Drawdowns compound from a
-starting capital of 1 and are negative (-0.25 is a 25% fall). Nothing is
-annualised over a span shorter than 365 calendar days.
+√(periods a year) only for display, 252 unless the caller counts its own.
+Kurtosis is raw (normal = 3). Drawdowns compound from a starting capital of 1
+and are negative (-0.25 is a 25% fall). Nothing is annualised over a span
+shorter than 365 calendar days.
 """
 
 # pandas ships no type stubs.
@@ -20,13 +21,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from statistics import NormalDist
-from typing import Final, cast
+from typing import Final, Literal, cast
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
 type Floats = npt.NDArray[np.float64]
+type Quote = Literal["discount", "simple"]  # how a 91-day rate is stated
 
 TRADING_DAYS: Final = 252
 YEAR_DAYS: Final = 365
@@ -35,13 +37,16 @@ CONFIDENCE: Final = 0.95
 NORMAL_KURT: Final = 3.0
 CDAR_LEVEL: Final = 0.95
 PERCENT: Final = 100.0
-DRAWDOWN_LEVELS: Final = (0.10, 0.20, 0.30)
+PATH_LEVELS: Final = (0.10, 0.20, 0.30)  # simulated falls and rises
 RECOVERY_RANGE: Final = (0.10, 0.90)
 EULER_GAMMA: Final = 0.5772156649015329
 TOLERANCE: Final = 1e-12  # a value this close below its peak has recovered
-XIRR_LOW: Final = -0.9999
-XIRR_HIGH: Final = 10.0
+XIRR_REACH: Final = 100.0  # most |log growth| over the whole span tried
+XIRR_GRID: Final = 4001  # points scanned for sign changes of the NPV
 XIRR_STEPS: Final = 200
+MAX_LOG: Final = 700.0  # exp() of more overflows: the annual rate is None
+BILL_DAYS: Final = 91  # CD 91-day and the 13-week T-bill
+DISCOUNT_YEAR: Final = 360  # days in a bank-discount year
 STYLE_STEPS: Final = 5000
 STYLE_TOLERANCE: Final = 1e-10
 
@@ -97,9 +102,15 @@ def sharpe_se(sr: float, n: int, skew: float = 0.0, kurt: float = NORMAL_KURT) -
 
 
 def sharpe_ci(
-    rets: npt.ArrayLike, rf: npt.ArrayLike = 0.0, conf: float = CONFIDENCE
+    rets: npt.ArrayLike,
+    rf: npt.ArrayLike = 0.0,
+    conf: float = CONFIDENCE,
+    periods: float = TRADING_DAYS,
 ) -> SharpeCI | None:
-    """Annualised Sharpe with a Mertens (non-normal, IID) confidence interval."""
+    """Annualised Sharpe with a Mertens (non-normal, IID) confidence interval.
+
+    ``periods`` returns make a year.
+    """
     x = _floats(rets) - _floats(rf)
     sr = sharpe(x)
     moments = skew_kurt(x)
@@ -107,7 +118,7 @@ def sharpe_ci(
         return None
     se = sharpe_se(sr, len(x), *moments)
     z = _NORMAL.inv_cdf(0.5 + conf / 2)
-    k = math.sqrt(TRADING_DAYS)
+    k = math.sqrt(periods)
     return SharpeCI(sr * k, (sr - z * se) * k, (sr + z * se) * k, se * k, len(x))
 
 
@@ -186,15 +197,20 @@ def average_drawdown(rets: npt.ArrayLike) -> float:
 
 
 def cdar(rets: npt.ArrayLike, alpha: float = CDAR_LEVEL) -> float:
-    """Conditional drawdown at risk: mean of the worst ceil((1 - alpha) * N) drawdowns.
+    """Conditional drawdown at risk: mean of the worst (1 - alpha) share of drawdowns.
 
-    alpha -> 1 gives the maximum drawdown, alpha = 0 the average drawdown.
+    With m = N (1 - alpha), the deepest ceil(m) count, the shallowest of them
+    by its fraction (Rockafellar-Uryasev, as ``quant._tail``). alpha -> 1
+    gives the maximum drawdown, alpha = 0 the average drawdown.
     """
     dd = np.sort(drawdown_series(rets))
     if not len(dd):
         return 0.0
-    k = max(1, math.ceil(round((1 - alpha) * len(dd), 9)))
-    return float(dd[:k].mean())
+    m = round((1 - alpha) * len(dd), 9)
+    if m <= 0:
+        return float(dd[0])
+    top = math.ceil(m)
+    return float((dd[: top - 1].sum() + (m - top + 1) * dd[top - 1]) / m)
 
 
 def ulcer_index(rets: npt.ArrayLike) -> float:
@@ -294,15 +310,34 @@ def underwater(wealth: pd.Series) -> Underwater:
 # ---------------------------------------------------------------- money and currencies
 
 
+def effective_annual(rates: pd.Series, quote: Quote) -> pd.Series:
+    """Effective annual percent from annual percent 91-day ``rates``.
+
+    ``discount``: a bank-discount yield on a 360-day year (^IRX), bought at
+    1 - d 91/360; ``simple``: a simple yield on a 365-day year (CD 91-day),
+    growing by 1 + r 91/365. Either compounded over 365/91 periods a year.
+    """
+    d = rates / PERCENT
+    if quote == "discount":
+        gross = 1 / (1 - d * BILL_DAYS / DISCOUNT_YEAR)
+    else:
+        gross = 1 + d * BILL_DAYS / YEAR_DAYS
+    return (gross ** (YEAR_DAYS / BILL_DAYS) - 1) * PERCENT
+
+
 def daily_rf(
-    rates: pd.Series, index: pd.DatetimeIndex, periods: int = TRADING_DAYS
+    rates: pd.Series,
+    index: pd.DatetimeIndex,
+    quote: Quote,
+    periods: float = TRADING_DAYS,
 ) -> pd.Series:
     """Per-period risk-free returns on ``index`` from annual percent ``rates``.
 
-    E.g. CD 91-day or ^IRX levels; (1 + rate/100)^(1/periods) - 1, the last
-    known rate carried forward. Days before the first rate stay NaN.
+    E.g. CD 91-day (``simple``) or ^IRX (``discount``) levels, made effective
+    annual (``effective_annual``), then (1 + annual)^(1/periods) - 1, the
+    last known rate carried forward. Days before the first rate stay NaN.
     """
-    known = rates.dropna().sort_index()
+    known = effective_annual(rates.dropna().sort_index(), quote)
     carried = known.reindex(known.index.union(index)).ffill().reindex(index)
     return ((1 + carried / PERCENT) ** (1 / periods) - 1).astype("float64")
 
@@ -322,42 +357,67 @@ def annualise(cumulative: float, span_days: float) -> Annualised:
     return Annualised(cumulative, annual, annualised=True)
 
 
+def _log_growth(days: npt.ArrayLike, cash: npt.ArrayLike) -> tuple[float, float] | None:
+    """The IRR as log growth h over the whole span, and the span in days.
+
+    Solved in h, where NPV(h) = sum(c exp(-h t / span)), so a few-day span
+    needs no huge annual rate. The NPV is scanned for sign changes on
+    ``XIRR_GRID`` points of |h| <= ``XIRR_REACH``: exactly one is bisected;
+    none or several (more than one rate fits) give None.
+    """
+    t = _floats(days)
+    c = _floats(cash)
+    span = float(t.max() - t.min()) if len(t) else 0.0
+    if span <= 0 or not ((c > 0).any() and (c < 0).any()):
+        return None
+    u = (t - t.min()) / span
+
+    def npv(h: npt.ArrayLike) -> Floats:
+        return np.exp(-np.multiply.outer(_floats(h), u)) @ c
+
+    grid = np.linspace(-XIRR_REACH, XIRR_REACH, XIRR_GRID)
+    sign = np.sign(npv(grid))
+    zeros = np.flatnonzero(sign == 0)
+    flips = np.flatnonzero(sign[:-1] * sign[1:] < 0)
+    if len(zeros) + len(flips) != 1:
+        return None
+    if len(zeros):
+        return float(grid[zeros[0]]), span
+    low, high = float(grid[flips[0]]), float(grid[flips[0] + 1])
+    at_low = float(npv(low))
+    for _ in range(XIRR_STEPS):
+        mid = (low + high) / 2
+        if at_low * float(npv(mid)) <= 0:
+            high = mid
+        else:
+            low = mid
+    return (low + high) / 2, span
+
+
 def xirr(days: npt.ArrayLike, cash: npt.ArrayLike) -> float | None:
     """Annual internal rate of return (actual/365) of dated cash flows.
 
     ``days`` are calendar-day offsets; ``cash`` is from the investor's side
     (deposits negative, withdrawals and today's value positive). None with no
-    sign change, or when no rate in -99.99%..+1000% fits.
+    sign change in ``cash``, all flows on one day, no rate within a growth of
+    e^±100 over the span, several rates (the NPV changes sign more than
+    once), or an annual rate too large for a float.
     """
-    t = _floats(days)
-    c = _floats(cash)
-    if not ((c > 0).any() and (c < 0).any()):
+    found = _log_growth(days, cash)
+    if found is None:
         return None
-    years = (t - t.min()) / YEAR_DAYS
-
-    def npv(rate: float) -> float:
-        return float((c / (1 + rate) ** years).sum())
-
-    low, high = XIRR_LOW, XIRR_HIGH
-    if npv(low) * npv(high) > 0:
-        return None
-    for _ in range(XIRR_STEPS):
-        mid = (low + high) / 2
-        if npv(low) * npv(mid) <= 0:
-            high = mid
-        else:
-            low = mid
-    return (low + high) / 2
+    h, span = found
+    annual = h * YEAR_DAYS / span
+    return math.expm1(annual) if annual < MAX_LOG else None
 
 
 def mwr(days: npt.ArrayLike, cash: npt.ArrayLike) -> Annualised | None:
     """Money-weighted return: XIRR, de-annualised over the span under a year."""
-    rate = xirr(days, cash)
-    if rate is None:
+    found = _log_growth(days, cash)
+    if found is None:
         return None
-    t = _floats(days)
-    span = float(t.max() - t.min())
-    return annualise((1 + rate) ** (span / YEAR_DAYS) - 1, span)
+    h, span = found
+    return annualise(math.expm1(h), span)
 
 
 def to_base(local: npt.ArrayLike, fx: npt.ArrayLike) -> Floats:
@@ -391,7 +451,7 @@ def fx_split(w_prev: npt.ArrayLike, local: npt.ArrayLike, fx: npt.ArrayLike) -> 
 
 
 def blend(w_kr: npt.ArrayLike, kr: npt.ArrayLike, us: npt.ArrayLike) -> Floats:
-    """Daily price-only benchmark returns in base currency.
+    """Daily returns of a two-index benchmark in base currency.
 
     ``kr`` and ``us`` are the two index legs already in base (see
     ``to_base``). ``w_kr`` per day is the portfolio's Korean share at the
@@ -407,21 +467,28 @@ def _active(rets: npt.ArrayLike, bench: npt.ArrayLike) -> Floats | None:
     return active if len(active) >= MIN_OBS else None
 
 
-def tracking_error(rets: npt.ArrayLike, bench: npt.ArrayLike) -> float | None:
-    """Annualised std of daily active returns; None under 252 observations."""
+def tracking_error(
+    rets: npt.ArrayLike, bench: npt.ArrayLike, periods: float = TRADING_DAYS
+) -> float | None:
+    """Annualised std of daily active returns; None under 252 observations.
+
+    ``periods`` returns make a year.
+    """
     active = _active(rets, bench)
     if active is None:
         return None
-    return float(active.std(ddof=1)) * math.sqrt(TRADING_DAYS)
+    return float(active.std(ddof=1)) * math.sqrt(periods)
 
 
-def information_ratio(rets: npt.ArrayLike, bench: npt.ArrayLike) -> float | None:
+def information_ratio(
+    rets: npt.ArrayLike, bench: npt.ArrayLike, periods: float = TRADING_DAYS
+) -> float | None:
     """Annualised mean active return ÷ tracking error."""
     active = _active(rets, bench)
-    te = tracking_error(rets, bench)
+    te = tracking_error(rets, bench, periods)
     if active is None or te is None or te <= 0:
         return None
-    return float(active.mean()) * TRADING_DAYS / te
+    return float(active.mean()) * periods / te
 
 
 def active_share(w_p: pd.Series, w_b: pd.Series) -> float:
@@ -571,35 +638,69 @@ def selection_returns(y: npt.ArrayLike, x: npt.ArrayLike, window: int) -> Floats
 
 
 @dataclass(frozen=True, slots=True)
+class Reach:
+    """Shares of paths past a level, three ways: end <= touched <= swing."""
+
+    end: float  # at the horizon, from today
+    touched: float  # on any day, from today
+    swing: float  # on any day, from the high (a fall) or low (a rise) so far
+
+
+@dataclass(frozen=True, slots=True)
 class PathRisk:
-    drawdown_odds: dict[float, float]  # level → share of paths falling further
+    falls: dict[float, Reach]  # level → paths down at least this far
+    rises: dict[float, Reach]  # level → paths up at least this far
     recovery_median: int | None  # periods to regain the peak; None past horizon
     recovery_low: int | None  # 10th percentile
     recovery_high: int | None  # 90th percentile
     never: float  # share of paths still below the peak at the horizon
 
 
+def _reach(
+    end: Floats, touched: Floats, swing: Floats, levels: tuple[float, ...]
+) -> dict[float, Reach]:
+    return {
+        level: Reach(
+            float((end >= level).mean()),
+            float((touched >= level).mean()),
+            float((swing >= level).mean()),
+        )
+        for level in levels
+    }
+
+
 def path_risk(
     paths: npt.ArrayLike,
     current: float,
     peak: float,
-    levels: tuple[float, ...] = DRAWDOWN_LEVELS,
+    levels: tuple[float, ...] = PATH_LEVELS,
 ) -> PathRisk:
-    """Drawdown and recovery odds from simulated growth paths.
+    """Falls, rises and recovery odds from simulated growth paths.
 
     ``paths`` is paths x horizon cumulative growth from today (1.05 = +5%),
     column h being the growth after h + 1 periods: leave out a leading column
     of ones.
-    Drawdowns are those inside the horizon, from today's value or a later
-    high; recovery is the first period back at the historical ``peak``.
-    Recovery figures are None when already at the peak.
+    A fall of X: 1 - V/ref >= X; a rise: V/ref - 1 >= X. ``Reach.end`` takes
+    ref = today and the last period, ``touched`` today and any period,
+    ``swing`` the high (a fall) or low (a rise) so far, today's included,
+    so each holds on a path the one before it does.
+    Recovery is the first period back at the historical ``peak``; its
+    figures are None when already at the peak.
     """
     growth = _floats(paths)
-    high = np.maximum(np.maximum.accumulate(growth, axis=1), 1.0)
-    worst = (growth / high - 1).min(axis=1)
-    odds = {level: float((worst < -level).mean()) for level in levels}
+    end = growth[:, -1]
+    ratio = np.maximum.accumulate(growth, axis=1)  # one buffer, reused
+    _ = np.maximum(ratio, 1.0, out=ratio)
+    _ = np.divide(growth, ratio, out=ratio)
+    from_high = ratio.min(axis=1)
+    _ = np.minimum.accumulate(growth, axis=1, out=ratio)
+    _ = np.minimum(ratio, 1.0, out=ratio)
+    _ = np.divide(growth, ratio, out=ratio, where=ratio > 0)  # a wiped-out path: 0
+    from_low = ratio.max(axis=1)
+    falls = _reach(1 - end, 1 - growth.min(axis=1), 1 - from_high, levels)
+    rises = _reach(end - 1, growth.max(axis=1) - 1, from_low - 1, levels)
     if current >= peak:
-        return PathRisk(odds, None, None, None, 0.0)
+        return PathRisk(falls, rises, None, None, None, 0.0)
     hit = growth * current >= peak * (1 - TOLERANCE)
     reached = hit.any(axis=1)
     periods = np.where(reached, np.argmax(hit, axis=1) + 1, np.inf)
@@ -610,7 +711,8 @@ def path_risk(
 
     low, high_q = RECOVERY_RANGE
     return PathRisk(
-        odds,
+        falls,
+        rises,
         quantile(0.5),
         quantile(low),
         quantile(high_q),

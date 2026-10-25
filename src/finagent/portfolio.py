@@ -12,8 +12,10 @@ Two price bases, never mixed: valuation and P&L use closes (split-adjusted,
 not dividend-adjusted) against the trade prices the user entered; returns,
 correlations and risk use adjusted closes (dividends and splits). Amounts are
 converted to the portfolio's base currency with daily USD/KRW (``KRW=X``).
-A missing price stays missing: a close is carried over at most ``FILL_LIMIT``
-rows to line up market holidays, never further.
+A missing price stays missing: a close is carried over a series' own gap
+(holidays, a short outage) for at most ``FILL_DAYS`` calendar days and past
+its last close for ``GAP_DAYS``, never further (``carry_over``); a 13F clone
+buys only at a close at most ``GAP_DAYS`` old.
 """
 
 # pandas and yfinance ship no type stubs.
@@ -28,7 +30,7 @@ import math
 import re
 import threading
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Final, Literal, Protocol, cast, final
@@ -51,37 +53,36 @@ DATA_DIR: Final = Path("data") / "portfolio"
 BOOK_FILE: Final = "portfolios.json"
 CLOSE_FILE: Final = "close.parquet"
 ADJUSTED_FILE: Final = "adjusted.parquet"
+RANGE_FILES: Final = ("open.parquet", "high.parquet", "low.parquet")  # on request
 YFINANCE_CACHE: Final = ".yfinance"
 PACKAGES: Final = ("yfinance",)
 INSTALL_HINT: Final = "uv sync --extra screen"
 FX: Final = "KRW=X"  # won per dollar
-BENCHMARK: Final = "^GSPC"
+BENCHMARK: Final = "^GSPC"  # price index, from 1987: stress, index x beta, betas
 BENCHMARK_LABEL: Final = "S&P 500"
+TOTAL_RETURN: Final = "^SP500TR"  # dividends reinvested, from 1988: return comparisons
 KOSPI: Final = "^KS11"  # stand-in for Korean holdings in stress windows
 KOSDAQ: Final = "^KQ11"
 KRW_INDICES: Final = (KOSPI, KOSDAQ)  # quoted in won
 RF_USD: Final = "^IRX"  # 13-week T-bill, annual percent: the USD risk-free rate
+VIX: Final = "^VIX"  # fetched on request, for the HAR filter
 HISTORY_START: Final = date(2007, 1, 1)  # holdings' history
 LONG_TICKERS: Final = (BENCHMARK, KOSPI, FX)  # kept back to LONG_START for stress
 LONG_START: Final = date(1987, 1, 1)
-FILL_LIMIT: Final = 5  # rows a close is carried over to line up holidays
-GAP_DAYS: Final = 7  # calendar days a rate or window edge may sit from its date
+FILL_DAYS: Final = 31  # calendar days a close is carried over a gap it resumes from
+GAP_DAYS: Final = 7  # calendar days a rate, window edge or last close may sit off
 TRADING_DAYS: Final = 252
 YEAR_DAYS: Final = 365
-MONTH_DAYS: Final = 21
 MIN_DAYS: Final = 20  # fewer return days and a statistic is left out
 WEEK: Final = "W-FRI"  # weekly returns for turbulence and style
 KOREAN_MAJORITY: Final = 0.5  # a book more Korean than this by value closes in Seoul
-PATHS: Final = 5000
-SEED: Final = 7
+PATHS: Final = 20_000  # a path share's Monte Carlo SD <= 0.35%p; 1Y peak ~150 MB
 PERCENTILES: Final = (5, 25, 50, 75, 95)
 BINS: Final = 40
 WINDOWS: Final = {"6M": 6, "1Y": 12, "3Y": 36}
-HORIZONS: Final = {"1M": 21, "3M": 63, "1Y": 252}
+HORIZONS: Final = {"1M": 21, "3M": 63, "6M": 126, "1Y": 252}
 KRW_SUFFIXES: Final = (".KS", ".KQ")
-LOSS_LEVELS: Final = (0.10, 0.20)  # Monte Carlo: share of paths ending this far down
 VAR_LEVELS: Final = (0.95, 0.975, 0.99)
-WIDE_MONTH: Final = 1.25  # overlapping vs sqrt(21) 1-month VaR this far apart: noted
 REVERSE_LOSS: Final = 0.30
 CHART_POINTS: Final = 1000  # most points a chart line shows; calculations use all
 PROXY_MIN_DAYS: Final = 60  # fewer overlapping returns: a stand-in index at beta 1
@@ -107,7 +108,7 @@ MEMO_LENGTH: Final = 200
 SIDES: Final = {"buy": "매수", "sell": "매도"}
 SYMBOLS: Final = {"KRW": "₩", "USD": "$"}
 DECIMALS: Final = {"KRW": 0, "USD": 2}
-UNKNOWN: Final = "미확인"
+UNKNOWN: Final = "—"
 
 Side = Literal["buy", "sell"]
 Currency = Literal["KRW", "USD"]
@@ -462,9 +463,13 @@ def book_tickers(book: Book) -> list[str]:
     return sorted({t.ticker for p in book.portfolios for t in p.trades})
 
 
-def wanted(book: Book) -> list[str]:
-    """Every ticker the page values, USD/KRW, the indices and the USD rate."""
-    return [*book_tickers(book), FX, BENCHMARK, KOSPI, RF_USD]
+def wanted(book: Book, saved: Collection[str] = ()) -> list[str]:
+    """Every ticker the page values, USD/KRW, the indices and the USD rate.
+
+    With VIX once it is among the ``saved`` tickers (it is fetched on request).
+    """
+    vix = [VIX] if VIX in saved else []
+    return [*book_tickers(book), FX, BENCHMARK, TOTAL_RETURN, KOSPI, RF_USD, *vix]
 
 
 # ---------------------------------------------------------------- storage
@@ -502,6 +507,15 @@ def _empty() -> pd.DataFrame:
 class Prices:
     close: pd.DataFrame  # daily closes, one column per ticker
     adjusted: pd.DataFrame  # daily adjusted closes, same columns
+    # Raw daily opens, highs and lows (split- not dividend-adjusted, like
+    # ``close``), only for the tickers they were asked for.
+    open: pd.DataFrame = field(default_factory=_empty)
+    high: pd.DataFrame = field(default_factory=_empty)
+    low: pd.DataFrame = field(default_factory=_empty)
+
+    @property
+    def ranges(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        return self.open, self.high, self.low
 
     @property
     def tickers(self) -> frozenset[str]:
@@ -514,19 +528,34 @@ def no_prices() -> Prices:
     return Prices(_empty(), _empty())
 
 
+def _read(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(path)
+    except (OSError, ValueError):
+        return _empty()
+
+
 def load_prices(root: Path) -> Prices:
     try:
-        return Prices(
-            pd.read_parquet(root / CLOSE_FILE), pd.read_parquet(root / ADJUSTED_FILE)
-        )
+        close = pd.read_parquet(root / CLOSE_FILE)
+        adjusted = pd.read_parquet(root / ADJUSTED_FILE)
     except (OSError, ValueError):
         return no_prices()
+    found = [
+        _read(root / name) if (root / name).is_file() else _empty()
+        for name in RANGE_FILES
+    ]
+    return Prices(close, adjusted, *found)
 
 
 def save_prices(root: Path, prices: Prices) -> None:
+    """The closes, and the opens, highs and lows once any were asked for."""
     root.mkdir(parents=True, exist_ok=True)
     _write(prices.adjusted, root / ADJUSTED_FILE)
     _write(prices.close, root / CLOSE_FILE)
+    for frame, name in zip(prices.ranges, RANGE_FILES, strict=True):
+        if len(frame.columns):
+            _write(frame, root / name)
 
 
 def prices_saved_at(root: Path) -> datetime | None:
@@ -545,6 +574,8 @@ def merge(old: Prices, new: Prices) -> Prices:
     """
 
     def one(before: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
+        if not len(fresh.columns):  # e.g. no opens, highs or lows kept
+            return before
         kept = before.drop(columns=list(fresh.columns), errors="ignore")
         columns: dict[str, pd.Series] = {}
         for name in fresh.columns:
@@ -558,7 +589,29 @@ def merge(old: Prices, new: Prices) -> Prices:
         added = pd.DataFrame(columns, dtype="float64")
         return pd.concat([kept, added], axis=1).sort_index()
 
-    return Prices(one(old.close, new.close), one(old.adjusted, new.adjusted))
+    return Prices(
+        one(old.close, new.close),
+        one(old.adjusted, new.adjusted),
+        *(one(a, b) for a, b in zip(old.ranges, new.ranges, strict=True)),
+    )
+
+
+def kept_ranges(fresh: Prices, saved: Prices, asked: bool) -> Prices:
+    """``fresh`` with opens, highs and lows only where ``asked`` or already saved.
+
+    Yahoo sends them with every download; they are kept for a ticker only
+    once the user asked for them, then refreshed with its closes.
+    """
+    if asked:
+        return fresh
+    have = set(saved.high.columns)
+    return replace(
+        fresh,
+        **{
+            name: frame[[c for c in frame.columns if c in have]]
+            for name, frame in zip(("open", "high", "low"), fresh.ranges, strict=True)
+        },
+    )
 
 
 def _write(frame: pd.DataFrame, path: Path) -> None:
@@ -624,6 +677,25 @@ def trading_days(frame: pd.DataFrame, names: Sequence[str]) -> pd.DatetimeIndex:
     )
 
 
+def carry_over(frame: pd.DataFrame, limit: int = FILL_DAYS) -> pd.DataFrame:
+    """Each column's last close carried over its own gaps, by calendar days.
+
+    Up to ``limit`` since its last close, so a market's first return after
+    its holiday (or USD/KRW's after an outage) spans the whole gap and is
+    kept; past a column's last close only ``GAP_DAYS``, so a series that
+    stopped is not carried on. ``frame`` is sorted by date.
+    """
+    if frame.empty:
+        return frame
+    known = frame.notna().to_numpy()
+    day = pd.DatetimeIndex(frame.index).to_numpy("datetime64[D]").astype(np.int64)
+    seen = np.where(known, day[:, None], np.iinfo(np.int64).min // 2)
+    age = day[:, None] - np.maximum.accumulate(seen, axis=0)
+    last = seen.max(axis=0)
+    ok = (age <= limit) & ((day[:, None] <= last) | (age <= GAP_DAYS))
+    return frame.ffill().where(ok)
+
+
 def in_base(
     frame: pd.DataFrame,
     names: Sequence[str],
@@ -633,7 +705,7 @@ def in_base(
     """Prices of ``names`` in ``base`` on ``days`` (by default when any traded)."""
     on = trading_days(frame, names) if days is None else days
     columns = [*dict.fromkeys([*names, FX])]
-    filled = frame.reindex(columns=columns).sort_index().ffill(limit=FILL_LIMIT)
+    filled = carry_over(frame.reindex(columns=columns).sort_index())
     filled = filled.reindex(on)
     fx = cast("pd.Series", filled[FX])
     out: dict[str, pd.Series] = {}
@@ -910,6 +982,21 @@ def span_days(index: pd.Index) -> float:
     return float((last - first).days)
 
 
+def per_year(index: pd.Index) -> float:
+    """Return observations a year in ``index``: steps x 365 / their calendar days.
+
+    A mix's days are the union of the Korean and US calendars (about 258 a
+    year; KOSPI alone about 243, the S&P 500 251), so annualising by a fixed
+    252 would misstate both. Steps longer than ``FILL_DAYS`` (a sold-out
+    stretch ``held_returns`` leaves out, not a holiday) are not counted.
+    ``TRADING_DAYS`` without a step.
+    """
+    days = pd.DatetimeIndex(index).to_numpy("datetime64[D]").astype(np.int64)
+    steps = np.diff(days)
+    steps = steps[steps <= FILL_DAYS]
+    return len(steps) * YEAR_DAYS / steps.sum() if steps.sum() > 0 else TRADING_DAYS
+
+
 def time_weighted(cumulative: pd.Series) -> perf.Annualised | None:
     """A cumulative return over its span; annual only from a year on."""
     known = cumulative.dropna()
@@ -940,24 +1027,32 @@ def window[T: (pd.Series, pd.DataFrame)](data: T, months: int) -> T:
     return data.truncate(before=last - pd.DateOffset(months=months))
 
 
-def held_returns(portfolio: Portfolio, adjusted: pd.DataFrame) -> pd.Series:
+def held_returns(
+    portfolio: Portfolio, close: pd.DataFrame, adjusted: pd.DataFrame
+) -> pd.Series:
     """Daily returns of the positions held at the previous close, in base.
 
-    Adjusted closes; time-weighted, so buys and sells do not count as gains.
-    Days on which an open position has no price are left out.
+    Each position weighs its value at the previous close (closes, as the
+    book is valued) and moves by its adjusted close, so a dividend counts on
+    its day without tilting the weights before it. Time-weighted, so buys
+    and sells do not count as gains. Days on which an open position has no
+    price are left out.
     """
     names = sorted({t.ticker for t in portfolio.trades})
     if not names:
         return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
-    prices = in_base(adjusted, names, portfolio.base)
+    prices = in_base(close, names, portfolio.base)
     days = cast("pd.DatetimeIndex", prices.index)
+    growth = in_base(adjusted, names, portfolio.base, days)
     held = quantities(portfolio.trades, days).reindex(columns=names).fillna(0.0)
     held = held.shift(1).fillna(0.0)
-    before = prices.shift(1)
-    unknown = ((held > EPSILON) & (prices.isna() | before.isna())).any(axis=1)
-    start = (held * before).sum(axis=1)
+    on = held > EPSILON
+    worth = held * prices.shift(1)
+    moved = growth / growth.shift(1)
+    unknown = (on & (worth.isna() | moved.isna())).any(axis=1)
+    start = worth.where(on, 0.0).sum(axis=1)
     keep = ~unknown & (start > 0)
-    end = (held * prices).sum(axis=1)
+    end = (worth * moved).where(on, 0.0).sum(axis=1)
     return (end[keep] / start[keep] - 1).rename("portfolio")
 
 
@@ -1040,13 +1135,15 @@ def clone(prices: pd.DataFrame, schedule: Sequence[tuple[date, pd.Series]]) -> C
 
     Each step's turnover is ``perf.turnover`` of the new set against the
     previous one drifted to that close; the first purchase, or one after a
-    period in cash, has none.
+    period in cash, has none. A holding is bought only at a close at most
+    ``GAP_DAYS`` old: these are US stocks on one calendar, so an older one
+    means a halt, and a weight set is not bought at a stale price.
     """
     names = sorted({str(t) for _, w in schedule for t in w.index})
     frame = prices.reindex(columns=names).sort_index()
     frame = frame[frame.notna().any(axis=1)]
     days = cast("pd.DatetimeIndex", frame.index)
-    near = frame.ffill(limit=FILL_LIMIT)
+    near = carry_over(cast("pd.DataFrame", frame), GAP_DAYS)
     carried = frame.ffill()
     starts: dict[int, pd.Series] = {}
     for day, w in sorted(schedule, key=lambda it: it[0]):
@@ -1088,7 +1185,7 @@ def clone(prices: pd.DataFrame, schedule: Sequence[tuple[date, pd.Series]]) -> C
     if not pieces:
         empty = pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
         return Clone(empty, (), pd.Series(dtype="float64"))
-    now = _priced_now(drifted, cast("pd.DataFrame", near))
+    now = _priced_now(drifted, near)
     return Clone(pd.concat(pieces) - 1, tuple(steps), now)
 
 
@@ -1160,13 +1257,14 @@ def us_sleeve(w: pd.Series) -> pd.Series:
 def lineup(
     book: Book, prices: Prices, base: Currency, months: int
 ) -> tuple[pd.DataFrame, list[bool]]:
-    """Each portfolio's current-weights returns and the S&P 500, in ``base``.
+    """Each portfolio's current-weights returns and the S&P 500's, in ``base``.
 
-    Holdings whose returns start or stop inside the window are left out
-    (``covered``). The flags say which columns close in Seoul: a portfolio
-    more than ``KOREAN_MAJORITY`` Korean by value.
+    The S&P 500 with dividends (``TOTAL_RETURN``), as the holdings' adjusted
+    closes have them, when it has any. Holdings whose returns start or stop
+    inside the window are left out (``covered``). The flags say which columns
+    close in Seoul: a portfolio more than ``KOREAN_MAJORITY`` Korean by value.
     """
-    names = [*book_tickers(book), BENCHMARK]
+    names = [*book_tickers(book), TOTAL_RETURN]
     rets = window(asset_returns(prices.adjusted, names, base), months)
     columns: dict[str, pd.Series] = {}
     flags: list[bool] = []
@@ -1175,8 +1273,11 @@ def lineup(
         if not w.empty:
             columns[p.name] = weighted(rets, w)
             flags.append(korean_weight(w) > KOREAN_MAJORITY)
-    columns[BENCHMARK_LABEL] = cast("pd.Series", rets[BENCHMARK])
-    return pd.DataFrame(columns), [*flags, False]
+    index = cast("pd.Series", rets[TOTAL_RETURN])
+    if index.notna().any():  # none until ^SP500TR is fetched
+        columns[BENCHMARK_LABEL] = index
+        flags.append(False)
+    return pd.DataFrame(columns), flags
 
 
 # ---------------------------------------------------------------- returns panel
@@ -1205,23 +1306,28 @@ def korean_share(
 def index_returns(
     frame: pd.DataFrame, base: Currency, days: pd.DatetimeIndex
 ) -> pd.DataFrame:
-    """Daily price returns of the S&P 500 and KOSPI in ``base`` on ``days``."""
-    return in_base(frame, [BENCHMARK, KOSPI], base, days).pct_change(fill_method=None)
+    """Daily returns of the S&P 500 (total return) and KOSPI (price) on ``days``.
+
+    In ``base``; Yahoo has no free KOSPI total-return index.
+    """
+    names = [TOTAL_RETURN, KOSPI]
+    return in_base(frame, names, base, days).pct_change(fill_method=None)
 
 
 def blended(p: Portfolio, frame: pd.DataFrame, days: pd.DatetimeIndex) -> pd.Series:
-    """The price-only KOSPI/S&P 500 mix in base, drifting with the portfolio.
+    """The KOSPI (price) / S&P 500 (total return) mix in base, drifting with it.
 
     Each day's Korean weight is the portfolio's Korean share at the prior
     close (``perf.blend``); a leg with no weight that day is not needed.
     Returns and shares are taken on the indices' own days, so a gap in
     ``days`` never stretches one over several days.
     """
-    grid = cast("pd.DatetimeIndex", trading_days(frame, [BENCHMARK, KOSPI]).union(days))
+    legs = [TOTAL_RETURN, KOSPI]
+    grid = cast("pd.DatetimeIndex", trading_days(frame, legs).union(days))
     rets = index_returns(frame, p.base, grid).reindex(days)
     share = korean_share(p, frame, grid).reindex(days)
     kr = cast("pd.Series", rets[KOSPI]).where(share > 0, 0.0)
-    us = cast("pd.Series", rets[BENCHMARK]).where(share < 1, 0.0)
+    us = cast("pd.Series", rets[TOTAL_RETURN]).where(share < 1, 0.0)
     return pd.Series(perf.blend(share, kr, us), index=days, dtype="float64")
 
 
@@ -1238,11 +1344,11 @@ def cumulative(daily_rets: pd.Series) -> pd.Series:
 def benchmark_lines(
     p: Portfolio, close: pd.DataFrame, days: pd.DatetimeIndex
 ) -> dict[str, pd.Series]:
-    """Cumulative price-only mix, S&P 500 and KOSPI in base on ``days``."""
+    """Cumulative mix, S&P 500 (total return) and KOSPI (price) in base on ``days``."""
     rets = index_returns(close, p.base, days)
     return {
         "혼합 벤치마크": cumulative(blended(p, close, days)),
-        BENCHMARK_LABEL: cumulative(cast("pd.Series", rets[BENCHMARK])),
+        BENCHMARK_LABEL: cumulative(cast("pd.Series", rets[TOTAL_RETURN])),
         "KOSPI": cumulative(cast("pd.Series", rets[KOSPI])),
     }
 
@@ -1260,7 +1366,7 @@ def currency_split(p: Portfolio, close: pd.DataFrame) -> perf.FxSplit | None:
     first = pd.Timestamp(min(t.day for t in p.trades))
     days = trading_days(close, names)
     days = cast("pd.DatetimeIndex", days[days >= first])
-    filled = close.reindex(columns=[*names, FX]).sort_index().ffill(limit=FILL_LIMIT)
+    filled = carry_over(close.reindex(columns=[*names, FX]).sort_index())
     filled = filled.reindex(days)
     rate = cast("pd.Series", filled[FX])
     per_dollar = rate if p.base == "KRW" else 1 / rate  # base per dollar
@@ -1328,16 +1434,21 @@ def trading(p: Portfolio, close: pd.DataFrame) -> Trading | None:
 # ---------------------------------------------------------------- risk-adjusted
 
 
-def risk_free(rates: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
+def risk_free(
+    rates: pd.Series, index: pd.DatetimeIndex, quote: perf.Quote
+) -> pd.Series:
     """Daily risk-free returns on ``index`` from annual percent ``rates``.
 
-    0 every day when there are no rates; NaN before the first rate, and
-    ``ratios`` leaves those days out.
+    ``quote`` is how the series states them: ``discount`` for ^IRX,
+    ``simple`` for CD 91-day (``perf.effective_annual``), compounded over
+    ``index``'s own days a year (``per_year``). 0 every day when there are
+    no rates; NaN before the first rate, and ``ratios`` leaves those days
+    out.
     """
     known = rates.dropna()
     if known.empty:
         return pd.Series(0.0, index=index, dtype="float64")
-    return perf.daily_rf(known, index)
+    return perf.daily_rf(known, index, quote, per_year(index))
 
 
 def wealth(rets: pd.Series) -> pd.Series:
@@ -1357,8 +1468,8 @@ def standing(rets: pd.Series) -> tuple[float, float]:
     return float(level.iloc[-1]), float(level.max())
 
 
-def _annual(value: float | None) -> float | None:
-    return None if value is None else value * math.sqrt(TRADING_DAYS)
+def _annual(value: float | None, periods: float) -> float | None:
+    return None if value is None else value * math.sqrt(periods)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1385,7 +1496,8 @@ def ratios(rets: pd.Series, rf: pd.Series, bench: pd.Series) -> Ratios:
     """Risk-adjusted statistics of daily ``rets`` over daily ``rf``.
 
     Days without a rate (NaN in ``rf``) are left out. ``bench`` is daily
-    benchmark returns for tracking error and the information ratio.
+    benchmark returns for tracking error and the information ratio. Annual
+    figures count the returns' own days a year (``per_year``).
     """
     rate = rf.reindex(rets.index)
     known = rate.notna() & rets.notna()
@@ -1393,6 +1505,7 @@ def ratios(rets: pd.Series, rf: pd.Series, bench: pd.Series) -> Ratios:
     f = cast("pd.Series", rate[known])
     x = (r - f).to_numpy(dtype="float64")
     n = len(r)
+    periods = per_year(r.index)
     level = wealth(r)
     span = span_days(level.index)
     sr = perf.sharpe(x)
@@ -1406,20 +1519,20 @@ def ratios(rets: pd.Series, rf: pd.Series, bench: pd.Series) -> Ratios:
     return Ratios(
         days=n,
         span=span,
-        volatility=float(x.std(ddof=1)) * math.sqrt(TRADING_DAYS) if n > 1 else None,
+        volatility=float(x.std(ddof=1)) * math.sqrt(periods) if n > 1 else None,
         under=perf.underwater(level) if n else None,
-        sharpe=_annual(sr),
-        ci=perf.sharpe_ci(x),
+        sharpe=_annual(sr, periods),
+        ci=perf.sharpe_ci(x, periods=periods),
         psr=perf.psr(x),
         min_trl=trl,
-        sortino=_annual(perf.sortino(r, f)),
+        sortino=_annual(perf.sortino(r, f), periods),
         calmar=perf.calmar(r, span),
         ulcer=perf.ulcer_index(r),
-        upi=perf.ulcer_performance(r, span, (1 + mean_rf) ** TRADING_DAYS - 1),
-        omega=perf.omega(r, mean_rf),
+        upi=perf.ulcer_performance(r, span, (1 + mean_rf) ** periods - 1),
+        omega=perf.omega(x),
         cdar=perf.cdar(r),
-        te=perf.tracking_error(r[paired], b[paired]),
-        ir=perf.information_ratio(r[paired], b[paired]),
+        te=perf.tracking_error(r[paired], b[paired], periods),
+        ir=perf.information_ratio(r[paired], b[paired], periods),
     )
 
 
@@ -1427,21 +1540,25 @@ def market_returns(
     adjusted: pd.DataFrame,
     base: Currency,
     days: pd.DatetimeIndex,
-    index: str = BENCHMARK,
+    index: str = TOTAL_RETURN,
 ) -> pd.Series:
-    """The S&P 500's (or KOSPI's) daily returns in ``base`` on ``days``.
+    """The S&P 500's (or another index's) daily returns in ``base`` on ``days``.
 
     Each is from the index's own previous close, so a gap in ``days`` never
     stretches one over several days.
     """
     grid = trading_days(adjusted, [index])
-    rets = cast("pd.Series", index_returns(adjusted, base, grid)[index])
-    return rets.reindex(days)
+    rets = returns(in_base(adjusted, [index], base, grid))
+    return cast("pd.Series", rets[index]).reindex(days)
 
 
 def market_beta(rets: pd.Series, adjusted: pd.DataFrame, base: Currency) -> float:
-    """Welch beta of daily ``rets`` against the S&P 500 in ``base``, same days."""
-    sp = market_returns(adjusted, base, pd.DatetimeIndex(rets.index))
+    """Welch beta of daily ``rets`` against the S&P 500 in ``base``, same days.
+
+    The price index, as ``betas`` and the stress betas: dividends add a near
+    constant to its returns, which leaves a slope alone.
+    """
+    sp = market_returns(adjusted, base, pd.DatetimeIndex(rets.index), BENCHMARK)
     ok = rets.notna() & sp.notna()
     if int(ok.sum()) <= 2:  # noqa: PLR2004 - a slope needs three days
         return math.nan
@@ -1484,7 +1601,10 @@ def peers(series: Mapping[str, pd.Series], rf: pd.Series) -> Peers:
         total = float(np.prod(1 + r.to_numpy(dtype="float64")) - 1)
         sr, moments = perf.sharpe(x), perf.skew_kurt(x)
         skew, kurt = moments or (0.0, perf.NORMAL_KURT)
-        found.append(_Rated(name, len(x), total, sr if moments else None, skew, kurt))
+        rated_sr = sr if moments else None
+        found.append(
+            _Rated(name, len(x), total, rated_sr, skew, kurt, per_year(r.index))
+        )
     rated = [f for f in found if f.sr is not None]
     shrunk: dict[str, float] = {}
     if len(rated) > 1:
@@ -1504,8 +1624,8 @@ def peers(series: Mapping[str, pd.Series], rf: pd.Series) -> Peers:
             f.name,
             f.n,
             f.total,
-            _annual(f.sr),
-            _annual(float(shrunk[f.name])) if f.name in shrunk else None,
+            _annual(f.sr, f.periods),
+            _annual(float(shrunk[f.name]), f.periods) if f.name in shrunk else None,
         )
         for f in found
     )
@@ -1520,6 +1640,7 @@ class _Rated:
     sr: float | None  # per period
     skew: float
     kurt: float  # raw
+    periods: float  # returns a year (``per_year``)
 
     @property
     def per(self) -> float:
@@ -1609,10 +1730,13 @@ def lagged_correlation(
 ) -> Correlation | None:
     """Columns' daily correlation as ``covariance``, on days all have a return.
 
-    ``korean_`` flags the columns that close in Seoul. None with fewer than
-    two columns or ``MIN_DAYS`` days.
+    ``korean_`` flags the columns that close in Seoul. Columns without any
+    return are left out first. None with fewer than two columns or
+    ``MIN_DAYS`` days.
     """
-    x = frame.dropna()
+    some = frame.notna().any().to_numpy()
+    x = frame.loc[:, some].dropna()
+    korean_ = [k for k, keep in zip(korean_, some, strict=True) if keep]
     if x.shape[1] < 2 or len(x) < MIN_DAYS:  # noqa: PLR2004 - a pair needs two
         return None
     cov, f, weight = _shrunk(x.to_numpy(dtype="float64"), np.array(korean_, dtype=bool))
@@ -1728,7 +1852,8 @@ def added(j: Joint, cov: NDArray[np.float64], ticker: str, fraction: float) -> A
     at = j.names.index(ticker)
     b = asset_betas(j)
     found = quant.what_if(j.w, cov, b, at, fraction)
-    vol = math.sqrt(float(j.w @ cov @ j.w)) * math.sqrt(TRADING_DAYS)
+    year = math.sqrt(per_year(j.window.index))
+    vol = math.sqrt(float(j.w @ cov @ j.w)) * year
     beta = float(j.w @ b)
     ratio = quant.diversification_ratio(j.w, cov)
     x = j.window.to_numpy(dtype="float64")
@@ -1737,7 +1862,7 @@ def added(j: Joint, cov: NDArray[np.float64], ticker: str, fraction: float) -> A
     parts = quant.component_es(x, mixed_in(j, ticker, fraction))
     total = float(parts.sum()) if parts is not None else 0.0
     return Added(
-        vol=(vol, vol + found.vol * math.sqrt(TRADING_DAYS)),
+        vol=(vol, vol + found.vol * year),
         beta=(beta, beta + found.beta),
         ratio=(ratio, ratio + found.ratio),
         correlation=found.correlation,
@@ -1750,30 +1875,136 @@ def added(j: Joint, cov: NDArray[np.float64], ticker: str, fraction: float) -> A
 # ---------------------------------------------------------------- Monte Carlo
 
 
-def mean_block(j: Joint) -> int:
-    return quant.block_length(len(j.window), mixed=j.mixed)
+def mean_block(j: Joint) -> float:
+    """The window's mean bootstrap block, from its portfolio returns."""
+    return quant.block_length(j.portfolio)
+
+
+@dataclass(frozen=True, slots=True)
+class Vol:
+    """The volatility filter's model and inputs; by default GJR-GARCH on r^2.
+
+    ``proxy`` (``range_proxy``) and ``x`` (``vix_regressor``) are on the last
+    rows of ``Joint.full`` (``FIT_ROWS`` covers every fit), one column per
+    holding.
+    """
+
+    model: quant.Filter = "gjr"
+    proxy: NDArray[np.float64] | None = None
+    x: NDArray[np.float64] | None = None
+
+    def fit(
+        self, r: NDArray[np.float64], rows: int | None = None
+    ) -> quant.Devolatilised:
+        """``quant.devolatilise`` of ``r``, the last rows of ``Joint.full``.
+
+        The filter is estimated on its first ``rows`` (all by default).
+        """
+        n = len(r)
+        proxy = None if self.proxy is None else self.proxy[-n:]
+        x = None if self.x is None else self.x[-n:]
+        return quant.devolatilise(r, rows, self.model, proxy, x)
+
+
+FIT_ROWS: Final = quant.FILTER_DAYS + quant.BACKTEST_DAYS  # rows a filter fit reads
+MODEL_NAMES: Final[dict[str, str]] = {"gjr": "GJR-GARCH", "har": "HAR", "pdv": "PDV"}
+
+
+def no_ranges(prices: Prices, names: Iterable[str]) -> list[str]:
+    """``names`` without saved opens, highs and lows."""
+    have = set.intersection(*(set(map(str, f.columns)) for f in prices.ranges))
+    return [n for n in names if n not in have]
+
+
+def range_proxy(
+    prices: Prices, names: Sequence[str], base: Currency, index: pd.Index
+) -> NDArray[np.float64] | None:
+    """Garman-Klass daily variances of ``names`` in ``base`` on ``index``.
+
+    ``index`` is ``Joint.full``'s; the previous close is the adjusted close
+    on the grid day before, as the joint returns take it, so the overnight
+    term spans holidays and, in another base currency, the exchange rate's
+    move. nan where a holding has no open, high or low that day (the
+    filter then takes r^2); None when none has any.
+    """
+    if len(no_ranges(prices, names)) == len(names):
+        return None
+    grid = trading_days(prices.adjusted, names)
+    native = carry_over(prices.adjusted.reindex(columns=list(names)).sort_index())
+    native = native.reindex(grid)
+    based = in_base(prices.adjusted, names, base, grid)
+    rate = based / native  # 1 in the holding's own currency
+    close = prices.close.reindex(index=grid, columns=list(names))
+    o, h, lo = (
+        f.reindex(index=grid, columns=list(names)).to_numpy(dtype="float64")
+        for f in prices.ranges
+    )
+    o, h, lo, c = quant.adjusted_ohlc(
+        o, h, lo, close.to_numpy(dtype="float64"), native.to_numpy(dtype="float64")
+    )
+    fx = rate.to_numpy(dtype="float64")
+    previous = based.shift(1).to_numpy(dtype="float64")
+    proxy = quant.garman_klass(o * fx, h * fx, lo * fx, c * fx, previous)
+    frame = pd.DataFrame(proxy, index=grid, columns=list(names))
+    return frame.reindex(index).to_numpy(dtype="float64")
+
+
+def vix_regressor(
+    adjusted: pd.DataFrame, names: Sequence[str], index: pd.Index
+) -> NDArray[np.float64] | None:
+    """VIX as daily variance (``quant.vix_variance``) for each holding's day.
+
+    On ``index`` (``Joint.full``'s): the last VIX close on or before the
+    day, for a Korean holding before it (Seoul closes before New York
+    opens). None without a saved VIX that covers ``index`` to within
+    ``GAP_DAYS`` of its last day.
+    """
+    if VIX not in adjusted.columns or not len(index):
+        return None
+    vix = cast("pd.Series", adjusted[VIX]).dropna().sort_index()
+    days = pd.DatetimeIndex(index)
+    if vix.empty or (days[-1] - vix.index[-1]).days > GAP_DAYS:
+        return None
+    late = pd.Series(vix.to_numpy(), index=vix.index + pd.Timedelta(days=1))
+    columns = [
+        (late if korean(name) else vix).reindex(days, method="ffill") for name in names
+    ]
+    out = quant.vix_variance(np.column_stack(columns).astype("float64"))
+    return out if np.isfinite(out).all() else None
+
+
+def volatility(j: Joint, v: Vol | None = None) -> quant.Devolatilised:
+    """The holdings' volatility filter on their last ``quant.FILTER_DAYS``."""
+    full = j.full.to_numpy(dtype="float64")[-quant.FILTER_DAYS :]
+    return (v or Vol()).fit(full)
+
+
+def filter_label(j: Joint, f: quant.Devolatilised) -> str:
+    """Which filter each holding got: HAR or PDV, GJR-GARCH, else EWMA."""
+    if f.model is not None:
+        return MODEL_NAMES[f.model.kind]
+    ewma = f"EWMA(λ={quant.EWMA_LAMBDA})"
+    if not f.garch.any():
+        return ewma
+    rest = [name for name, garch in zip(j.names, f.garch, strict=True) if not garch]
+    return "GJR-GARCH(1,1)" + (f", {ewma}: {', '.join(rest)}" if rest else "")
 
 
 def growth(
     j: Joint,
     picks: NDArray[np.int64],
-    *,
-    fhs: bool,
+    f: quant.Devolatilised | None = None,
     w: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """Growth of 1 along the drawn days, shape (paths, horizon + 1).
 
-    ``fhs``: residuals of the full history's EWMA filter, scaled from today's
-    volatility back toward the long-run level (``quant.revolatilise``).
+    ``picks`` index into the window's days; with ``f`` (``volatility``),
+    into their residuals: filtered HS from today's volatility, which then
+    follows the filter along each path (``quant.growth_paths``).
     ``w`` replaces ``j.w``, e.g. after a what-if, on the same draws.
     """
     mix = j.w if w is None else w
-    x = j.window.to_numpy(dtype="float64")
-    if not fhs:
-        return quant.growth_paths(x, mix, picks)
-    f = quant.devolatilise(j.full.to_numpy(dtype="float64"))
-    scale = quant.revolatilise(f.now, f.long_run, picks.shape[1])
-    return quant.growth_paths(f.z[-len(x) :], mix, picks, scale)
+    return quant.growth_paths(j.window.to_numpy(dtype="float64"), mix, picks, f)
 
 
 def fan(growth: NDArray[np.float64], value: float) -> list[dict[str, float]]:
@@ -1798,7 +2029,6 @@ def histogram(growth: NDArray[np.float64], value: float) -> list[dict[str, float
 
 @dataclass(frozen=True, slots=True)
 class Simulation:
-    losses: dict[float, float]  # share of paths ending at least this far down
     paths: perf.PathRisk
     fan: list[dict[str, float]]
     ends: list[dict[str, float]]
@@ -1808,13 +2038,47 @@ def simulation(
     paths: NDArray[np.float64], value: float, current: float, peak: float
 ) -> Simulation:
     """Summary of growth ``paths``; ``current`` and ``peak`` are past wealth."""
-    end = paths[:, -1]
     return Simulation(
-        {level: float((end <= 1 - level).mean()) for level in LOSS_LEVELS},
         perf.path_risk(paths[:, 1:], current, peak),
         fan(paths, value),
         histogram(paths, value),
     )
+
+
+def generated_returns(
+    j: Joint,
+    native: NDArray[np.float64],
+    fx: NDArray[np.float64] | None,
+    base: Currency,
+) -> NDArray[np.float64]:
+    """A generator's paths as daily portfolio returns in ``base``, shape (n, h).
+
+    ``native`` (n, h, len(j.names)) are simple returns in each holding's own
+    currency, columns in ``j.names`` order; ``fx`` (n, h) the same paths'
+    USD/KRW returns, needed when a holding is not in ``base``. Converted as
+    ``in_base`` converts prices (times USD/KRW into won, divided into
+    dollars) and weighted by ``j.w``, reset daily.
+    """
+    out = native.copy()
+    for i, name in enumerate(j.names):
+        if currency(name) == base:
+            continue
+        if fx is None:
+            raise ValueError(f"{name}: 환율 경로가 없습니다.")
+        grown = 1.0 + native[..., i]
+        out[..., i] = (grown * (1.0 + fx) if base == "KRW" else grown / (1.0 + fx)) - 1
+    return out @ j.w
+
+
+def path_growth(daily: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Growth of 1 along daily portfolio returns (n, h), shape (n, h + 1).
+
+    Demeaned (zero drift) and floored at -100%, as ``quant.growth_paths``.
+    """
+    steps = np.maximum(daily - daily.mean(), -1.0) + 1.0
+    growth = np.ones((len(daily), daily.shape[1] + 1))
+    _ = np.cumprod(steps, axis=1, out=growth[:, 1:])
+    return growth
 
 
 # ---------------------------------------------------------------- VaR and ES
@@ -1826,36 +2090,83 @@ class Tail:
     level: float
     var: float | None  # loss fraction; None below quant.min_samples
     es: float | None
+    var_ci: tuple[float, float] | None = None  # EVT: evt_intervals; else bootstrap
+    es_ci: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Tails:
     rows: tuple[Tail, ...]
-    band: tuple[float, float] | None  # 90% band of the 97.5% ES
-    month: tuple[float, float] | None  # 1-month 95% VaR: overlapping, sqrt(21)
-    backtest: quant.Backtest | None  # full history
+    # By method, full history; None for a method short of data; {} if all are
+    backtests: dict[str, quant.Backtest | None]
+    lookback: int | None  # days behind each backtest forecast (``backtest_lookback``)
     component: NDArray[np.float64] | None  # 97.5% ES by holding
     days: int
     history: int
 
 
-def tails(j: Joint) -> Tails:
-    """Historical and filtered-HS VaR and ES at current weights."""
+def backtest_lookback(window: int, history: int) -> int | None:
+    """Days behind each backtest forecast: the page window's, else a year.
+
+    The window's when it holds ``quant.min_samples`` at the backtest level
+    and the history reaches that far before the ``quant.BACKTEST_DAYS``
+    tested; else ``quant.BACKTEST_DAYS``; None when even that does not fit.
+    """
+    days = quant.BACKTEST_DAYS
+    if window >= quant.min_samples(quant.BACKTEST_LEVEL) and history >= days + window:
+        return window
+    return days if history >= 2 * days else None
+
+
+def tails(j: Joint, f: quant.Devolatilised, v: Vol | None = None) -> Tails:
+    """Historical, filtered-HS and EVT VaR and ES at current weights.
+
+    Historical uses the window's returns; filtered HS and EVT its residuals
+    under ``f`` (``volatility(j)``). Every row carries a 95% interval: EVT's
+    by profile likelihood (``quant.evt_intervals``), the others' by
+    bootstrap (``quant.bootstrap_intervals``). The backtests' forecasts look back as
+    far as the window (``backtest_lookback``); the filtered-HS one refits
+    the filter on the ``quant.FILTER_DAYS`` before the tested days, and the
+    EVT one puts a GPD on its tails (``quant.evt_windows``). ``v``
+    (GJR-GARCH by default) is the filter ``f`` was fitted with.
+    """
+    v = v or Vol()
     x = j.window.to_numpy(dtype="float64")
     full = j.full.to_numpy(dtype="float64")
     r = x @ j.w
-    filtered = quant.filtered_returns(full)[-len(x) :] @ j.w if len(x) else r
+    held = full @ j.w
+    filtered = quant.filtered_returns(f)[-len(x) :] @ j.w
     rows: list[Tail] = []
-    for method, series in (("역사적", r), ("FHS", filtered)):
-        for level in VAR_LEVELS:
-            got = quant.var_es(series, level)
-            rows.append(Tail(method, level, *(got or (None, None))))
-    block = mean_block(j) if j.mixed and len(x) else None
+    for method, series, measure in (
+        ("역사적", r, quant.var_es),
+        ("FHS", filtered, quant.var_es),
+        ("EVT", filtered, quant.evt_var_es),
+    ):
+        cis = (
+            [quant.evt_intervals(series, level) for level in VAR_LEVELS]
+            if method == "EVT"
+            else quant.bootstrap_intervals(series, VAR_LEVELS)
+        )
+        for level, ci in zip(VAR_LEVELS, cis, strict=True):
+            got = measure(series, level)
+            rows.append(
+                Tail(method, level, *(got or (None, None)), *(ci or (None, None)))
+            )
+    lookback = backtest_lookback(len(x), len(full))
+    backtests: dict[str, quant.Backtest | None] = {}
+    if lookback is not None:
+        days = quant.BACKTEST_DAYS
+        windows = quant.past_windows(held, days, lookback)
+        fhs = refit(j, v, lookback)
+        evt = None if fhs is None else quant.evt_windows(fhs)
+        for method, past in (("역사적", windows), ("FHS", fhs), ("EVT", evt)):
+            backtests[method] = (
+                None if past is None else quant.backtest(held[-days:], past)
+            )
     return Tails(
         rows=tuple(rows),
-        band=quant.es_band(r, quant.TAIL_LEVEL, mean_block=block),
-        month=quant.month_var(r, VAR_LEVELS[0]),
-        backtest=quant.backtest(full @ j.w),
+        backtests=backtests,
+        lookback=lookback,
         component=quant.component_es(x, j.w),
         days=len(x),
         history=len(full),
@@ -1864,6 +2175,66 @@ def tails(j: Joint) -> Tails:
 
 def tail_of(t: Tails, method: str, level: float) -> Tail:
     return next(row for row in t.rows if row.method == method and row.level == level)
+
+
+def refit(j: Joint, v: Vol, lookback: int) -> NDArray[np.float64] | None:
+    """Filtered-HS forecasts of the last ``quant.BACKTEST_DAYS``, out of sample.
+
+    The filter ``v`` is fitted on the ``quant.FILTER_DAYS`` before them.
+    """
+    days = quant.BACKTEST_DAYS
+    recent = j.full.to_numpy(dtype="float64")[-quant.FILTER_DAYS - days :]
+    before = v.fit(recent, len(recent) - days)
+    return quant.filtered_windows(before, j.w, days, lookback)
+
+
+DENSITY_PATHS: Final = 2000  # draws per month: a PIT's Monte Carlo SD <= 0.011
+
+
+@dataclass(frozen=True, slots=True)
+class Density:
+    test: quant.Berkowitz | None  # None under quant.MIN_MONTHS blocks
+    blocks: int
+
+
+def density(
+    j: Joint, f: quant.Devolatilised | None = None, paths: int = DENSITY_PATHS
+) -> Density:
+    """Berkowitz test of 1-month forecasts made as the 1M fan makes them.
+
+    Each non-overlapping 21-day block (``quant.blocks``) of the portfolio's
+    returns is set against ``paths`` compounded months. With ``f``, over its
+    own days, they are simulated from the filter's state on the block's
+    first day, as the FHS fan simulates from today's. Without, they are
+    stationary-bootstrapped from the window's length of days before the
+    block, its mean block re-estimated there (``quant.block_length``), as
+    the fan resamples the window; blocks with fewer days before them are
+    left out.
+    """
+    held = j.full.to_numpy(dtype="float64")
+    if f is not None:
+        held = held[-len(f.z) :]
+    outcomes, starts = quant.blocks(held @ j.w)
+    n = len(j.window)
+    if f is None:
+        outcomes, starts = outcomes[starts >= n], starts[starts >= n]
+    rng = np.random.default_rng(quant.SEED)
+    samples = np.empty((len(starts), paths))
+    for i, start in enumerate(starts):
+        if f is None:
+            before = held[start - n : start]
+            block = quant.block_length(before @ j.w)
+            picks = quant.stationary_indices(n, paths, quant.MONTH_DAYS, block, rng)
+            samples[i] = quant.growth_paths(before, j.w, picks)[:, -1] - 1
+        else:
+            picks = rng.integers(0, len(f.z), size=(paths, quant.MONTH_DAYS))
+            daily = (
+                quant.filtered_paths(f, j.w, picks, f.sigma[start] ** 2)
+                if f.model is None
+                else quant.model_paths(f, j.w, picks, f.model.states[start])
+            )
+            samples[i] = np.prod(1 + np.maximum(daily, -1.0), axis=1) - 1
+    return Density(quant.berkowitz(quant.pit(outcomes, samples)), len(starts))
 
 
 # ---------------------------------------------------------------- scenario replay
@@ -1880,6 +2251,11 @@ def long_fx(adjusted: pd.DataFrame, older: pd.Series) -> pd.Series:
     return pd.concat([known, yahoo]).sort_index()
 
 
+def benchmark_of(ticker: str) -> str:
+    """The index a stock's returns are compared with: KOSPI or the S&P 500 TR."""
+    return KOSPI if korean(ticker) else TOTAL_RETURN
+
+
 def stand_in(ticker: str) -> str:
     """The index whose move a holding without history takes: KOSPI or S&P 500."""
     return KOSPI if korean(ticker) else BENCHMARK
@@ -1888,9 +2264,10 @@ def stand_in(ticker: str) -> str:
 def proxy_beta(adjusted: pd.DataFrame, name: str, index: str) -> float:
     """``name``'s beta to ``index`` from all its saved days, shrunk toward 1.
 
-    Dimson when a Korean name stands in for a US index (Seoul closes first),
-    else Welch, in local currency; 1 with fewer than ``PROXY_MIN_DAYS``
-    returns on days both have.
+    Every day both have counts alike: Dimson when a Korean name stands in
+    for a US index (Seoul closes first), else Welch's winsorised slope
+    without its age decay, in local currency; then ``quant.shrunk_beta`` by
+    those days. 1 with fewer than ``PROXY_MIN_DAYS`` of them.
     """
     pair = adjusted.reindex(columns=[name, index]).dropna()
     rets = returns(pair).dropna()
@@ -1899,7 +2276,7 @@ def proxy_beta(adjusted: pd.DataFrame, name: str, index: str) -> float:
     r = cast("pd.Series", rets[name]).to_numpy(dtype="float64")
     m = cast("pd.Series", rets[index]).to_numpy(dtype="float64")
     lagged = korean(name) and not korean(index)
-    beta = quant.dimson_beta(r, m) if lagged else quant.welch_beta(r, m)
+    beta = quant.dimson_beta(r, m) if lagged else quant.welch_beta(r, m, decay=0.0)
     return quant.shrunk_beta(beta, len(rets)) if math.isfinite(beta) else 1.0
 
 
@@ -1941,8 +2318,8 @@ class Replayed:
     window: tuple[date, date] | None
     change: float  # base, first to last day; nan when unknown
     worst: float  # deepest fall from a running peak inside the window
-    fx: float  # the currency's part: (1 + change) / (1 + local) - 1
-    pnl: float  # base
+    fx: float  # the currency's factor on change: (1 + change) / (1 + local) - 1
+    pnl: float  # base: today's value times ``worst``, the peak-to-trough loss
     sp500: float  # the index's own move, local currency
     kospi: float
     proxied: tuple[str, ...]  # holdings without data: their index stands in
@@ -1967,14 +2344,17 @@ def _replay_one(  # noqa: PLR0913 - one scenario's inputs
         else math.nan
         for i in (BENCHMARK, KOSPI)
     }
+    names = labels(values)
+    present = [c for c in dict.fromkeys([*names, BENCHMARK, KOSPI]) if c in adjusted]
+    local = carry_over(adjusted.reindex(columns=present)).loc[start:end]
     sources: list[str] = []
     proxied: list[str] = []
     scale: list[float] = []  # 1 for a holding's own prices
     proxy_betas: list[float] = []
-    for name in labels(values):
-        own = name in adjusted.columns and _covers(
-            cast("pd.Series", adjusted[name]), start, end
-        )
+    for name in names:
+        # Its own closes (the last one before the window carried in), or,
+        # with none on the first day, its index for the whole window.
+        own = name in local.columns and not local[name].isna().any()
         if own:
             sources.append(name)
             scale.append(1.0)
@@ -1987,16 +2367,14 @@ def _replay_one(  # noqa: PLR0913 - one scenario's inputs
     unknown = _unknown(scenario, window_, moves, tuple(proxied), tuple(proxy_betas))
     if any(not math.isfinite(moves.get(s, 0.0)) for s in sources if s in moves):
         return unknown
-    inside = adjusted.loc[start:end]
-    local = inside.reindex(columns=list(dict.fromkeys(sources))).ffill().bfill()
+    local = local.reindex(columns=list(dict.fromkeys(sources)))
     if local.isna().any().any():
         return unknown
-    foreign = [currency(s) != base for s in sources]
-    rate = fx.loc[start:end]
-    no_fx = any(foreign) and not _covers(rate, start, end)
-    per = (
-        rate.reindex(rate.index.union(local.index)).ffill().bfill().reindex(local.index)
-    )
+    # A stand-in's beta is on the holding's own returns: its currency decides.
+    foreign = [currency(name) != base for name in names]
+    rate = fx.loc[:end]
+    per = rate.reindex(rate.index.union(local.index)).ffill().reindex(local.index)
+    no_fx = any(foreign) and (bool(per.isna().any()) or not _covers(fx, start, end))
     factor = per if base == "KRW" else 1 / per
     plain = np.column_stack(
         [
@@ -2020,7 +2398,7 @@ def _replay_one(  # noqa: PLR0913 - one scenario's inputs
         change=both.change,
         worst=both.worst,
         fx=(1 + both.change) / (1 + own.change) - 1 if own.change > -1 else math.nan,
-        pnl=float(w.sum()) * both.change,
+        pnl=float(w.sum()) * both.worst,
         sp500=moves[BENCHMARK],
         kospi=moves[KOSPI],
         proxied=tuple(proxied),
@@ -2069,10 +2447,12 @@ def scenario_replays(
 ) -> list[Replayed]:
     """Today's positions (ticker -> base value) through each past window.
 
-    Buy and hold from the window's first day (``quant.replay``). A holding
-    without prices across a window takes its index (KOSPI or S&P 500; the
-    S&P 500 in a US-only scenario) in that index's currency, each day's move
-    times its ``proxy_beta``. ``fx`` is USD/KRW, e.g. ``long_fx``.
+    Buy and hold from the window's first day (``quant.replay``), each price
+    the last close on or before the day (``carry_over``). A holding without
+    prices across a window (or listed inside it) takes its index (KOSPI or
+    S&P 500; the S&P 500 in a US-only scenario), each day's move times its
+    ``proxy_beta``, as a return in the holding's own currency. ``fx`` is
+    USD/KRW, e.g. ``long_fx``.
     """
     amounts = pd.Series(dict(values), dtype="float64")
     amounts = cast("pd.Series", amounts[amounts > 0])
@@ -2118,11 +2498,17 @@ def local_betas(
 ) -> NDArray[np.float64]:
     """Each holding's Welch beta to its own index in local currency.
 
-    Over the last ``months``, shrunk toward 1 by n / (n + 250); 1 without data.
+    Over the last ``months``, pulled toward 1 by 250 / (n + 250)
+    (``quant.shrunk_beta``), n the Kish effective size of Welch's age
+    weights over the window's days (``quant.effective_days``: about 255
+    for 3Y, not 750); 1 without data, and for the index itself.
     """
     out: list[float] = []
     for name in names:
         index = KOSPI if korean(name) else BENCHMARK
+        if name == index:
+            out.append(1.0)
+            continue
         pair = adjusted.reindex(columns=[name, index]).dropna()
         rets = window(returns(pair), months).dropna()
         beta = math.nan
@@ -2131,7 +2517,9 @@ def local_betas(
                 cast("pd.Series", rets[name]).to_numpy(dtype="float64"),
                 cast("pd.Series", rets[index]).to_numpy(dtype="float64"),
             )
-        out.append(quant.shrunk_beta(beta, len(rets)) if math.isfinite(beta) else 1.0)
+        if math.isfinite(beta):
+            beta = quant.shrunk_beta(beta, quant.effective_days(len(rets)))
+        out.append(beta if math.isfinite(beta) else 1.0)
     return np.array(out, dtype="float64")
 
 
@@ -2280,6 +2668,8 @@ def money(value: float, unit: Currency, *, signed: bool = False) -> str:
 def percent(value: float, *, signed: bool = False, dec: int = 1) -> str:
     if not math.isfinite(value):
         return UNKNOWN
+    if round(value * 100, dec) == 0:  # no signed zero
+        value = 0.0
     sign = "−" if value < 0 else ("+" if signed and value > 0 else "")
     return f"{sign}{abs(value):.{dec}%}"
 
@@ -2288,6 +2678,8 @@ def points(value: float) -> str:
     """A difference of two returns in percentage points."""
     if not math.isfinite(value):
         return UNKNOWN
+    if round(value * 100, 1) == 0:  # no signed zero
+        value = 0.0
     sign = "−" if value < 0 else ("+" if value > 0 else "")
     return f"{sign}{abs(value) * 100:.1f}%p"
 
@@ -2488,9 +2880,28 @@ class Yahoo:
         if frame is None or frame.empty:
             return no_prices()
         return Prices(
-            _daily(cast("pd.DataFrame", frame["Close"])),
-            _daily(cast("pd.DataFrame", frame["Adj Close"])),
+            *(
+                _daily(cast("pd.DataFrame", frame[name]))
+                for name in ("Close", "Adj Close", "Open", "High", "Low")
+            )
         )
+
+
+def market_series(ticker: str) -> bool:
+    """A Yahoo index or rate (``^``) or exchange rate (``=X``), not a stock."""
+    return ticker.startswith("^") or ticker.endswith("=X")
+
+
+def saved_message(got: Sequence[str], lost: Sequence[str]) -> str:
+    """What a fetch saved: stocks and the exchange rate, indices and rates apart."""
+    stocks = [t for t in got if not market_series(t)]
+    markets = len(got) - len(stocks)
+    parts = [f"{len(stocks)}종목 가격 저장"] if stocks else []
+    if markets:
+        parts.append(f"환율·지수·금리 {markets}개 갱신")
+    if lost:
+        parts.append(f"받지 못함: {', '.join(lost)}")
+    return " · ".join(parts) or "받은 가격이 없습니다"
 
 
 def shallow(prices: Prices) -> bool:
@@ -2548,8 +2959,17 @@ class Fetcher:
         with self._lock:
             return [t for t in tickers if t not in cached and t not in self._tried]
 
-    def start(self, tickers: Sequence[str], since: date = HISTORY_START) -> bool:
-        """Fetch ``tickers`` from ``since`` unless a fetch is already running."""
+    def start(
+        self,
+        tickers: Sequence[str],
+        since: date = HISTORY_START,
+        *,
+        ranges: bool = False,
+    ) -> bool:
+        """Fetch ``tickers`` from ``since`` unless a fetch is already running.
+
+        ``ranges``: also save their opens, highs and lows (``kept_ranges``).
+        """
         with self._lock:
             if self._progress.running or not tickers:
                 return False
@@ -2557,7 +2977,7 @@ class Fetcher:
             self._progress = Progress(running=True, message=", ".join(tickers))
         threading.Thread(
             target=self._run,
-            args=(list(tickers), since),
+            args=(list(tickers), since, ranges),
             name="finagent-portfolio",
             daemon=True,
         ).start()
@@ -2585,26 +3005,25 @@ class Fetcher:
             self._tried.update(tickers)
         return self._save(self._source(self.root).history(tickers, HISTORY_START))
 
-    def _save(self, fresh: Prices) -> Prices:
+    def _save(self, fresh: Prices, ranges: bool = False) -> Prices:
         with self._saving:
             prices = load_prices(self.root)
             if not fresh.tickers:
                 return prices
-            prices = merge(prices, fresh)
+            prices = merge(prices, kept_ranges(fresh, prices, ranges))
             save_prices(self.root, prices)
             return prices
 
-    def _run(self, tickers: list[str], since: date) -> None:
+    def _run(self, tickers: list[str], since: date, ranges: bool) -> None:
         try:
             fresh = self._source(self.root).history(tickers, since)
-            _ = self._save(fresh)
+            _ = self._save(fresh, ranges)
         except Exception as error:  # noqa: BLE001 - shown on the page, not lost
             self._finish(f"가격을 받지 못했습니다: {type(error).__name__}: {error}")
             return
         lost = [t for t in tickers if t not in fresh.tickers]
-        got = len(tickers) - len(lost)
-        note = f" · 받지 못함: {', '.join(lost)}" if lost else ""
-        self._finish(f"{got}종목 가격 저장{note}", failed=bool(lost))
+        got = [t for t in tickers if t in fresh.tickers]
+        self._finish(saved_message(got, lost), failed=bool(lost))
 
     def _finish(self, message: str, *, failed: bool = True) -> None:
         with self._lock:

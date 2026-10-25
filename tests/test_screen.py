@@ -11,8 +11,10 @@ import math
 import sys
 import threading
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from typing import TYPE_CHECKING, cast, override
 
+import httpx
 import numpy as np
 import pandas as pd
 import pytest
@@ -226,11 +228,6 @@ def stored(tmp_path: Path) -> pd.DataFrame:
 # ---------------------------------------------------------------- parsing
 
 
-def test_wikipedia_symbols_become_yahoo_tickers() -> None:
-    assert screen.yahoo_symbol("BRK.B") == "BRK-B"
-    assert screen.yahoo_symbol(" bf.b ") == "BF-B"
-
-
 def test_constituents_are_parsed_from_the_wikipedia_table() -> None:
     parsed = screen.parse_constituents(HTML)
 
@@ -321,6 +318,90 @@ def test_tce_ratio_formula_and_missing_inputs() -> None:
     assert math.isnan(ratio(CommonStockEquity=10.0, TotalAssets=100.0))
 
 
+def test_margin_average_over_the_fiscal_years() -> None:
+    years = [pd.Timestamp(f"{year}-12-31") for year in range(2025, 2020, -1)]
+    income = pd.DataFrame(
+        [[100.0, 80.0, -10.0, 50.0, math.nan], [30.0, 8.0, 5.0, math.nan, 1.0]],
+        index=["TotalRevenue", "OperatingIncome"],
+        columns=years,
+    )
+
+    row = screen.fundamentals_row({}, income)
+
+    # 2023 has negative revenue, 2022 no operating income, 2021 no revenue.
+    assert row["margin_avg"] == pytest.approx((0.30 + 0.10) / 2)
+    assert row["margin_years"] == 2
+    revenue_only = cast("pd.DataFrame", income.loc[["TotalRevenue"]])
+    for bare in (
+        screen.fundamentals_row({}, pd.DataFrame()),
+        screen.fundamentals_row({}, revenue_only),
+    ):
+        assert math.isnan(cast("float", bare["margin_avg"]))
+        assert bare["margin_years"] == 0
+    assert {"margin_avg", "margin_years"} <= set(screen.FUNDAMENTAL_COLUMNS)
+
+
+def test_the_yahoo_margin_is_the_median_so_one_bad_year_does_not_drag_it() -> None:
+    years = [pd.Timestamp(f"{year}-12-31") for year in range(2025, 2020, -1)]
+    income = pd.DataFrame(
+        [[100.0] * 5, [20.0, 22.0, -50.0, 18.0, 21.0]],  # 2023: a one-off charge
+        index=["TotalRevenue", "OperatingIncome"],
+        columns=years,
+    )
+
+    row = screen.fundamentals_row({}, income)
+
+    assert row["margin_avg"] == pytest.approx(0.20)  # the mean would be 0.062
+    assert row["margin_years"] == 5
+
+
+def quarters(**rows: list[float]) -> pd.DataFrame:
+    dates = [
+        pd.Timestamp(d)
+        for d in ("2026-05-31", "2026-02-28", "2025-11-30", "2025-08-31", "2025-05-31")
+    ]
+    return pd.DataFrame(rows, index=dates[: len(next(iter(rows.values())))]).T
+
+
+def test_op_margin_is_ttm_over_the_latest_four_quarters() -> None:
+    # The fifth (oldest) quarter is left out; the info field is ignored.
+    quarterly = quarters(
+        TotalRevenue=[100.0, 80.0, 60.0, 60.0, 999.0],
+        OperatingIncome=[50.0, 30.0, 10.0, 10.0, -999.0],
+    )
+
+    row = screen.fundamentals_row(
+        {"operatingMargins": 0.5}, pd.DataFrame(), quarterly=quarterly
+    )
+
+    assert row["op_margin"] == pytest.approx(100 / 300)
+    assert row["op_margin_quarters"] == 4
+    assert row["ttm_end"] == "2026-05-31"  # the newest quarterly statement
+    assert {"op_margin", "op_margin_quarters", "ttm_end"} <= set(
+        screen.FUNDAMENTAL_COLUMNS
+    )
+    assert "op_margin" not in screen.INFO_FIELDS
+
+
+def test_op_margin_is_nan_without_four_full_quarters() -> None:
+    nan = math.nan
+    broken = [
+        quarters(TotalRevenue=[100.0, 80.0, nan, 60.0], OperatingIncome=[5.0] * 4),
+        quarters(
+            TotalRevenue=[100.0, 80.0, 60.0, 60.0], OperatingIncome=[5.0, nan, 5.0, 5.0]
+        ),
+        quarters(TotalRevenue=[100.0, -100.0, 0.0, 0.0], OperatingIncome=[5.0] * 4),
+        quarters(TotalRevenue=[100.0, 80.0, 60.0], OperatingIncome=[5.0] * 3),
+        quarters(TotalRevenue=[100.0] * 4),
+        pd.DataFrame(),
+    ]
+    for quarterly in [*broken, None]:
+        row = screen.fundamentals_row({}, pd.DataFrame(), quarterly=quarterly)
+        assert math.isnan(cast("float", row["op_margin"]))
+        assert row["op_margin_quarters"] == 0
+        assert row["ttm_end"] == ""  # no quarter is used
+
+
 def test_estimates_row_reads_fy0_and_fy1() -> None:
     trend = pd.DataFrame(
         {
@@ -347,16 +428,6 @@ def test_estimates_row_reads_fy0_and_fy1() -> None:
     assert math.isnan(cast("float", empty["fy1_now"]))
 
 
-def test_an_empty_yahoo_answer_is_a_failure_to_retry() -> None:
-    table = pd.DataFrame({"x": [1.0]})
-
-    assert screen.nonempty(table, "표") is table
-    with pytest.raises(screen.EmptyAnswerError, match="표 빈 응답"):
-        _ = screen.nonempty(pd.DataFrame(), "표")
-    with pytest.raises(screen.EmptyAnswerError):
-        _ = screen.nonempty(None, "표")
-
-
 # ---------------------------------------------------------------- indicators
 
 
@@ -375,15 +446,6 @@ def test_rsi_uses_wilder_smoothing() -> None:
     assert values[2] == pytest.approx(50.0)
     assert values[3] == pytest.approx(75.0)
     assert screen.rsi(series(range(30))).iloc[-1] == 100.0
-
-
-def test_macd_of_a_flat_line_is_zero() -> None:
-    line, signal = screen.macd(series([10.0] * 40))
-
-    assert line.iloc[-1] == 0.0
-    assert signal.iloc[-1] == 0.0
-    rising, _ = screen.macd(series(range(40)))
-    assert rising.iloc[-1] > 0
 
 
 def test_percent_b_uses_a_population_deviation() -> None:
@@ -578,65 +640,100 @@ def test_liquidity_filter() -> None:
     assert reasons[4:-1] == [""] * 9
 
 
-# Every Financials sub-industry on the Wikipedia list (2026-10-22).
-WIKIPEDIA_FINANCIALS = {
-    "Asset Management & Custody Banks": "Financial Services",
-    "Transaction & Payment Processing Services": "Financial Services",
-    "Financial Exchanges & Data": "Financial Services",
-    "Property & Casualty Insurance": "Insurance",
-    "Diversified Banks": "Banks",
-    "Insurance Brokers": "Insurance",
-    "Investment Banking & Brokerage": "Financial Services",
-    "Regional Banks": "Banks",
-    "Life & Health Insurance": "Insurance",
-    "Consumer Finance": "Financial Services",
-    "Multi-line Insurance": "Insurance",
-    "Multi-Sector Holdings": "Financial Services",
-    "Reinsurance": "Insurance",
-}
-
-
-def test_financial_sub_industries_map_to_industry_groups() -> None:
-    for industry, group in WIKIPEDIA_FINANCIALS.items():
-        assert screen.FINANCIAL_GROUPS[industry] == group, industry
-
-
-def test_peer_groups_fall_back_to_the_sector() -> None:
-    table = pd.DataFrame(
-        {
-            "industry": ["Software"] * 10 + ["Semiconductors"] * 3,
-            "sector": ["Information Technology"] * 13,
-        }
-    )
-
-    assert (
-        screen.peers(table).tolist()
-        == ["Software"] * 10 + ["Information Technology"] * 3
-    )
-
-
-def test_financials_fall_back_to_their_industry_group() -> None:
-    industries = [
-        *["Asset Management & Custody Banks"] * 10,
-        "Diversified Banks",
-        "Regional Banks",
-        "Transaction & Payment Processing Services",
-        "Reinsurance",
-        "Something New",  # unmapped: the sector
+def test_gics_lists_each_sub_industry_once() -> None:
+    subs = [
+        sub
+        for industries in screen.GICS_TREE.values()
+        for names in industries.values()
+        for sub in names
     ]
-    table = pd.DataFrame({"industry": industries, "sector": "Financials"})
 
-    assert screen.peers(table).tolist() == [
-        *["Asset Management & Custody Banks"] * 10,
-        "Banks",
-        "Banks",
+    assert len(subs) == len(set(subs)) == len(screen.GICS) == 163
+    assert len(screen.GICS_TREE) == 25  # industry groups
+    assert len({industry for industry, _ in screen.GICS.values()}) == 74
+    # MSCI code order, 60108010 to 60108050.
+    assert screen.GICS_TREE["Equity Real Estate Investment Trusts (REITs)"][
+        "Specialized REITs"
+    ] == (
+        "Other Specialized REITs",
+        "Self-Storage REITs",
+        "Telecom Tower REITs",
+        "Timber REITs",
+        "Data Center REITs",
+    )
+
+
+def peer_table(*members: tuple[str, str, int]) -> pd.DataFrame:
+    rows = [(sub, sector) for sub, sector, count in members for _ in range(count)]
+    return pd.DataFrame(rows, columns=["industry", "sector"])
+
+
+def peer_levels(table: pd.DataFrame) -> list[tuple[str, str]]:
+    rows = screen.records(table.assign(peer=screen.peers(table)))
+    return [(str(row["peer"]), screen.peer_level(row)) for row in rows]
+
+
+def test_peers_widen_through_four_levels() -> None:
+    it = "Information Technology"
+    table = peer_table(
+        ("Application Software", it, 10),
+        ("Systems Software", it, 6),  # industry Software: 16
+        ("IT Consulting & Other Services", it, 2),  # group: 18
+        ("Semiconductors", it, 3),  # 3 at every level
+        ("Something New", it, 2),  # unmapped
+    )
+
+    found = peer_levels(table)
+
+    assert found[0] == ("Application Software", "세부 산업")
+    assert found[10] == ("Software", "산업")
+    assert found[16] == ("Software & Services", "산업 그룹")
+    assert found[18] == (it, "섹터")
+    assert found[21] == (it, "섹터")
+    # An unmapped sub-industry with enough members is still its own group.
+    many = peer_table(("Something New", it, 10))
+    assert peer_levels(many)[0] == ("Something New", "세부 산업")
+
+
+def test_a_group_named_like_its_industry_stays_apart() -> None:
+    table = peer_table(
+        ("Transaction & Payment Processing Services", "Financials", 9),
+        ("Multi-Sector Holdings", "Financials", 1),  # industry: 10
+        ("Consumer Finance", "Financials", 3),  # group: 13
+        ("Diversified Banks", "Financials", 7),
+        ("Regional Banks", "Financials", 6),  # industry Banks: 13
+    )
+
+    found = peer_levels(table)
+
+    assert found[0] == ("Financial Services", "산업")
+    assert found[10] == ("Financial Services 전체", "산업 그룹")
+    assert found[13] == ("Banks", "산업")
+    assert found[-1] == ("Banks", "산업")
+    table = table.assign(peer=screen.peers(table))
+    size = screen.within_peers(pd.Series(1, index=table.index), table, "size")
+    assert size.tolist() == [10] * 10 + [13] * 3 + [13] * 13
+
+
+def test_banks_are_found_from_the_industry_group() -> None:
+    table = peer_table(
+        ("Diversified Banks", "Financials", 1),
+        ("Regional Banks", "Financials", 1),
+        ("Asset Management & Custody Banks", "Financials", 1),
+        ("Reinsurance", "Financials", 1),
+        ("Something New", "Financials", 1),
+        ("Diversified Banks", "Industrials", 1),  # not Financials
+    )
+
+    group = screen.financial_group(table)
+
+    assert group.tolist()[:4] == [
+        screen.BANKS,
+        screen.BANKS,
         "Financial Services",
         "Insurance",
-        "Financials",
     ]
-    rows = screen.records(table.assign(peer=screen.peers(table)))
-    assert [screen.peer_level(r) for r in rows[9:11]] == ["세부 산업", "산업 그룹"]
-    assert screen.peer_level(rows[-1]) == "섹터"
+    assert group.iloc[4:].isna().all()
 
 
 # ---------------------------------------------------------------- fundamentals
@@ -662,6 +759,13 @@ def frame(**overrides: object) -> dict[str, object]:
         "fpe": 15.0,
         "tpe": 15.0,
         "ev_ebitda": 10.0,
+        "op_margin": 0.2,
+        "margin_avg": 0.2,
+        "margin_years": 4,
+        "margin_source": "야후",
+        "op_margin_source": "야후",
+        "revenue": 10.0,
+        "price": 50.0,
     }
     return row | overrides
 
@@ -671,7 +775,10 @@ def status(*rows: dict[str, object]) -> pd.DataFrame:
 
 
 def test_cash_flow_disqualifier() -> None:
-    result = status(frame(), frame(fcf=-1.0), frame(fcf=math.nan))
+    # Capital ratios play no part outside financials.
+    result = status(
+        frame(tce_ratio=0.01, eq_ratio=0.01), frame(fcf=-1.0), frame(fcf=math.nan)
+    )
 
     assert result["dq_fcf"].tolist() == ["통과", "결격", "미확인"]
     assert result["dq_state"].tolist() == ["통과", "결격", "미확인"]
@@ -707,7 +814,6 @@ def test_non_bank_financials_use_the_group_median_equity_ratio() -> None:
     assert result["dq_fcf"].tolist()[:5] == ["통과", "통과", "결격", "결격", "미확인"]
     # Net debt/EBITDA and EV/EBITDA are not used for financials.
     assert set(result["dq_debt"]) == {"해당 없음"}
-    assert result["ev_cheap"].tolist() == [False] * 7
 
 
 def test_banks_use_a_tangible_common_equity_floor() -> None:
@@ -730,12 +836,6 @@ def test_banks_use_a_tangible_common_equity_floor() -> None:
         "통과",
     ]
     assert result["eq_limit"].isna().tolist() == [True] * 6
-
-
-def test_non_financials_keep_the_cash_flow_test() -> None:
-    result = status(frame(tce_ratio=0.01, eq_ratio=0.01), frame(fcf=-1.0))
-
-    assert result["dq_fcf"].tolist() == ["통과", "결격"]
 
 
 def test_revenue_disqualifier() -> None:
@@ -774,31 +874,6 @@ def test_net_debt_disqualifier() -> None:
     assert floor["dq_debt"].tolist() == ["통과", "통과", "결격"]
 
 
-def test_roe_label_against_the_peer_median() -> None:
-    result = status(
-        frame(roe=0.10),
-        frame(roe=0.20),
-        frame(roe=0.30),
-        frame(roe=-0.5, book_value=-1.0),
-        frame(roe=math.nan),
-    )
-
-    assert result["roe_med"].iloc[0] == pytest.approx(0.20)
-    assert result["roe_label"].tolist() == ["", "우수", "우수", "해석 부적절", "미확인"]
-
-
-def test_valuation_labels_rank_positive_pers_in_the_peer_group() -> None:
-    pers = [5.0, *range(10, 18), 40.0, -3.0, math.nan]
-    result = status(*(frame(fpe=float(p)) for p in pers))
-
-    labels = result["value_label"].tolist()
-    assert labels[0] == "저렴"  # lowest 2 of 10 positive values
-    assert labels[1] == "저렴"
-    assert labels[2:8] == ["보통"] * 6
-    assert labels[8:10] == ["비쌈", "비쌈"]
-    assert labels[10:] == ["해석 부적절", "미확인"]
-
-
 def test_cyclicals_flag_peak_earnings() -> None:
     oil = {"sector": "Energy", "peer": "Energy"}
     result = status(
@@ -811,85 +886,222 @@ def test_cyclicals_flag_peak_earnings() -> None:
     assert result["peak"].tolist() == [True, False, False, False]
 
 
-# ---------------------------------------------------------------- groups
+def test_tailwind_needs_both_margin_conditions() -> None:
+    ratio_binds = 0.25  # x 1.5 = 0.375 is above + 5%p = 0.30
+    gap_binds = 0.04  # + 5%p = 0.09 is above x 1.5 = 0.06
+    at_ratio = ratio_binds * screen.TAILWIND_RATIO
+    at_gap = gap_binds + screen.TAILWIND_GAP
+    result = status(
+        frame(margin_avg=ratio_binds, op_margin=at_ratio),
+        frame(margin_avg=ratio_binds, op_margin=np.nextafter(at_ratio, 0)),
+        frame(margin_avg=gap_binds, op_margin=at_gap),
+        frame(margin_avg=gap_binds, op_margin=np.nextafter(at_gap, 0)),
+        frame(margin_avg=0.25, op_margin=0.9, margin_years=2),  # too few years
+        frame(margin_avg=-0.1, op_margin=0.9),  # no positive average
+        frame(margin_avg=math.nan, op_margin=0.9),
+        frame(margin_avg=0.25, op_margin=math.nan),
+        frame(**FIN_SERVICES, margin_avg=0.25, op_margin=0.9),  # financials
+    )
+
+    assert (screen.TAILWIND_RATIO, screen.TAILWIND_GAP) == (1.5, 0.05)
+    assert screen.MARGIN_YEARS == 3
+    assert result["tailwind"].tolist() == [True, False, True, False] + [False] * 5
 
 
-def group_row(**overrides: object) -> dict[str, object]:
+# ---------------------------------------------------------------- 퀄리티 and 밸류에이션
+
+
+def measured(*rows: dict[str, object]) -> pd.DataFrame:
+    return screen.axes(pd.DataFrame(list(rows)))
+
+
+def test_axes_rank_each_measure_within_its_peer_group() -> None:
+    result = measured(
+        frame(roe=0.10, fpe=30.0),
+        frame(roe=0.20, fpe=20.0),
+        frame(roe=0.30, fpe=10.0),
+        # No base: negative equity, revenue and multiples are left unranked.
+        frame(roe=0.90, book_value=-1.0, revenue=-1.0, fpe=-5.0, ev_ebitda=0.0),
+        frame(roe=0.01, sector="Utilities", peer="Utilities"),  # alone
+    )
+
+    # Hazen percentiles, (rank - 0.5) / n: the middle of three is the median.
+    assert result["q_roe"].tolist()[:3] == pytest.approx([1 / 6, 1 / 2, 5 / 6])
+    assert result["v_fpe"].tolist()[:3] == pytest.approx([5 / 6, 1 / 2, 1 / 6])
+    assert result.loc[3, ["q_roe", "q_fcf", "v_fpe", "v_ev"]].isna().all()
+    assert result.loc[4, "q_roe"] == 0.5
+
+
+def test_the_split_halves_each_peer_group() -> None:
+    result = measured(
+        *(frame(roe=roe) for roe in (0.1, 0.2, 0.3, 0.4)),
+        *(frame(roe=roe, sector="Utilities", peer="Utilities") for roe in (1, 1, 2, 2)),
+    )
+
+    roe = result["q_roe"]
+    assert roe.tolist()[:4] == pytest.approx([1 / 8, 3 / 8, 5 / 8, 7 / 8])
+    assert roe.tolist()[4:] == pytest.approx([1 / 4, 1 / 4, 3 / 4, 3 / 4])  # ties
+    assert (roe[:4] >= screen.SPLIT).sum() == 2
+    assert (roe[4:] >= screen.SPLIT).sum() == 2
+
+
+def test_a_wider_peer_group_keeps_the_narrower_members() -> None:
+    it = "Information Technology"
+    table = peer_table(("Application Software", it, 10), ("Systems Software", it, 6))
+    table = table.assign(peer=screen.peers(table))
+    roe = pd.Series([float(i) for i in range(16)], index=table.index)
+
+    rank = screen.within_peers(roe, table, "rank", pct=True)
+    size = screen.within_peers(roe, table, "size")
+
+    # Systems Software is compared within all of Software, Application
+    # Software only within itself.
+    assert rank.iloc[-1] == 1.0
+    assert rank.iloc[10] == pytest.approx(11 / 16)
+    assert rank.iloc[9] == 1.0
+    assert size.tolist() == [10] * 10 + [16] * 6
+
+
+def test_financials_use_pbr_in_place_of_margins_and_ev() -> None:
+    result = measured(
+        frame(**(BANK | {"fcf": 1.0}), price=20.0),
+        frame(**(BANK | {"fcf": 1.0}), price=10.0),
+        frame(price=10.0),
+    )
+
+    assert result.loc[:1, ["q_margin", "q_fcf", "v_ev"]].isna().all().all()
+    assert result["v_pb"].tolist()[:2] == [0.75, 0.25]
+    assert result.loc[:1, ["q_roe", "q_growth", "v_fpe"]].notna().all().all()
+    assert math.isnan(result.loc[2, "v_pb"])  # PBR is for financials only
+    assert result.loc[2, ["q_margin", "q_fcf", "v_ev"]].notna().all()
+
+
+def test_margin_measure_is_the_multi_year_average() -> None:
+    result = measured(
+        frame(margin_avg=0.10, op_margin=0.50),
+        frame(margin_avg=0.30, op_margin=0.05),
+        frame(margin_avg=0.20, margin_years=3),
+        frame(margin_avg=0.90, margin_years=2),  # too few years
+        frame(margin_avg=0.90, margin_years=math.nan),  # an older file
+    )
+
+    # The TTM margin plays no part.
+    assert result["q_margin"].tolist()[:3] == pytest.approx([1 / 6, 5 / 6, 1 / 2])
+    assert result.loc[3:, "q_margin"].isna().all()
+
+
+def test_quality_needs_two_measures_and_valuation_one() -> None:
+    result = measured(
+        frame(),
+        frame(margin_avg=math.nan, fcf=math.nan, rev_growth=math.nan),  # ROE only
+        frame(margin_avg=math.nan, fcf=math.nan),  # ROE and revenue growth
+        frame(fpe=math.nan, ev_ebitda=-1.0),
+    )
+
+    assert screen.QUALITY_MIN == 2
+    assert math.isnan(result.loc[1, "quality"])
+    assert result.loc[1, "valuation"] == pytest.approx(
+        result.loc[1, ["v_fpe", "v_ev"]].mean()
+    )
+    assert result.loc[2, "quality"] == pytest.approx(
+        (result.loc[2, "q_roe"] + result.loc[2, "q_growth"]) / 2
+    )
+    assert math.isnan(result.loc[3, "valuation"])
+    assert math.isnan(result.loc[3, "edge"])
+    first = result.loc[0]
+    assert first["quality"] == pytest.approx(first[list(screen.QUALITY)].mean())
+    assert first["edge"] == pytest.approx(first["quality"] - first["valuation"])
+
+
+def cell_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
-        "chart": "강",
         "dq_state": "통과",
-        "roe_label": "우수",
-        "value_label": "보통",
-        "ev_cheap": False,
-        "fy1_now": 6.0,
-        "fy1_90d": 5.0,
-        "fy1_up30": 3.0,
-        "fy1_down30": 1.0,
-        "score": 9,
+        "peak": False,
+        "tailwind": False,
+        "quality": 0.8,
+        "valuation": 0.2,
+        "peer_n": 3,  # small peer groups are not set apart
     }
     return row | overrides
 
 
-def members(*rows: dict[str, object]) -> list[list[str]]:
-    result = screen.groups(pd.DataFrame(list(rows)))
-    return [
-        [k[3:] for k in result.columns if result.iloc[i][k]] for i in range(len(rows))
-    ]
+def cells(*rows: dict[str, object]) -> list[str]:
+    return screen.groups(pd.DataFrame(list(rows))).tolist()
 
 
-def test_group_membership() -> None:
-    assert members(
-        group_row(),
-        group_row(value_label="비쌈"),
-        group_row(value_label="미확인"),
-        group_row(dq_state="미확인"),
-        group_row(chart="약", value_label="저렴", score=4),
-        group_row(chart="", roe_label="", value_label="저렴", score=5),
-        group_row(chart="", roe_label="", ev_cheap=True, score=3),
-        group_row(chart="", roe_label="", value_label="저렴", score=7),
-        group_row(chart="", value_label="저렴", score=5, fy1_now=4.0),
-        group_row(chart="", value_label="저렴", score=5, fy1_down30=4.0),
-        group_row(chart="", value_label="저렴", score=5, fy1_now=math.nan),
-        group_row(value_label="저렴", score=6, dq_state="결격"),
+def test_cells_of_quality_by_valuation() -> None:
+    assert cells(
+        cell_row(),
+        cell_row(valuation=0.5),
+        cell_row(quality=0.49),
+        cell_row(quality=0.3, valuation=0.9),
+        cell_row(quality=0.5, valuation=0.49),
+        cell_row(peak=True),
+        cell_row(quality=math.nan),
+        cell_row(valuation=math.nan),
+        cell_row(dq_state="결격"),
+        cell_row(dq_state="미확인", peak=True),
+        cell_row(tailwind=True),
+        cell_row(tailwind=True, dq_state="결격"),
     ) == [
-        ["A"],
-        ["B"],
-        [],  # 비쌈 아님 needs a valuation
-        [],  # judgment withheld
-        ["C", "D"],
-        ["D"],
-        ["D"],
-        [],  # score above 6
-        [],  # estimates cut
-        [],  # more down than up revisions
-        [],  # no estimates
-        [],
+        "prime",
+        "pricey",
+        "trap",
+        "weak",
+        "prime",  # 퀄리티 0.5 is the upper half
+        "hold",  # peak earnings
+        "hold",
+        "hold",
+        "",  # judgment withheld
+        "",
+        "hold",  # 업황 순풍
+        "",
     ]
 
 
-def test_d_excludes_a_but_may_overlap_b() -> None:
-    assert members(group_row(value_label="저렴", score=6)) == [["A"]]
-    assert members(group_row(value_label="비쌈", ev_cheap=True, score=6)) == [
-        ["B", "D"]
+def test_estimate_direction() -> None:
+    table = pd.DataFrame(
+        [
+            (6.0, 5.0, 3.0, 1.0),
+            (5.0, 5.0, 2.0, 2.0),
+            (4.0, 5.0, 1.0, 3.0),
+            (6.0, 5.0, 1.0, 3.0),  # higher, but more cuts
+            (4.0, 5.0, 3.0, 1.0),  # lower, but more raises
+            (4.0, 5.0, 2.0, 2.0),
+            (math.nan, 5.0, 3.0, 1.0),
+            (6.0, 5.0, math.nan, 1.0),
+        ],
+        columns=["fy1_now", "fy1_90d", "fy1_up30", "fy1_down30"],
+    )
+
+    assert screen.estimate_direction(table).tolist() == [
+        "상향",
+        "상향",
+        "하향",
+        "보합",
+        "보합",
+        "보합",
+        "미확인",
+        "미확인",
     ]
 
 
-def test_groups_are_sorted_and_capped() -> None:
+def test_cells_are_sorted_by_edge_and_capped() -> None:
     table = pd.DataFrame(
         {
-            "in_D": [True] * 25 + [False],
-            "signals": [i % 4 for i in range(26)],
-            "score": [3 + i % 4 for i in range(26)],
-            "mcap": [float(i) for i in range(26)],
+            "group": ["prime"] * 25 + ["hold"] * 3,
+            "edge": [i % 5 / 10 for i in range(25)] + [math.nan] * 3,
+            "mcap": [float(i) for i in range(28)],
         }
     )
 
-    top = screen.group(table, "D")
+    top = screen.group(table, "prime")
 
     assert len(top) == screen.TOP_N
-    assert top["signals"].tolist() == sorted(top["signals"], reverse=True)
-    first = top[top["signals"] == 3]["score"].tolist()
+    assert top["edge"].tolist() == sorted(top["edge"], reverse=True)
+    first = top[top["edge"] == 0.4]["mcap"].tolist()
     assert first == sorted(first, reverse=True)
+    assert screen.group(table, "hold")["mcap"].tolist() == [27.0, 26.0, 25.0]
 
 
 # ---------------------------------------------------------------- whole run
@@ -908,45 +1120,177 @@ def test_evaluate_on_stored_data(tmp_path: Path) -> None:
     assert by.loc["UP1", "score"] > by.loc["DOWN", "score"]
     assert by.loc["DOWN", "dq_fcf"] == "결격"
     assert by.loc["BANK", "dq_debt"] == "해당 없음"
-    assert by.loc["BANK", "peer"] == "Banks"
+    assert by.loc["BANK", "peer"] == "Financials"  # one bank: the sector
     assert by.loc["BANK", "dq_fcf"] == "통과"  # TCE/TA 6%
     assert bool(by.loc["OIL", "peak"])
-    assert screen.tags(by.loc["OIL"].to_dict()).endswith("정점 이익")
+    assert by.loc["OIL", "group"] == "hold"
+    assert by.loc["DOWN", "group"] == ""  # 결격
+    assert by.loc["BANK", "v_pb"] == 0.5  # alone in its group: the median
+    assert math.isnan(by.loc["BANK", "v_ev"])
+    assert set(by.loc[list(kept["ticker"]), "est"]) == {"상향"}
     assert screen.failures(table)["ticker"].tolist() == ["THIN"]
-    assert all(screen.group(kept, key).shape[0] <= screen.TOP_N for key in "ABCD")
+    assert all(
+        screen.group(kept, key).shape[0] <= screen.TOP_N for key in screen.GROUPS
+    )
+    points = screen.map_rows(kept)
+    placed = sum(screen.counts(kept)[key] for key in screen.GROUPS if key != "hold")
+    assert len(points) == placed
+    assert {point["ticker"] for point in points}.isdisjoint({"OIL", "DOWN"})
 
 
-def test_page_text_for_one_stock(tmp_path: Path) -> None:
-    row = screen.liquid(stored(tmp_path)).set_index("ticker").loc["DOWN"].to_dict()
+# ---------------------------------------------------------------- criteria
 
-    assert len(screen.tech_lines(row)) == 10
-    assert all(isinstance(ok, bool) for ok, _, _ in screen.tech_lines(row))
-    assert screen.dq_lines(row)[0][0] == "결격"
-    assert screen.verdict(row) == "결격: FCF"
-    assert screen.estimate_table(row)["현재"].tolist() == ["5.00", "6.00"]
-    assert len(screen.label_lines(row)) == 3
-    assert len(screen.overheat_lines(row)) == 3
+# ``evaluate`` on the fixtures before the criteria became adjustable.
+PINNED = {
+    # ticker: score, chart, dq_fcf, dq_state, peak, quality, valuation, group
+    "UP1": (7, "약", "통과", "통과", False, 23 / 30, 0.7, "pricey"),
+    "UP2": (7, "약", "통과", "통과", False, 17 / 30, 0.6, "pricey"),
+    "UP3": (9, "강", "통과", "통과", False, 0.4, 0.4, "trap"),
+    "FLAT": (8, "강", "통과", "통과", False, 16 / 30, 0.3, "prime"),
+    "DOWN": (1, "약", "결격", "결격", False, 7 / 30, 0.5, ""),
+    "BANK": (8, "강", "통과", "통과", False, 0.5, 0.5, "pricey"),
+    "OIL": (4, "약", "통과", "통과", True, 0.5, 0.5, "hold"),
+}
+PINNED_VIEW = {
+    # ticker: weak_spot, tags, verdict, hot
+    "UP1": ("선행 PER 백분위 90(비쌈)", "", "통과", "RSI"),
+    "UP2": ("선행 PER 백분위 70(비쌈)", "", "통과", "RSI · 스토캐스틱"),
+    "UP3": ("ROE 백분위 30", "", "통과", "스토캐스틱"),
+    "FLAT": ("FCF 마진 백분위 40", "", "통과", ""),
+    "DOWN": ("ROE 백분위 10", "", "결격: FCF", ""),
+    "BANK": ("ROE 백분위 50", "", "통과", "스토캐스틱"),
+    "OIL": ("ROE 백분위 50", "정점 이익", "통과", ""),
+}
 
 
-def test_values_are_formatted_for_the_page() -> None:
-    assert screen.fmt("pct", 0.1234) == "12.3%"
-    assert screen.fmt("signed", 0.05) == "+5.0%"
-    assert screen.fmt("big", 2.5e12) == "$2,500.0B"
-    assert screen.fmt("usd", 345.2) == "$345.20"
-    assert screen.fmt("x", 2.25) == "2.2x"
-    assert screen.fmt("num", math.nan) == "—"
-    assert screen.fmt("num", None) == "—"
+def prepared(tmp_path: Path) -> pd.DataFrame:
+    root = tmp_path / "data" / "screen"
+    _ = run_update(FakeSource(), root)
+    inputs = screen.load(root)
+    assert inputs is not None
+    return screen.prepare(inputs)
 
 
-def test_chart_rows_cover_a_year_with_moving_averages(tmp_path: Path) -> None:
-    _ = stored(tmp_path)
-    rows = screen.chart_rows(screen.history(tmp_path / "data" / "screen", "UP1"))
+def test_the_default_criteria_reproduce_the_constants(tmp_path: Path) -> None:
+    table = stored(tmp_path)
+    by = table.set_index("ticker")
+    columns = ["score", "chart", "dq_fcf", "dq_state", "peak"]
+    for ticker, (*fixed, quality, valuation, cell) in PINNED.items():
+        assert list(by.loc[ticker, columns]) == fixed
+        assert by.loc[ticker, "quality"] == pytest.approx(quality, rel=1e-12)
+        assert by.loc[ticker, "valuation"] == pytest.approx(valuation, rel=1e-12)
+        assert by.loc[ticker, "group"] == cell
+    assert by.loc["THIN", "liquidity"] == "거래대금 하위 10%"
+    shown = screen.view(screen.liquid(table), screen.Criteria()).set_index("ticker")
+    for ticker, texts in PINNED_VIEW.items():
+        assert tuple(shown.loc[ticker, ["weak_spot", "tags", "verdict", "hot"]]) == (
+            texts
+        )
+    again = screen.judge(prepared(tmp_path / "again"), screen.Criteria())
+    pd.testing.assert_frame_equal(again, table, check_exact=True)
+    assert screen.changed(screen.DEFAULT) == []
+    assert screen.saved(screen.DEFAULT) == ({}, ())
 
-    assert {row["line"] for row in rows} == {"종가", "20일선", "60일선", "200일선"}
-    days = sorted({str(row["day"]) for row in rows})
-    assert days[0] >= "2025-10-22"
-    assert days[-1] == "2026-10-22"
-    assert screen.chart_rows(screen.empty_prices()) == []
+
+def judged(tmp_path: Path, off: Sequence[str] = (), **values: float) -> pd.DataFrame:
+    table = screen.judge(prepared(tmp_path), screen.criteria(values, off))
+    return table.set_index("ticker")
+
+
+def test_a_measure_turned_off_leaves_the_mean(tmp_path: Path) -> None:
+    by = judged(tmp_path, ["q_roe"])
+
+    assert bool(by["q_roe"].isna().all())
+    assert by.loc["UP1", "quality"] == pytest.approx(0.7)  # margin, FCF, growth
+    # A financial has ROE and growth only: growth alone now meets the need.
+    assert by.loc["BANK", "quality"] == pytest.approx(0.5)
+    assert screen.criteria({}, ["q_roe"]).need(financial=True) == 1
+    assert screen.criteria({}, ["q_roe"]).need(financial=False) == 2
+
+
+def test_with_every_measure_off_the_axis_is_not_computed(tmp_path: Path) -> None:
+    by = judged(tmp_path, list(screen.QUALITY))
+
+    kept = cast("pd.DataFrame", by[by["liquidity"] == ""])
+    assert bool(kept["quality"].isna().all())
+    assert set(kept["group"]) == {"hold", ""}  # DOWN keeps its 결격
+    assert "퀄리티 산출 불가" in screen.tags(by.loc["UP1"].to_dict())
+
+
+def test_checks_turned_off_leave_the_score_and_flags(tmp_path: Path) -> None:
+    by = judged(tmp_path, ["t_above200", "o_rsi", "strong"])
+    base = stored(tmp_path / "base").set_index("ticker")
+
+    kept = cast("pd.DataFrame", by[by["liquidity"] == ""])
+    before = base.loc[kept.index]
+    assert (kept["score"] == before["score"] - before["t_above200"].astype(int)).all()
+    assert "강" not in set(kept["chart"])
+    assert not bool(kept["o_rsi"].any())
+    c = screen.criteria({}, ["t_above200", "o_rsi"])
+    row = by.loc["UP1"].to_dict()
+    assert len(screen.tech_lines(row, c)) == len(screen.TECH_CHECKS) - 1
+    assert [label for _, label, _ in screen.overheat_lines(row, c)] == [
+        screen.OVERHEAT["o_stoch"],
+        screen.OVERHEAT["o_bb"],
+    ]
+
+    none = judged(tmp_path / "none", list(screen.TECH_CHECKS))
+    assert set(none["chart"].dropna()) == {""}
+
+
+def test_filters_and_disqualifiers_turned_off(tmp_path: Path) -> None:
+    by = judged(tmp_path, ["illiquid", "dq_fcf", "peak"])
+
+    assert (by["liquidity"] == "").all()  # THIN stays
+    assert set(by["dq_fcf"]) == {screen.UNUSED}
+    assert by.loc["DOWN", "dq_state"] == screen.CLEAR
+    assert by.loc["DOWN", "group"] != ""
+    assert not bool(by["peak"].any())
+    c = screen.criteria({}, ["dq_fcf", "peak"])
+    assert screen.dq_lines(by.loc["DOWN"].to_dict(), c)[0][0] == screen.UNUSED
+    peak = screen.label_lines(by.loc["OIL"].to_dict(), c)[-2]
+    assert peak[0] == screen.UNUSED
+
+
+def test_numbers_move_the_cutlines(tmp_path: Path) -> None:
+    by = judged(tmp_path, min_price=100)
+
+    assert by.loc["FLAT", "liquidity"] == "주가 $100 미만"  # about $50
+    assert by.loc["UP1", "liquidity"] == ""
+    by = judged(tmp_path / "split", split=0.6)
+    assert by.loc["UP2", "group"] == "weak"  # 퀄리티 57% < 60%
+    assert by.loc["BANK", "group"] == "trap"  # 밸류에이션 50% < 60%
+    help_text = screen.group_help(screen.criteria({"split": 0.6}, ()))
+    assert "60% 이상" in help_text
+
+
+def test_saved_criteria_are_checked() -> None:
+    c = screen.criteria(
+        {
+            "split": 0.6,
+            "min_bars": 300,
+            "bank_tce_floor": 0.045,
+            "quality_min": 2.5,  # not whole
+            "illiquid_share": 0.9,  # above its range
+            "min_price": True,  # a bool is not a number
+            "weak_share": math.nan,
+            "gone": 1.0,
+        },
+        ["q_roe", "split", "gone", "o_rsi"],
+    )
+
+    assert (c.split, c.min_bars, c.bank_tce_floor) == (0.6, 300, 0.045)
+    assert (c.quality_min, c.illiquid_share, c.min_price, c.weak_share) == (
+        screen.QUALITY_MIN,
+        screen.ILLIQUID_SHARE,
+        screen.MIN_PRICE,
+        screen.WEAK_SHARE,
+    )
+    assert c.off == ("q_roe", "o_rsi")  # a boundary cannot be off
+    assert screen.changed(c) == ["min_bars", "dq_fcf", "q_roe", "split", "o_rsi"]
+    values, off = screen.saved(c)
+    assert screen.criteria(values, off) == c
+    assert {rule.key for rule in screen.RULES} >= set(screen.TECH_CHECKS)
 
 
 # ---------------------------------------------------------------- storage
@@ -967,13 +1311,6 @@ def test_the_last_final_bar_depends_on_new_york_time() -> None:
         2026, 10, 21
     )
     assert screen.last_session(datetime(2026, 10, 22, 21, 0, tzinfo=UTC)) == DAY
-
-
-def test_pending_skips_fetched_rows_and_retries_failures() -> None:
-    existing = pd.DataFrame({"ticker": ["A", "B"], "error": ["", "HTTPError"]})
-
-    assert screen.pending(existing, ["A", "B", "C"]) == ["B", "C"]
-    assert screen.pending(pd.DataFrame(), ["A"]) == ["A"]
 
 
 def test_price_plan_and_merge() -> None:
@@ -1054,6 +1391,35 @@ def test_later_updates_fetch_only_what_is_due(tmp_path: Path) -> None:
     assert (root / "fundamentals-2027-Q1.csv").exists()
 
 
+def test_a_finished_update_keeps_only_the_newest_dated_files(tmp_path: Path) -> None:
+    root = tmp_path / "data" / "screen"
+    _ = run_update(FakeSource(), root)
+    older = root / "universe-2026-09-01.csv"
+    _ = older.write_text("ticker\n")
+    sibling = root / "sp400"
+    sibling.mkdir()
+    kept = [sibling / "estimates-2026-10-01.csv", sibling / "estimates-2026-10-02.csv"]
+    for path in kept:
+        _ = path.write_text("ticker\n")
+
+    refusals = [screen.RateLimitedError("429")] * (len(screen.RETRY_WAITS) + 1)
+    with pytest.raises(screen.RateLimitedError):
+        _ = run_update(FakeSource({"est:UP1": refusals}), root, NOW + timedelta(days=7))
+    assert older.exists()  # a stopped update deletes nothing
+    assert (root / "estimates-2026-10-22.csv").exists()
+
+    _ = run_update(FakeSource(), root, NOW + timedelta(days=7))
+
+    assert sorted(path.name for path in root.iterdir()) == [
+        "estimates-2026-10-29.csv",
+        "fundamentals-2026-Q4.csv",
+        "prices.parquet",
+        "sp400",
+        "universe-2026-10-22.csv",
+    ]
+    assert all(path.exists() for path in kept)  # another root is left alone
+
+
 def test_rate_limits_are_retried_and_failures_recorded(tmp_path: Path) -> None:
     root = tmp_path / "data" / "screen"
     source = FakeSource(
@@ -1092,6 +1458,41 @@ def test_an_update_stopped_by_yahoo_keeps_what_it_fetched(tmp_path: Path) -> Non
     assert not list(root.glob("*.tmp"))
 
 
+def test_an_older_fundamentals_file_is_fetched_again(tmp_path: Path) -> None:
+    root = tmp_path / "data" / "screen"
+    _ = run_update(FakeSource(), root)
+    path = root / "fundamentals-2026-Q4.csv"
+    pd.read_csv(path).drop(columns=["margin_avg", "margin_years"]).to_csv(
+        path, index=False
+    )
+    refusals = [screen.RateLimitedError("429")] * (len(screen.RETRY_WAITS) + 1)
+    stopped = FakeSource({"UP3": refusals})
+
+    with pytest.raises(screen.RateLimitedError):
+        _ = run_update(stopped, root, NOW + timedelta(hours=1))
+
+    assert [t for t, _ in stopped.fundamental_calls][:2] == ["UP1", "UP2"]
+    saved = pd.read_csv(path)
+    assert set(screen.FUNDAMENTAL_COLUMNS) <= set(saved.columns)
+    errors = dict(zip(saved["ticker"], saved["error"].fillna(""), strict=True))
+    assert errors["UP1"] == ""
+    assert errors["FLAT"] == "옛 형식 (margin_avg, margin_years 없음)"
+    # The old rows still count as failures, so the next update finishes them.
+    resumed = FakeSource()
+    _ = run_update(resumed, root, NOW + timedelta(hours=2))
+    assert [t for t, _ in resumed.fundamental_calls] == [
+        "UP3",
+        "FLAT",
+        "DOWN",
+        "BANK",
+        "OIL",
+        "THIN",
+    ]
+    done = FakeSource()
+    _ = run_update(done, root, NOW + timedelta(hours=3))
+    assert done.fundamental_calls == []
+
+
 def test_a_split_refetches_that_tickers_history(tmp_path: Path) -> None:
     root = tmp_path / "data" / "screen"
     _ = run_update(FakeSource(), root)
@@ -1116,7 +1517,13 @@ def test_a_split_refetches_that_tickers_history(tmp_path: Path) -> None:
     assert up2["date"].min() < pd.Timestamp("2025-01-01")
 
 
-def test_one_update_at_a_time(tmp_path: Path) -> None:
+def no_pauses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Updater's run without its real pauses between requests."""
+    monkeypatch.setattr(screen, "update", partial(screen.update, sleep=ignore))
+
+
+def test_one_update_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    no_pauses(monkeypatch)
     gate = threading.Event()
 
     class Slow(FakeSource):
@@ -1156,6 +1563,653 @@ def test_missing_packages_are_named(monkeypatch: pytest.MonkeyPatch) -> None:
     assert screen.missing_packages() == ["yfinance", "lxml"]
 
 
+# ---------------------------------------------------------------- SEC margins
+
+AGENT = "finagent-test contact"  # no real address in tests
+REVENUES, CONTRACT, SALES, GROSS = screen.REVENUE_CONCEPTS
+INCOME = screen.OPERATING_INCOME
+
+
+def fact(  # noqa: PLR0913 - one companyfacts entry
+    end: str,
+    value: float,
+    *,
+    filed: str = "",
+    days: int = 364,
+    form: str = "10-K",
+    fp: str = "FY",
+) -> dict[str, object]:
+    stop = date.fromisoformat(end)
+    return {
+        "start": (stop - timedelta(days=days)).isoformat(),
+        "end": end,
+        "val": value,
+        "form": form,
+        "fp": fp,
+        "filed": filed or f"{stop.year + 1}-02-15",
+    }
+
+
+def companyfacts(**concepts: list[dict[str, object]]) -> dict[str, object]:
+    us_gaap = {name: {"units": {"USD": rows}} for name, rows in concepts.items()}
+    return {"cik": 1, "entityName": "X", "facts": {"us-gaap": us_gaap}}
+
+
+def years(first: int, last: int, value: float) -> list[dict[str, object]]:
+    return [fact(f"{year}-12-31", value) for year in range(first, last + 1)]
+
+
+def test_annual_values_are_10k_full_years_latest_filed() -> None:
+    facts = companyfacts(
+        **{
+            INCOME: [
+                fact("2024-12-31", 10.0, filed="2025-02-15"),
+                fact("2024-12-31", 12.0, filed="2026-02-15"),  # restated
+                fact("2025-12-31", 20.0),
+                fact("2025-12-28", 99.0, days=91),  # the fourth quarter alone
+                fact("2025-09-30", 99.0, days=273, form="10-Q", fp="Q3"),
+                fact("2023-12-31", 99.0, form="8-K"),
+                fact("2022-12-31", 99.0, fp="Q4"),
+                fact("2021-12-31", 7.0, days=371),  # a 53-week year
+            ]
+        }
+    )
+
+    assert screen.annual(facts, INCOME) == {
+        "2025-12-31": (20.0, "2026-02-15"),
+        "2024-12-31": (12.0, "2026-02-15"),
+        "2021-12-31": (7.0, "2022-02-15"),
+    }
+    assert screen.annual(facts, REVENUES) == {}
+    assert screen.annual({}, INCOME) == {}
+
+
+def test_revenue_concepts_fall_back_in_order() -> None:
+    facts = companyfacts(
+        **{
+            INCOME: years(2015, 2025, 10.0),
+            SALES: years(2015, 2018, 50.0),  # before ASC 606
+            CONTRACT: years(2018, 2025, 100.0),
+            REVENUES: years(2023, 2025, 200.0),  # fewer years in the window
+        }
+    )
+
+    rows = screen.margin_history(facts)
+
+    assert [str(row["end"])[:4] for row in rows] == [
+        str(year) for year in range(2025, 2014, -1)
+    ]
+    concepts = {str(row["end"])[:4]: row["concept"] for row in rows}
+    assert {concepts[str(y)] for y in range(2018, 2026)} == {CONTRACT}
+    assert {concepts[str(y)] for y in range(2015, 2018)} == {SALES}
+    assert rows[0] == {
+        "period": "FY",
+        "end": "2025-12-31",
+        "revenue": 100.0,
+        "op_income": 10.0,
+        "concept": CONTRACT,
+        "filed": "2026-02-15",
+    }
+    tie = companyfacts(
+        **{INCOME: years(2021, 2025, 1.0), CONTRACT: years(2021, 2025, 4.0)}
+        | {REVENUES: years(2021, 2025, 5.0)}
+    )
+    assert {row["concept"] for row in screen.margin_history(tie)} == {REVENUES}
+    gross = companyfacts(
+        **{INCOME: years(2021, 2025, 1.0), GROSS: years(2021, 2025, 4.0)}
+    )
+    assert {row["concept"] for row in screen.margin_history(gross)} == {GROSS}
+    assert screen.margin_history(companyfacts()) == []
+
+
+def history(ticker: str, facts: dict[str, object]) -> pd.DataFrame:
+    rows = [{"ticker": ticker, **row} for row in screen.margin_history(facts)]
+    return pd.DataFrame(rows, columns=list(screen.MARGIN_COLUMNS))
+
+
+def test_the_sec_average_takes_the_newest_five_full_years() -> None:
+    full = companyfacts(
+        **{
+            INCOME: [*years(2019, 2020, 50.0), *years(2021, 2025, 10.0)],
+            CONTRACT: years(2019, 2025, 100.0),
+        }
+    )
+    short = companyfacts(
+        **{INCOME: years(2022, 2025, 10.0), CONTRACT: years(2022, 2025, 100.0)}
+    )
+    # Operating income stopped in 2019, so the newest five years lack it.
+    stale = companyfacts(
+        **{INCOME: years(2015, 2019, 10.0), CONTRACT: years(2015, 2025, 100.0)}
+    )
+    losses = companyfacts(
+        **{
+            INCOME: years(2021, 2025, 10.0),
+            CONTRACT: [*years(2021, 2024, 100.0), fact("2025-12-31", 0.0)],
+        }
+    )
+    table = pd.concat(
+        [
+            history("FULL", full),
+            history("SHORT", short),
+            history("STALE", stale),
+            history("ZERO", losses),
+        ]
+    )
+
+    result = screen.sec_margins(table).set_index("ticker")
+
+    assert result.loc["FULL", "sec_avg"] == pytest.approx(0.10)  # not 2019-2020
+    assert result["sec_years"].to_dict() == {
+        "FULL": 5,
+        "SHORT": 4,
+        "STALE": 0,
+        "ZERO": 4,
+    }
+    assert screen.SEC_YEARS == 5
+
+
+def test_the_sec_margin_is_the_median_of_its_five_years() -> None:
+    income = [20.0, 22.0, -50.0, 18.0, 21.0]  # 2023: a one-off charge
+    facts = companyfacts(
+        **{
+            INCOME: [fact(f"{2021 + i}-12-31", op) for i, op in enumerate(income)],
+            CONTRACT: years(2021, 2025, 100.0),
+        }
+    )
+
+    result = screen.sec_margins(history("ONE", facts)).set_index("ticker")
+
+    assert result.loc["ONE", "sec_avg"] == pytest.approx(0.20)  # mean 0.062
+    assert result.loc["ONE", "sec_years"] == 5
+
+
+def quarter_facts(year: int, value: float) -> list[dict[str, object]]:
+    """Three 10-Q quarters and the 10-K's own fourth, each ``value``."""
+    ends = ("03-31", "06-30", "09-30")
+    filed = [fact(f"{year}-{end}", value, days=90, form="10-Q", fp="Q") for end in ends]
+    return [*filed, fact(f"{year}-12-31", value, days=91)]
+
+
+def test_quarters_are_three_month_values_latest_filed() -> None:
+    facts = companyfacts(
+        **{
+            INCOME: [
+                fact("2025-03-29", 1.0, days=90, form="10-Q", fp="Q1"),
+                fact(
+                    "2025-06-28", 2.0, days=91, form="10-Q", fp="Q2", filed="2025-08-01"
+                ),
+                fact("2025-06-28", 2.5, days=91, form="10-Q", fp="Q2"),  # restated
+                fact("2025-06-28", 9.0, days=182, form="10-Q", fp="Q2"),  # half year
+                fact("2025-10-04", 3.0, days=98, form="10-Q", fp="Q3"),  # 14 weeks
+                fact("2025-10-04", 9.0, days=280, form="10-Q", fp="Q3"),  # nine months
+                fact("2026-01-03", 4.0, days=91),  # the 10-K's fourth quarter
+                fact("2025-12-31", 9.0, days=91, form="8-K", fp="Q4"),
+                fact("2025-03-01", 9.0, days=60, form="10-Q", fp="Q1"),
+            ]
+        }
+    )
+
+    assert screen.quarterly(facts, INCOME) == {
+        "2025-03-29": (1.0, "2026-02-15"),
+        "2025-06-28": (2.5, "2026-02-15"),
+        "2025-10-04": (3.0, "2026-02-15"),
+        "2026-01-03": (4.0, "2027-02-15"),
+    }
+
+
+def test_a_missing_fourth_quarter_is_the_year_less_nine_months() -> None:
+    year = fact("2025-12-31", 100.0, days=364)  # 2025-01-01 to 2025-12-31
+    nine = fact("2025-09-30", 70.0, days=272, form="10-Q", fp="Q3", filed="2025-11-01")
+    late = fact("2025-09-30", 72.0, days=272, form="10-Q", fp="Q3", filed="2026-11-01")
+    other = fact("2025-09-30", 50.0, days=200, form="10-Q", fp="Q3")  # not the year's
+
+    derived = screen.quarterly(companyfacts(**{INCOME: [year, nine, other]}), INCOME)
+    restated = screen.quarterly(companyfacts(**{INCOME: [year, nine, late]}), INCOME)
+    filed = screen.quarterly(
+        companyfacts(**{INCOME: [year, nine, fact("2025-12-31", 31.0, days=91)]}),
+        INCOME,
+    )
+
+    assert derived == {"2025-12-31": (30.0, "2026-02-15")}
+    # The nine months the 10-K was filed against, not a later restatement.
+    assert restated == {"2025-12-31": (30.0, "2026-02-15")}
+    assert filed == {"2025-12-31": (31.0, "2026-02-15")}  # a filed one stands
+    assert screen.quarterly(companyfacts(**{INCOME: [year]}), INCOME) == {}
+
+
+def test_a_derived_quarter_takes_both_values_from_one_filing() -> None:
+    year = fact("2025-12-31", 100.0, days=364)  # filed 2026-02-15
+    nine = fact("2025-09-30", 70.0, days=272, form="10-Q", fp="Q3", filed="2025-11-01")
+    late = fact("2025-09-30", 72.0, days=272, form="10-Q", fp="Q3", filed="2026-11-01")
+    recast = fact("2025-12-31", 104.0, days=364, filed="2027-02-15")
+    after = fact("2025-09-30", 71.0, days=272, form="10-Q", fp="Q3", filed="2026-03-01")
+
+    def q4(*rows: dict[str, object]) -> tuple[float, str]:
+        return screen.quarterly(companyfacts(**{INCOME: list(rows)}), INCOME)[
+            "2025-12-31"
+        ]
+
+    assert q4(year, nine, late) == (30.0, "2026-02-15")
+    assert q4(year, nine, late, recast) == (32.0, "2027-02-15")  # both recast
+    assert q4(year, late, after) == (29.0, "2026-03-01")  # none before: the first
+
+
+def test_quarters_filed_only_as_year_to_date_are_differences() -> None:
+    # Fiscal year from 2025-01-01: Q1 alone, then only six and nine months.
+    q1 = fact("2025-03-31", 10.0, days=89, form="10-Q", fp="Q1")
+    half = fact("2025-06-30", 25.0, days=180, form="10-Q", fp="Q2")
+    nine = fact("2025-09-30", 45.0, days=272, form="10-Q", fp="Q3")
+    year = fact("2025-12-31", 70.0, days=364)
+    restated = fact(
+        "2025-06-30", 26.0, days=180, form="10-Q", fp="Q2", filed="2027-01-01"
+    )
+    filed_q2 = fact("2025-06-30", 14.0, days=91, form="10-Q", fp="Q2")
+
+    derived = screen.quarterly(companyfacts(**{INCOME: [q1, half, nine, year]}), INCOME)
+    later = screen.quarterly(companyfacts(**{INCOME: [q1, half, restated]}), INCOME)
+    alone = screen.quarterly(companyfacts(**{INCOME: [q1, half, filed_q2]}), INCOME)
+
+    assert {end: value for end, (value, _) in derived.items()} == {
+        "2025-03-31": 10.0,
+        "2025-06-30": 15.0,  # six months less the first three
+        "2025-09-30": 20.0,  # nine less six
+        "2025-12-31": 25.0,  # the year less nine
+    }
+    assert later["2025-06-30"] == (16.0, "2027-01-01")  # the restated half year
+    assert alone["2025-06-30"] == (14.0, "2026-02-15")  # a filed quarter stands
+    # Without the year to date before it, a half year gives no quarter.
+    assert screen.quarterly(companyfacts(**{INCOME: [half]}), INCOME) == {}
+
+
+def test_the_sec_ttm_needs_four_quarters_of_both_values() -> None:
+    def ttm(income: list[dict[str, object]], revenue: list[dict[str, object]]) -> float:
+        facts = companyfacts(
+            **{
+                INCOME: [*years(2021, 2025, 10.0), *income],
+                REVENUES: [*years(2021, 2025, 100.0), *revenue],
+            }
+        )
+        margins = screen.sec_margins(history("X", facts))
+        return float(margins["sec_ttm"].iloc[0])
+
+    q = quarter_facts(2025, 5.0)
+    sales = quarter_facts(2025, 20.0)
+    assert ttm(q, sales) == pytest.approx(0.25)
+    assert math.isnan(ttm(q[:3], sales))  # no fourth quarter of income
+    assert math.isnan(ttm(q, sales[:3]))  # no fourth quarter of revenue
+    gap = [*quarter_facts(2024, 5.0)[:1], *q[1:]]  # 2024-03-31 then 2025-06-30
+    assert math.isnan(ttm(gap, [*quarter_facts(2024, 20.0)[:1], *sales[1:]]))
+    stale = quarter_facts(2024, 5.0)  # the 2025 10-K is newer than these
+    assert math.isnan(ttm(stale, quarter_facts(2024, 20.0)))
+    losses = [fact(str(row["end"]), -20.0, days=90) for row in sales]
+    assert math.isnan(ttm(q, losses))  # revenue summing to zero or less
+
+
+def test_retail_calendars_of_twelve_and_sixteen_weeks_count() -> None:
+    def weeks(end: str, n: int, value: float, fp: str) -> dict[str, object]:
+        return fact(end, value, days=7 * n - 1, form="10-Q", fp=fp)
+
+    # Kroger-like: a 16-week first quarter, then 12 weeks each.
+    kroger = companyfacts(
+        **{
+            INCOME: [
+                weeks("2025-05-24", 16, 16.0, "Q1"),
+                weeks("2025-08-16", 28, 28.0, "Q2"),  # six months: 28 weeks
+                weeks("2025-11-08", 40, 40.0, "Q3"),  # nine months: 40 weeks
+                fact("2026-01-31", 52.0, days=363),
+            ]
+        }
+    )
+    # PepsiCo-like: 12-week quarters, then a 16-week fourth.
+    pepsi = companyfacts(
+        **{
+            INCOME: [
+                weeks("2025-03-22", 12, 12.0, "Q1"),
+                weeks("2025-06-14", 24, 24.0, "Q2"),  # six months: 24 weeks
+                weeks("2025-09-06", 36, 36.0, "Q3"),  # nine months: 36 weeks
+                fact("2025-12-27", 52.0, days=363),
+            ]
+        }
+    )
+
+    assert {e: v for e, (v, _) in screen.quarterly(kroger, INCOME).items()} == {
+        "2025-05-24": 16.0,
+        "2025-08-16": 12.0,
+        "2025-11-08": 12.0,
+        "2026-01-31": 12.0,
+    }
+    assert {e: v for e, (v, _) in screen.quarterly(pepsi, INCOME).items()} == {
+        "2025-03-22": 12.0,
+        "2025-06-14": 12.0,
+        "2025-09-06": 12.0,
+        "2025-12-27": 16.0,
+    }
+
+    def ttm(*ends: str) -> float:
+        rows = pd.DataFrame({"end": list(ends), "revenue": 4.0, "op_income": 1.0})
+        return screen.sec_ttm(rows, ends[0])
+
+    assert ttm("2026-01-31", "2025-11-08", "2025-08-16", "2025-05-24") == 0.25
+    assert ttm("2025-12-27", "2025-09-06", "2025-06-14", "2025-03-22") == 0.25
+    # A four-month period among them spans more than a year.
+    assert math.isnan(ttm("2026-04-29", "2025-12-31", "2025-09-30", "2025-06-30"))
+    # Two values for one quarter under different ends are not two quarters.
+    assert math.isnan(ttm("2025-12-31", "2025-12-27", "2025-09-27", "2025-06-28"))
+
+
+def test_a_10q_quarter_beats_the_10k_and_a_mistag_is_dropped() -> None:
+    # VICR's 10-K tagged its full year to the third quarter.
+    q3 = fact("2025-09-30", 110.0, days=91, form="10-Q", fp="Q3", filed="2025-10-29")
+    tagged = fact("2025-09-30", 400.0, days=91, filed="2026-03-02")
+    assert screen.quarterly(companyfacts(**{CONTRACT: [q3, tagged]}), CONTRACT) == {
+        "2025-09-30": (110.0, "2025-10-29")
+    }
+
+    def rows(fourth: float) -> pd.DataFrame:
+        sales = [*quarter_facts(2025, 100.0)[:3], fact("2025-12-31", fourth, days=91)]
+        facts = companyfacts(
+            **{
+                INCOME: [*years(2021, 2025, 10.0), *quarter_facts(2025, 5.0)],
+                CONTRACT: [*years(2021, 2025, 400.0), *sales],
+            }
+        )
+        return history("X", facts)
+
+    mistag = rows(400.0)
+    assert math.isnan(mistag.loc[mistag["end"] == "2025-12-31", "revenue"].iloc[-1])
+    assert math.isnan(screen.sec_margins(mistag)["sec_ttm"].iloc[0])
+    assert screen.sec_margins(rows(100.0))["sec_ttm"].iloc[0] == pytest.approx(0.05)
+    season = screen.sec_margins(rows(244.0))  # H&R Block's 61% tax season
+    assert season["sec_ttm"].iloc[0] == pytest.approx(20 / 544)
+    assert screen.QUARTER_SHARE == 0.75
+
+
+def test_quarter_revenue_picks_its_own_concept() -> None:
+    def quarter_rows(**revenue: list[dict[str, object]]) -> pd.DataFrame:
+        facts = companyfacts(
+            **{
+                INCOME: [*years(2021, 2025, 10.0), *quarter_facts(2025, 5.0)],
+                REVENUES: years(2021, 2025, 100.0),  # the 10-K average's concept
+            }
+            | revenue
+        )
+        table = history("X", facts)
+        assert screen.sec_margins(table)["sec_ttm"].iloc[0] == pytest.approx(0.25)
+        return cast("pd.DataFrame", table[table["period"] == "Q"])
+
+    sales = quarter_facts(2025, 20.0)
+    # Quarters only in another concept still count, under that concept.
+    assert set(quarter_rows(**{CONTRACT: sales})["concept"]) == {CONTRACT}
+    # One concept with all four quarters beats a mix.
+    both = quarter_rows(
+        **{REVENUES: [*years(2021, 2025, 100.0), *sales[:3]], CONTRACT: sales}
+    )
+    assert set(both["concept"]) == {CONTRACT}
+    # Without one, each quarter takes the first concept that has it.
+    mixed = quarter_rows(
+        **{REVENUES: [*years(2021, 2025, 100.0), *sales[:3]], CONTRACT: sales[3:]}
+    )
+    assert mixed["concept"].tolist() == [CONTRACT, REVENUES, REVENUES, REVENUES]
+
+
+class FakeEdgar:
+    def __init__(self, facts: Mapping[str, dict[str, object] | None]) -> None:
+        self.data: dict[str, dict[str, object] | None] = dict(facts)
+        self.ticker_calls: int = 0
+        self.fact_calls: list[str] = []
+
+    def tickers(self) -> pd.DataFrame:
+        self.ticker_calls += 1
+        names = list(self.data)
+        ciks = [f"{i:010d}" for i in range(1, len(names) + 1)]
+        return pd.DataFrame({"ticker": names, "cik": ciks})
+
+    def facts(self, cik: str) -> Mapping[str, object] | None:
+        self.fact_calls.append(cik)
+        return self.data[list(self.data)[int(cik) - 1]]
+
+
+class YahooMargins(FakeSource):
+    """Yahoo's own four-year average, which SEC's replaces when it is full."""
+
+    @override
+    def fundamentals(self, ticker: str, *, financial: bool) -> Mapping[str, object]:
+        row = dict(super().fundamentals(ticker, financial=financial))
+        stale = {"ttm_end": "2026-06-30"} if ticker == "UP3" else {}
+        return row | {
+            "margin_avg": 0.30,
+            "margin_years": 4.0,
+            "op_margin": 0.40,
+            "ttm_end": "2026-01-31",  # SEC's 2025-12-31 is the same quarter
+            **stale,
+        }
+
+
+def test_sec_margins_replace_yahoo_only_with_five_years(tmp_path: Path) -> None:
+    root = tmp_path / "data" / "screen"
+    edgar = FakeEdgar(
+        {
+            "UP1": companyfacts(
+                **{
+                    INCOME: [*years(2020, 2025, 10.0), *quarter_facts(2025, 5.0)],
+                    REVENUES: [*years(2020, 2025, 100.0), *quarter_facts(2025, 20.0)],
+                }
+            ),
+            "UP2": companyfacts(  # four years: Yahoo's average and TTM
+                **{
+                    INCOME: [*years(2022, 2025, 10.0), *quarter_facts(2025, 5.0)],
+                    REVENUES: [*years(2022, 2025, 100.0), *quarter_facts(2025, 20.0)],
+                }
+            ),
+            "UP3": companyfacts(  # quarters older than Yahoo's newest
+                **{
+                    INCOME: [*years(2020, 2025, 10.0), *quarter_facts(2025, 5.0)],
+                    REVENUES: [*years(2020, 2025, 100.0), *quarter_facts(2025, 20.0)],
+                }
+            ),
+            "DOWN": None,  # no companyfacts
+            "FLAT": companyfacts(  # five years, no quarters: Yahoo's TTM
+                **{INCOME: years(2021, 2025, 10.0), REVENUES: years(2021, 2025, 100.0)}
+            ),
+            "BANK": companyfacts(**{INCOME: years(2020, 2025, 10.0)}),
+        }
+    )
+
+    message = screen.update(
+        YahooMargins(), root, NOW, ignore, sleep=ignore, edgar=edgar
+    )
+
+    assert "SEC" not in message  # nothing failed
+    assert edgar.ticker_calls == 1
+    assert len(edgar.fact_calls) == 5  # financials and unknown tickers skip
+    saved = pd.read_csv(root / "margins-2026-Q4.csv")
+    assert set(saved["ticker"]) == {"UP1", "UP2", "UP3", "FLAT", "DOWN", "OIL", "THIN"}
+    assert bool(saved["error"].isna().all())
+    inputs = screen.load(root)
+    assert inputs is not None
+    table = screen.evaluate(inputs).set_index("ticker")
+    assert table.loc["UP1", "margin_source"] == "SEC"
+    assert table.loc["UP1", "margin_avg"] == pytest.approx(0.10)
+    assert table.loc["UP1", "margin_years"] == 5
+    assert table.loc["UP1", "op_margin"] == pytest.approx(0.25)
+    assert table.loc["UP1", "op_margin_source"] == "SEC"
+    assert table.loc["FLAT", "margin_source"] == "SEC"
+    assert table.loc["UP3", "margin_source"] == "SEC"
+    for ticker in ("UP2", "UP3", "FLAT"):
+        assert table.loc[ticker, "op_margin"] == pytest.approx(0.40)
+        assert table.loc[ticker, "op_margin_source"] == "야후"
+    assert table.loc["UP1", "op_margin_end"] == "2025-12-31"  # SEC's quarters
+    assert table.loc["UP2", "op_margin_end"] == "2026-01-31"  # Yahoo's
+    assert table.loc["UP3", "op_margin_end"] == "2026-06-30"
+    for ticker in ("UP2", "DOWN", "OIL"):
+        assert table.loc[ticker, "margin_source"] == "야후"
+        assert table.loc[ticker, "margin_avg"] == pytest.approx(0.30)
+        assert table.loc[ticker, "margin_years"] == 4
+    assert screen.parts(root).margins == "2026-Q4"
+
+    again = FakeEdgar(edgar.data)
+    _ = screen.update(
+        YahooMargins(),
+        root,
+        NOW + timedelta(days=40),
+        ignore,
+        sleep=ignore,
+        edgar=again,
+    )
+    assert again.fact_calls == []  # same quarter
+    assert again.ticker_calls == 1  # the CIK list is a month old
+
+
+def test_an_older_margins_file_is_fetched_again(tmp_path: Path) -> None:
+    root = tmp_path / "data" / "screen"
+    data = {
+        "UP1": companyfacts(
+            **{INCOME: years(2020, 2025, 10.0), REVENUES: years(2020, 2025, 100.0)}
+        )
+    }
+    _ = screen.update(
+        FakeSource(), root, NOW, ignore, sleep=ignore, edgar=FakeEdgar(data)
+    )
+    path = root / "margins-2026-Q4.csv"
+    pd.read_csv(path).drop(columns=["concept"]).to_csv(path, index=False)
+
+    edgar = FakeEdgar(data)
+    _ = screen.update(FakeSource(), root, NOW, ignore, sleep=ignore, edgar=edgar)
+
+    assert edgar.fact_calls == ["0000000001"]
+    assert edgar.ticker_calls == 0  # the stored CIK list is fresh
+    assert "concept" in pd.read_csv(path).columns
+
+
+def test_an_unreachable_sec_leaves_the_yahoo_average(tmp_path: Path) -> None:
+    class Down(FakeEdgar):
+        @override
+        def tickers(self) -> pd.DataFrame:
+            raise httpx.ConnectError("down")
+
+    root = tmp_path / "data" / "screen"
+    edgar = Down({})
+
+    message = screen.update(FakeSource(), root, NOW, ignore, sleep=ignore, edgar=edgar)
+
+    assert message.endswith(" · SEC 받지 못함 (ConnectError: down)")
+    assert edgar.fact_calls == []
+    assert screen.load(root) is not None
+    assert screen.parts(root).margins is None
+
+
+def test_a_refusing_sec_stops_the_stage_and_keeps_what_came(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Refusing(FakeEdgar):
+        @override
+        def facts(self, cik: str) -> Mapping[str, object] | None:
+            if len(self.fact_calls) == 1:
+                self.fact_calls.append(cik)
+                raise screen.SecUnavailableError("HTTP 429")
+            return super().facts(cik)
+
+    root = tmp_path / "data" / "screen"
+    sec = companyfacts(
+        **{INCOME: years(2021, 2025, 10.0), REVENUES: years(2021, 2025, 100.0)}
+    )
+    edgar = Refusing(dict.fromkeys(("UP1", "UP2", "UP3", "FLAT"), sec))
+
+    message = screen.update(FakeSource(), root, NOW, ignore, sleep=ignore, edgar=edgar)
+
+    assert message.endswith(" · SEC 받지 못함 (SecUnavailableError: HTTP 429)")
+    assert len(edgar.fact_calls) == 2  # no third request after the refusal
+    stored = pd.read_csv(root / "margins-2026-Q4.csv")
+    assert set(stored["ticker"]) == {"UP1"}
+
+    statuses = iter([403, 429])
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if "CIK0000000003" in request.url.path:
+            raise httpx.ConnectError("down", request=request)
+        return httpx.Response(next(statuses))
+
+    mocked = partial(httpx.Client, transport=httpx.MockTransport(answer))
+    monkeypatch.setattr(httpx, "Client", mocked)
+    client = screen.Sec(AGENT, sleep=ignore)
+    for cik, reason in (("1", "HTTP 403"), ("2", "HTTP 429"), ("3", "ConnectError")):
+        with pytest.raises(screen.SecUnavailableError, match=reason):
+            _ = client.facts(f"000000000{cik}")
+    client.close()
+
+
+def test_without_a_user_agent_sec_is_never_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    no_pauses(monkeypatch)
+    built: list[str] = []
+
+    def edgar(agent: str) -> screen.Filings:
+        built.append(agent)
+        return FakeEdgar({"UP1": None})
+
+    def source(_: Path) -> screen.Source:
+        return FakeSource()
+
+    def finish(updater: screen.Updater) -> screen.Progress:
+        pause = threading.Event()
+        for _ in range(300):
+            if not updater.progress.running:
+                break
+            _ = pause.wait(0.1)
+        return updater.progress
+
+    updater = screen.Updater(tmp_path, source=source, edgar=edgar)
+    assert updater.start("  ")
+    assert not finish(updater).failed
+    assert built == []
+    assert not list(tmp_path.glob("margins-*"))
+    assert not list(tmp_path.glob("ciks-*"))
+
+    assert updater.start(f" {AGENT} ")
+    assert not finish(updater).failed
+    assert built == [AGENT]
+    assert list(tmp_path.glob("margins-*"))
+    with pytest.raises(ValueError, match="SEC_USER_AGENT"):
+        _ = screen.Sec(" ")
+
+
+def test_sec_requests_carry_the_agent_and_pace_themselves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("company_tickers.json"):
+            body = {"0": {"cik_str": 320193, "ticker": "BRK.B", "title": "X"}}
+            return httpx.Response(200, json=body)
+        if "CIK0000000002" in request.url.path:
+            return httpx.Response(404)
+        return httpx.Response(200, json=companyfacts())
+
+    mocked = partial(httpx.Client, transport=httpx.MockTransport(answer))
+    monkeypatch.setattr(httpx, "Client", mocked)
+    waits: list[float] = []
+    sec = screen.Sec(AGENT, sleep=waits.append)
+
+    assert sec.tickers().to_dict(orient="records") == [
+        {"ticker": "BRK-B", "cik": "0000320193"}
+    ]
+    assert sec.facts("0000000001") == companyfacts()
+    assert sec.facts("0000000002") is None
+    sec.close()
+
+    assert [str(r.url) for r in seen] == [
+        screen.SEC_TICKERS_URL,
+        screen.COMPANYFACTS_URL.format(cik="0000000001"),
+        screen.COMPANYFACTS_URL.format(cik="0000000002"),
+    ]
+    assert {r.headers["User-Agent"] for r in seen} == {AGENT}
+    assert waits == [screen.SEC_PAUSE] * 3
+    assert 1 / screen.SEC_PAUSE <= 10  # SEC's limit, with room for the 13F page
+
+
 # ---------------------------------------------------------------- page
 
 
@@ -1177,66 +2231,97 @@ def click(at: AppTest, column: str, index: int = 0) -> None:
     _ = at.run()
 
 
-def test_the_page_without_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    at = page(tmp_path, monkeypatch)
-
-    assert not at.exception
-    assert "S&P 500 스크리닝" in [h.value for h in at.header]
-    assert any(i.value.startswith("아직 받은 데이터가 없습니다") for i in at.info)
-    assert at.button(key="screen_refresh").disabled
-    assert not at.dataframe
-
-
-def test_the_page_shows_groups_and_opens_a_stock(
+def test_the_page_shows_groups_opens_a_stock_and_switches_universes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    at = page(tmp_path, monkeypatch)
+    assert not at.exception
+    assert at.button(key="screen_refresh").disabled  # demo: nothing fetched
+    assert not at.dataframe
+
     root = tmp_path / screen.SNAPSHOT_DIR
     _ = run_update(FakeSource(), root)
     inputs = screen.load(root)
     assert inputs is not None
     table = screen.evaluate(inputs)
-    at = page(tmp_path, monkeypatch)
+    _ = at.run()  # saved files are picked up
 
     assert not at.exception
-    bar = " ".join(c.value for c in at.caption)
-    assert "시세 2026-10-22" in bar
-    assert "재무 2026-Q4" in bar
+    assert "시세 2026-10-22" in " ".join(c.value for c in at.caption)
     assert len(at.dataframe[0].value) == 7  # the liquid stocks
+    assert at.dataframe[0].proto.placeholder == "—"  # NaN cells show a dash
+    group = at.segmented_control(key="screen_group")
+    assert group.options[1:] == [
+        f"{screen.GROUP_NAMES[key]} · {screen.counts(screen.liquid(table))[key]}"
+        for key in screen.GROUPS
+    ]
+    assert len(at.get("vega_lite_chart")) == 1  # the map's scatter
 
-    selector = at.segmented_control(key="screen_group")
-    labels = " ".join(selector.options)
-    assert all(name in labels for name in screen.GROUP_NAMES.values())
-    for key in "ABCD":  # the map's group cells, then the empty one
-        assert not at.button(key=f"screen_cell_{key}").disabled
-    assert at.button(key="screen_cell_none").disabled
-    assert at.button(key="screen_cell_none").label == "—"
-    captions = " ".join(c.value for c in at.caption)
-    assert "비쌈 아님" in captions
-    assert "차트 약" in captions
-    assert screen.GROUPS["A"] not in captions  # conditions only in tooltips
-
-    _ = at.button(key="screen_cell_B").click().run()
+    _ = group.set_value("pricey").run()
     assert not at.exception
-    assert at.segmented_control(key="screen_group").value == "B"
     shown = at.dataframe[0].value["ticker"].tolist()
-    assert shown == screen.pick(table, "B")["ticker"].tolist()
+    assert shown == screen.pick(table, "pricey")["ticker"].tolist()
+    assert len(shown) == 3
 
     _ = at.segmented_control(key="screen_group").set_value("all").run()
     _ = at.multiselect(key="screen_sectors").set_value(["Financials"]).run()
     assert at.dataframe[0].value["ticker"].tolist() == ["BANK"]
 
     click(at, "sector")  # only the ticker and name cells open a stock
-    assert not at.get("vega_lite_chart")
+    assert len(at.get("vega_lite_chart")) == 1
 
     click(at, "name")
     assert not at.exception
-    text = " ".join(m.value for m in at.markdown)
-    assert "TCE/TA" in text  # the bank test
-    assert "해당 없음" in text
-    assert len(at.get("vega_lite_chart")) == 1
+    assert len(at.get("vega_lite_chart")) == 2  # the map and the stock
 
     _ = at.run()  # an unrelated rerun does not bring the dialog back
-    assert not at.get("vega_lite_chart")
+    assert len(at.get("vega_lite_chart")) == 1
 
     click(at, "ticker")  # the same row again opens it again
-    assert len(at.get("vega_lite_chart")) == 1
+    assert len(at.get("vega_lite_chart")) == 2
+
+    _ = at.segmented_control(key="screen_universe").set_value("sp400").run()
+    assert not at.exception
+    assert not at.dataframe  # nothing saved for the S&P 400 yet
+    midcap = root / screen.UNIVERSES["sp400"].folder
+    _ = screen.update(
+        FakeSource(), midcap, NOW, ignore, sleep=ignore, edgar=FakeEdgar({})
+    )
+    _ = at.run()
+    assert not at.exception
+    assert len(at.dataframe[0].value) == 7
+    assert "SEC 2026-Q4" in " ".join(c.value for c in at.caption)
+
+
+def test_the_criteria_panel_saves_and_resets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ = run_update(FakeSource(), tmp_path / screen.SNAPSHOT_DIR)
+    at = page(tmp_path, monkeypatch)
+    settings = tmp_path / "finagent.settings.json"
+    assert not at.exception
+    assert at.expander[0].label == "기준"
+    assert at.button(key="crit_reset").disabled
+    assert len(at.dataframe[0].value) == 7
+
+    _ = at.checkbox(key="crit_on_illiquid").uncheck().run()
+    assert not at.exception
+    assert len(at.dataframe[0].value) == 8  # THIN is in
+    assert at.expander[0].label == "기준 · 변경 1"
+    assert '"illiquid"' in settings.read_text("utf-8")
+    assert at.number_input(key="crit_illiquid_share").disabled
+    _ = at.checkbox(key="crit_on_t_above200").uncheck().run()
+    click(at, "name")  # the stock dialog with a check off
+    assert not at.exception
+    assert any(m.value.endswith(("/9 강", "/9 약", "/9 ")) for m in at.metric)
+
+    _ = at.number_input(key="crit_split").set_value(60.0).run()
+    assert not at.exception
+    saved = settings.read_text("utf-8")
+    assert '"split": 0.6' in saved
+
+    _ = at.button(key="crit_reset").click().run()
+    assert not at.exception
+    assert at.expander[0].label == "기준"
+    assert len(at.dataframe[0].value) == 7
+    assert '"screen"' not in settings.read_text("utf-8")

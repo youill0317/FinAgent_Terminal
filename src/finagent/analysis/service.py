@@ -100,7 +100,11 @@ class AnalysisService:
         self._lock = asyncio.Lock()
         saved = load_analysis(settings_path) if settings_path is not None else None
         first = DEFAULT_PROVIDER if DEFAULT_PROVIDER in self._providers else ""
-        self._choice = saved or AnalysisChoice(first or next(iter(self._providers)))
+        fallback = first or next(iter(self._providers))
+        if saved is not None and saved.provider not in self._providers:
+            # e.g. "demo" saved under --demo, then a run with the real providers
+            saved = AnalysisChoice(fallback, saved.models, saved.scope)
+        self._choice = saved or AnalysisChoice(fallback)
 
     # ------------------------------------------------------------ choice and meta
 

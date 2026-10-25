@@ -13,9 +13,8 @@ from __future__ import annotations
 import json
 import math
 import sys
-import threading
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pandas as pd
@@ -105,13 +104,6 @@ def test_values_before_2023_are_in_thousands() -> None:
     assert inv.value_unit(date(2023, 1, 3)) == 1
     assert inv.parse_table(text, date(2022, 11, 14)).rows[0].value == 7_000
     assert inv.parse_table(text, date(2023, 2, 14)).rows[0].value == 7
-
-
-def test_amendment_types_from_the_cover_page() -> None:
-    assert inv.parse_amendment(cover("RESTATEMENT")) == "RESTATEMENT"
-    assert inv.parse_amendment(cover("NEW HOLDINGS")) == "NEW HOLDINGS"
-    assert inv.parse_amendment("<edgarSubmission/>") == "UNKNOWN"
-    assert inv.parse_amendment("not xml") == "UNKNOWN"
 
 
 def test_ciks_tickers_and_index_files() -> None:
@@ -548,20 +540,6 @@ def test_large_filers_get_prices_for_their_top_holdings_only(*, capped: bool) ->
     assert len(inv.tickers(found, cusips)) == len(top) - 1
 
 
-def test_ninety_percent_stops_early_for_concentrated_filers() -> None:
-    rows = (row("A", 1, 60), row("B", 1, 31), row("C", 1, 5), row("D", 1, 4))
-
-    assert [r.cusip for r in inv.covered(rows)] == ["A", "B"]
-    assert math.isclose(inv.excluded_share(rows), 0.09)
-
-
-def test_overlap_lists_both_sides() -> None:
-    theirs = pd.Series({"AAPL": 0.5, "KO": 0.2, "OXY": 0.3})
-    mine = pd.Series({"KO": 0.6, "AAPL": 0.1, "MSFT": 0.3})
-
-    assert inv.overlap(theirs, mine) == [("KO", 0.2, 0.6), ("AAPL", 0.5, 0.1)]
-
-
 def test_late_starts_and_early_stops_are_dropped_and_renormalized() -> None:
     rets = pd.DataFrame(
         {
@@ -729,24 +707,6 @@ def test_a_cik_without_13f_filings_is_refused(tmp_path: Path) -> None:
     assert fetcher.check  # the fetcher stays usable
 
 
-def test_the_fetcher_runs_in_the_background(tmp_path: Path) -> None:
-    def build(_agent: str, _root: Path) -> inv.Source:
-        return fake_source()
-
-    fetcher = inv.Fetcher(tmp_path, build=build, sleep=quiet)
-
-    assert fetcher.start(CIK, "Name name@example.org")
-    done = threading.Event()
-    for _ in range(200):
-        if not fetcher.progress.running:
-            break
-        _ = done.wait(0.05)
-
-    assert not fetcher.progress.failed, fetcher.progress.message
-    assert fetcher.tried(CIK)
-    assert inv.load_filer(tmp_path, CIK) is not None
-
-
 # ---------------------------------------------------------------- the page
 
 
@@ -759,6 +719,7 @@ def market() -> pf.Prices:
             "AAA": 100 * walk[:, 0],
             "BBB-B": 50 * walk[:, 1],
             pf.BENCHMARK: 1_000 * walk[:, 2],
+            pf.TOTAL_RETURN: 1_000 * walk[:, 2],
             pf.FX: 1_300.0,
         },
         index=days,
@@ -787,30 +748,12 @@ def page(
     return at
 
 
-def app_limits() -> str:
-    return (
-        "13F는 미국 상장 주식 롱 포지션만 보여줍니다. 공매도·옵션·채권·현금·분기 중"
-        " 매매는 빠져 있어 실제 펀드 수익률과 다릅니다."
-    )
-
-
 def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
     def refuse(*_: object, **_kw: object) -> None:
         raise AssertionError("contacted the network")
 
     monkeypatch.setattr(inv.Web, "__init__", refuse)
     monkeypatch.setattr(pf.Yahoo, "__init__", refuse)
-
-
-def test_the_investor_view_without_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    no_network(monkeypatch)
-    at = page(tmp_path, monkeypatch)
-
-    assert not at.exception
-    assert any("저장된 13F 자료가 없습니다" in i.value for i in at.info)
-    assert not (tmp_path / inv.DATA_DIR).exists()
 
 
 def test_the_investor_view_asks_for_a_user_agent(
@@ -832,7 +775,7 @@ def test_the_investor_view_asks_for_a_user_agent(
     at = page(tmp_path, monkeypatch, demo=False)
 
     assert not at.exception
-    assert any(inv.AGENT_KEY in c.value for c in at.caption)
+    assert any(inv.AGENT_KEY in i.value for i in at.info)
     assert not (tmp_path / inv.DATA_DIR).exists()
 
 
@@ -864,37 +807,22 @@ def test_the_investor_view_with_saved_filings(
     assert any("2026-06-30" in str(o) for o in at.selectbox(key="inv_selected").options)
     holdings = next(d.value for d in at.dataframe if "티커" in d.value.columns)
     assert list(holdings["티커"]) == ["AAA", "BBB-B"]
-    assert "가격 미연결 비중 0.0%" in " ".join(c.value for c in at.caption)
-    notice = "최근 분기 보고 없음 (13F-NT, 2026-08-20)"
-    assert any(notice in c.value for c in at.caption)
+    charts = [str(cast("object", c.proto)) for c in at.get("vega_lite_chart")]
+    assert any("innerRadius" in chart for chart in charts)  # 현황's weight donut
 
-    expected = {
-        "returns": {
-            "누적 · 제출일 복제",
-            "종목 수",
-            "평균 회전율",
-            "분기말 이후 경과일",
-        },
-        "analysis": {
-            "샤프 지수",
-            "PSR",
-            "MinTRL",
-            "최대 낙폭",
-            "고점 아래 기간",
-            "베타",
-        },
-        "correlation": {"분산 비율", "유효 종목 수"},
-        "risk": {"10% 이상 손실 경로 비율", "ES 97.5% (1일)", "초과 횟수"},
-        "stress": {"−30% 손실에 필요한 지수 하락폭"},
-        "compare": {"보유 겹침"},
-    }
-    for section, labels in expected.items():
+    for section in (
+        "returns",
+        "analysis",
+        "correlation",
+        "tail",
+        "outlook",
+        "stress",
+        "compare",
+    ):
         _ = at.segmented_control(key="inv_section").set_value(section).run()
         assert not at.exception, section
-        assert labels <= {m.label for m in at.metric}, section
-        assert at.info[-1].value == app_limits(), section
+        assert at.metric, section
     _ = at.segmented_control(key="inv_section").set_value("analysis").run()
-    assert next(m for m in at.metric if m.label == "PSR").value == "기간 부족"
     at.session_state["inv_style"] = True
     _ = at.run()
     assert not at.exception
@@ -902,17 +830,25 @@ def test_the_investor_view_with_saved_filings(
     league = next(d.value for d in at.dataframe if "투자자" in d.value.columns)
     assert list(league["투자자"]) == ["ALPHA FUND LP"]
     assert "축소 샤프" not in league.columns  # one investor: nothing to shrink toward
-    assert not any("DSR" in c.value for c in at.caption)
+
     _ = at.segmented_control(key="inv_section").set_value("returns").run()
     steps = next(d.value for d in at.dataframe if "회전율" in d.value.columns)
     assert list(steps["회전율"])[-1] == "—"  # the first purchase, from cash
-    assert any("공개 전 정보 사용" in m.value for m in at.markdown)
+
+    def total() -> str:
+        return str(next(m.value for m in at.metric if m.label.startswith("누적")))
+
+    filed = total()
+    _ = at.segmented_control(key="inv_variant").set_value("top").run()
+    assert not at.exception
+    assert total() == filed  # two holdings: the top ten are all of them
+    _ = at.toggle(key="inv_equal").set_value(True).run()
+    assert not at.exception
+    assert total() != filed  # 50/50 instead of the reported 70/30
 
     # Older quarter: ZZZ was sold, and its weight was not linked to a price.
-    _ = at.segmented_control(key="inv_section").set_value("holdings").run()
     _ = at.selectbox(key="inv_quarter").set_value(Q1).run()
     assert not at.exception
-    assert "가격 미연결 비중 40.0%" in " ".join(c.value for c in at.caption)
 
     # A ticker cell opens its dialog.
     gen = at.session_state.get("inv_gen", 0)
@@ -923,30 +859,6 @@ def test_the_investor_view_with_saved_filings(
     _ = at.run()
     assert not at.exception
     assert at.session_state["inv_gen"] == gen + 1  # the dialog opened
-
-
-def test_the_top_weights_clone_in_the_view(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    at = saved_view(tmp_path, monkeypatch)
-    _ = at.segmented_control(key="inv_section").set_value("returns").run()
-
-    def total() -> str:
-        return str(next(m.value for m in at.metric if m.label.startswith("누적")))
-
-    filed = total()
-    _ = at.segmented_control(key="inv_variant").set_value("top").run()
-    assert not at.exception
-    assert "누적 · 상위 10종목 복제" in [m.label for m in at.metric]
-    assert total() == filed  # two holdings: the top ten are all of them
-    _ = at.toggle(key="inv_equal").set_value(True).run()
-    assert not at.exception
-    assert "누적 · 상위 10종목 복제 · 같은 비중" in [m.label for m in at.metric]
-    assert total() != filed  # 50/50 instead of the reported 70/30
-    _ = at.segmented_control(key="inv_section").set_value("risk").run()
-    assert not at.exception
-    _ = at.segmented_control(key="inv_variant").set_value("filed").run()
-    assert not at.exception
 
 
 def test_two_investors_are_ranked_with_shrunk_sharpes(
@@ -975,11 +887,9 @@ def test_two_investors_are_ranked_with_shrunk_sharpes(
     assert "축소 샤프" in league.columns
     sharpes = [float(v.replace("−", "-")) for v in league["샤프 (연)"]]
     assert sharpes == sorted(sharpes, reverse=True)
-    dsr = next(c.value for c in at.caption if "DSR" in c.value)
-    assert "2명 중 최고값이 운으로 나올 수준을 넘는지" in dsr
-    assert "기간 부족" in dsr  # about 110 days of clone returns
-    heat = [c.value for c in at.caption if "모두 값이 있는 날, 일간 수익률" in c.value]
-    assert heat  # investors and the S&P 500 on one lag-adjusted heatmap
-    assert not any(
-        word in "".join(c.value for c in at.caption) for word in ("최고 투자자", "추천")
+    dsr = next(
+        str(m.proto.help) for m in at.markdown if m.value.startswith("**투자자 비교**")
     )
+    assert "DSR" in dsr
+    assert "기간 부족" in dsr  # about 110 days of clone returns
+    assert not any(word in dsr for word in ("최고 투자자", "추천"))

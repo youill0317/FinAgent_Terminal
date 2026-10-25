@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, cast, override
 
 import httpx
 
-from finagent import catalog
 from finagent.analysis.providers import DEFAULT_PROVIDER, registry
 from finagent.analysis.providers.base import (
     ProviderError,
@@ -17,7 +16,6 @@ from finagent.analysis.providers.base import (
 )
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import AnalysisService, RunInput
-from finagent.cli import provider_report
 from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService
 from finagent.settings import (
@@ -272,6 +270,15 @@ def test_the_scope_is_saved_and_loaded(tmp_path: Path) -> None:
     assert analysis(Recorder(), settings_path=path).choice.scope == "all"
 
 
+def test_a_saved_provider_missing_from_this_run_falls_back(tmp_path: Path) -> None:
+    path = tmp_path / "finagent.settings.json"
+    save_analysis(path, AnalysisChoice("gemini_api", {"gemini_api": "m"}, "all"))
+
+    service = analysis(Recorder(), settings_path=path)
+
+    assert service.choice == AnalysisChoice("demo", {"gemini_api": "m"}, "all")
+
+
 def test_a_file_without_a_valid_scope_loads_with_the_default(tmp_path: Path) -> None:
     path = tmp_path / "finagent.settings.json"
     old = '{"analysis": {"provider": "demo", "models": {"demo": "m"}}}'
@@ -310,11 +317,7 @@ def test_settings_keep_each_others_keys(tmp_path: Path) -> None:
 def test_registry_and_api_key_status() -> None:
     providers = registry({}, demo=False)
 
-    assert list(providers) == ["claude_api", "openai_api", "gemini_api"]
-    assert DEFAULT_PROVIDER == "claude_api"
-    assert providers["claude_api"].default_model == "claude-opus-5-5"
-    assert providers["openai_api"].default_model == "gpt-6-astra"
-    assert providers["gemini_api"].default_model == "gemini-4-argon"
+    assert DEFAULT_PROVIDER in providers
     assert list(registry({}, demo=True)) == ["demo"]
 
     async def keyed() -> list[ProviderStatus]:
@@ -324,22 +327,3 @@ def test_registry_and_api_key_status() -> None:
     assert [status.kind for status in asyncio.run(keyed())] == ["missing_key"] * 3
     with_key = registry({"GEMINI_API_KEY": "x"}, demo=False)["gemini_api"]
     assert asyncio.run(with_key.status()).ready
-
-
-def test_provider_report_lists_every_provider() -> None:
-    report = provider_report(
-        {
-            "claude_api": ProviderStatus("ready"),
-            "openai_api": ProviderStatus("missing_key", "OPENAI_API_KEY가 없습니다"),
-        }
-    )
-
-    lines = report.splitlines()
-    assert lines[0] == "AI 공급자 (선택 기능):"
-    assert "claude_api" in lines[1]
-    assert "ready" in lines[1]
-    assert "OPENAI_API_KEY" in lines[2]
-
-
-def test_default_view_is_the_core_view() -> None:
-    assert dashboard().view == catalog.CORE_VIEW

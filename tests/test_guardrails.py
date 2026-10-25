@@ -1,9 +1,10 @@
 """Scope guardrails: public sources only, nothing persisted, no keys in source.
 
-The macro dashboard keeps all of these. The S&P 500 screener
+The macro dashboard keeps all of these. The S&P 500/400 screener
 (``src/finagent/screen.py``) is a documented exception: it may import
-yfinance, contact Wikipedia (and Yahoo through yfinance) and write its data
-files, only under ``data/screen/``. The portfolio page
+yfinance, contact Wikipedia, SEC EDGAR (with the user's ``SEC_USER_AGENT``)
+and Yahoo through yfinance, and write its data files, only under
+``data/screen/``. The portfolio page
 (``src/finagent/portfolio.py``) is the other: it may import yfinance and write
 its trade log and price files, only under ``data/portfolio/``. The investor
 view (``src/finagent/investors.py``) is the third: it may contact SEC EDGAR
@@ -11,7 +12,12 @@ and OpenFIGI, import yfinance (sectors) and write only under
 ``data/investors/``; its prices go to the portfolio page's store via app.py.
 The dashboard's gold row is the fourth: ``src/finagent/sources.py`` may import
 yfinance for Yahoo closes, and yfinance's own caches go only under
-``data/macro/.yfinance/``; the closes themselves stay in memory.
+``data/macro/.yfinance/``; the closes themselves stay in memory. Generator
+retraining (``src/finagent/colab_jobs.py``) is the fifth: it may run the
+``colab`` CLI as a subprocess and write only under ``data/models/`` (its job
+state, a staging folder and the swapped weights; ``tests/test_colab_jobs.py``).
+torch, for the optional Kronos generator, is imported only inside
+``generative.load_kronos``.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from typing import TYPE_CHECKING, Final
 
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 
-from finagent import catalog, investors, portfolio, screen
+from finagent import catalog, generative, investors, portfolio, screen
 from finagent.fetch import SOURCE_LANES
 from finagent.sources import YAHOO_CACHE, YahooCloses
 
@@ -46,12 +52,16 @@ SCREEN_MODULE: Final = SRC / "screen.py"
 PORTFOLIO_MODULE: Final = SRC / "portfolio.py"
 # The third: 13F filings, CUSIP mappings and sectors under data/investors/.
 INVESTORS_MODULE: Final = SRC / "investors.py"
-# Pure numpy/pandas math the portfolio and investor modules may import.
+# The fifth: the colab CLI as a subprocess, files under data/models/.
+COLAB_MODULE: Final = SRC / "colab_jobs.py"
+GENERATIVE_MODULE: Final = SRC / "generative.py"
+# Pure numpy/pandas math the portfolio and investor modules may import; quant.py
+# also fits GJR-GARCH with the optional arch package.
 MATH_MODULES: Final = (SRC / "quant.py", SRC / "perf.py")
 _OTHER_MODULE: Final = r"^\s*(?:import|from)\s+finagent\b(?!\.(?:quant|perf)\b)"
 _OTHER_NAME: Final = r"^\s*from\s+finagent\s+import\s+(?!(?:quant|perf)\b)"
 IMPORTS_BEYOND_MATH: Final = re.compile(f"{_OTHER_MODULE}|{_OTHER_NAME}")
-SCREEN_HOSTS: Final = frozenset({"en.wikipedia.org"})
+SCREEN_HOSTS: Final = frozenset({"en.wikipedia.org", "data.sec.gov", "www.sec.gov"})
 INVESTORS_HOSTS: Final = frozenset({"data.sec.gov", "www.sec.gov", "api.openfigi.com"})
 
 PERSISTENCE_TERMS: Final = (
@@ -126,10 +136,43 @@ def _hits(pattern: re.Pattern[str], paths: list[Path]) -> list[str]:
 
 
 def test_source_never_persists_fetched_data() -> None:
-    allowed = {SETTINGS_MODULE, SCREEN_MODULE, PORTFOLIO_MODULE, INVESTORS_MODULE}
+    allowed = {
+        SETTINGS_MODULE,
+        SCREEN_MODULE,
+        PORTFOLIO_MODULE,
+        INVESTORS_MODULE,
+        COLAB_MODULE,
+    }
     others = [path for path in _python_files() if path not in allowed]
 
     assert _hits(PERSISTENCE_PATTERN, others) == []
+
+
+def test_only_the_training_jobs_run_subprocesses() -> None:
+    imported = re.compile(r"^\s*(?:import|from)\s+subprocess\b")
+    others = [path for path in _python_files() if path != COLAB_MODULE]
+
+    assert Path("data", "models") == generative.MODELS_DIR
+    assert _hits(imported, others) == []
+    finagent = re.compile(r"^\s*(?:import|from)\s+finagent\b")
+    lines = [hit.split(": ", 1)[1] for hit in _hits(finagent, [COLAB_MODULE])]
+    assert lines == ["from finagent import generative"]  # never portfolio
+
+
+def test_torch_is_an_optional_extra_imported_only_by_kronos() -> None:
+    imported = re.compile(r"^\s*(?:import|from)\s+torch\b|import_module\(\"torch\"\)")
+    text = GENERATIVE_MODULE.read_text("utf-8")
+    kronos = text.split("def load_kronos(", 1)[1].split("\ndef ", 1)[0]
+    pyproject = (ROOT / "pyproject.toml").read_text("utf-8")
+    runtime = pyproject.split("[project.optional-dependencies]")[0]
+    extras = pyproject.split("[project.optional-dependencies]")[1].split("\n[", 1)[0]
+
+    assert [h.split(": ", 1)[1] for h in _hits(imported, _python_files())] == [
+        'torch = importlib.import_module("torch")'
+    ]
+    assert 'importlib.import_module("torch")' in kronos
+    assert "torch" not in runtime
+    assert '"torch>=' in extras.split("kronos = [", 1)[1].split("]", 1)[0]
 
 
 class _OneStock:
@@ -346,6 +389,20 @@ def test_yfinance_stays_in_its_homes() -> None:
         assert _hits(imported, [home]) != [], home
     assert "yfinance" not in runtime
     assert '"yfinance>=' in screen_extra
+
+
+def test_arch_is_an_optional_extra_of_the_math_module() -> None:
+    imported = re.compile(r"^\s*(?:import|from)\s+arch\b")
+    text = (ROOT / "pyproject.toml").read_text("utf-8")
+    runtime = text.split("[project.optional-dependencies]")[0]
+    extras = text.split("[project.optional-dependencies]")[1].split("\n[", 1)[0]
+    garch_extra = extras.split("garch = [", 1)[1].split("]", 1)[0]
+    home = SRC / "quant.py"
+
+    assert _hits(imported, [p for p in _python_files() if p != home]) == []
+    assert _hits(imported, [home]) != []
+    assert "arch" not in runtime
+    assert '"arch>=' in garch_extra
 
 
 def test_ai_packages_are_optional_extras() -> None:

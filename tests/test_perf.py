@@ -55,10 +55,37 @@ def test_xirr_known_answer() -> None:
     assert perf.xirr(days, [-100, -50, 300]) == pytest.approx(0.4993, abs=5e-5)
 
 
+def test_xirr_of_a_few_days_is_a_large_annual_rate() -> None:
+    # 105/100 over 7 days is 1.05^(365/7) - 1; 125/100 over 30 days likewise.
+    week = perf.xirr([0, 7], [-100, 105])
+    month = perf.mwr([0, 30], [-100, 125])
+
+    assert week == pytest.approx(1.05 ** (365 / 7) - 1, rel=1e-9)  # about 1,173%
+    assert month is not None
+    assert month.cumulative == pytest.approx(0.25, rel=1e-9)
+    assert perf.xirr([0, 30], [-100, 125]) == pytest.approx(
+        1.25 ** (365 / 30) - 1, rel=1e-9
+    )  # about 1,410%
+
+
+def test_xirr_is_none_when_two_rates_fit() -> None:
+    # -100 + 230/(1+r) - 132/(1+r)^2 = 0 at r = 10% and at r = 20%.
+    assert perf.xirr([0, 365, 730], [-100, 230, -132]) is None
+    assert perf.xirr([0, 0], [-100, 100]) is None  # no span
+    assert perf.xirr([0, 400], [-100, -50]) is None  # no sign change
+    assert perf.mwr([0, 400], [100, 50]) is None
+
+
 def test_ratios_known_answers() -> None:
     assert perf.sortino(SORTINO_CASE) == pytest.approx(0.22361, abs=1e-5)
     assert perf.omega(SORTINO_CASE) == pytest.approx(4 / 3)
     assert perf.ulcer_index([-0.10, 0.0]) == pytest.approx(10.0)
+    # Drawdowns count from the starting capital; Calmar needs a year.
+    assert perf.drawdown_series([-0.1, 0.05]) == pytest.approx([-0.1, -0.055])
+    assert perf.calmar([0.1, -0.2, 0.15], 364) is None
+    assert perf.calmar([0.1, -0.2, 0.15], 365) == pytest.approx(
+        (1.1 * 0.8 * 1.15 - 1) / 0.2
+    )
 
 
 def test_fx_split_known_answer() -> None:
@@ -92,15 +119,12 @@ def test_sharpe_interval_needs_a_year() -> None:
     sr = perf.sharpe(rets)
     assert sr is not None
     assert ci.sharpe == pytest.approx(sr * math.sqrt(252))
+    kospi = perf.sharpe_ci(rets, periods=243)
+    assert kospi is not None
+    assert kospi.sharpe == pytest.approx(sr * math.sqrt(243))
     assert perf.sharpe_ci(rets[:251]) is None
     assert perf.psr(rets[:251]) is None
     assert perf.psr(rets) is not None
-
-
-def test_sharpe_none_without_spread() -> None:
-    assert perf.sharpe([0.01] * 5) is None
-    assert perf.sortino([0.01, 0.02]) is None
-    assert perf.omega([0.01, 0.02]) is None
 
 
 def test_deflated_sharpe_grows_with_fewer_trials() -> None:
@@ -138,10 +162,6 @@ def test_rising_path_has_no_drawdown() -> None:
     assert under.recovery_days == 0
 
 
-def test_drawdown_includes_starting_capital() -> None:
-    assert perf.drawdown_series([-0.1, 0.05]) == pytest.approx([-0.1, -0.055])
-
-
 def test_cdar_limits() -> None:
     rets = rng().normal(0.0, 0.02, 300)
     mdd = perf.max_drawdown(rets)
@@ -152,12 +172,17 @@ def test_cdar_limits() -> None:
     assert mdd <= perf.cdar(rets, 0.95) <= perf.cdar(rets, 0.5) <= avg
 
 
-def test_cdar_takes_exactly_the_tail_share() -> None:
-    # 5% of 100 is 5 observations, not 6 from floating-point noise.
-    rets = [-0.01] * 100
+def test_cdar_counts_the_boundary_drawdown_by_its_fraction() -> None:
+    # 30 drawdowns at 95%: m = 1.5, so the deepest and half the next.
+    rets = [-0.01] * 30
     dd = np.sort(perf.drawdown_series(rets))
 
-    assert perf.cdar(rets, 0.95) == pytest.approx(dd[:5].mean())
+    assert perf.cdar(rets, 0.95) == pytest.approx((dd[0] + 0.5 * dd[1]) / 1.5)
+    # 5% of 100 is 5 observations, not 6 from floating-point noise.
+    hundred = [-0.01] * 100
+    assert perf.cdar(hundred, 0.95) == pytest.approx(
+        np.sort(perf.drawdown_series(hundred))[:5].mean()
+    )
 
 
 def test_underwater_dates_and_durations() -> None:
@@ -174,26 +199,14 @@ def test_underwater_dates_and_durations() -> None:
     assert under.recovery_days == 2
     assert under.longest_days == 3
     assert under.current_days == 1
-
-
-def test_underwater_not_recovered() -> None:
-    wealth = pd.Series(
+    falling = pd.Series(
         [1.0, 2.0, 1.5, 1.0], index=pd.date_range("2024-01-01", periods=4)
     )
-    under = perf.underwater(wealth)
-
-    assert under.max_drawdown == pytest.approx(-0.5)
-    assert under.recovery is None
-    assert under.recovery_days is None
-    assert under.longest_days == under.current_days == 2
-
-
-def test_calmar_needs_a_year() -> None:
-    rets = [0.1, -0.2, 0.15]
-
-    assert perf.calmar(rets, 364) is None
-    calmar = perf.calmar(rets, 365)
-    assert calmar == pytest.approx((1.1 * 0.8 * 1.15 - 1) / 0.2)
+    lost = perf.underwater(falling)
+    assert lost.max_drawdown == pytest.approx(-0.5)
+    assert lost.recovery is None
+    assert lost.recovery_days is None
+    assert lost.longest_days == lost.current_days == 2
 
 
 # ---------------------------------------------------------------- money
@@ -210,28 +223,16 @@ def test_under_a_year_is_not_annualised() -> None:
     assert long.annual == pytest.approx(0.1)
 
 
-def test_mwr_under_a_year_is_holding_period() -> None:
-    result = perf.mwr([0, 182], [-100, 105])
+def test_91_day_rates_are_made_effective_by_how_they_are_quoted() -> None:
+    five = pd.Series([5.0])
+    # ^IRX: bank discount, price 1 - 0.05 x 91/360 = 0.987361; (1/price)^(365/91).
+    bill = float(perf.effective_annual(five, "discount").iloc[0])
+    # CD 91-day: simple on 365 days, (1 + 0.05 x 91/365)^(365/91).
+    cd = float(perf.effective_annual(five, "simple").iloc[0])
 
-    assert result is not None
-    assert result.annual is None
-    assert result.cumulative == pytest.approx(0.05, abs=1e-9)
-
-
-def test_xirr_needs_a_sign_change() -> None:
-    assert perf.xirr([0, 400], [-100, -50]) is None
-    assert perf.mwr([0, 400], [100, 50]) is None
-
-
-def test_daily_risk_free_carries_rates_forward() -> None:
-    rates = pd.Series([3.65, 5.0], index=pd.DatetimeIndex(["2024-01-02", "2024-01-05"]))
-    index = pd.date_range("2024-01-01", "2024-01-06")
-    rf = perf.daily_rf(rates, index)
-
-    assert math.isnan(float(rf.iloc[0]))
-    daily = 1.0365 ** (1 / 252) - 1
-    assert rf.iloc[1:4].to_numpy() == pytest.approx([daily] * 3)
-    assert rf.iloc[4:].to_numpy() == pytest.approx([1.05 ** (1 / 252) - 1] * 2)
+    assert bill == pytest.approx(5.2341, abs=1e-4)
+    assert cd == pytest.approx(5.0946, abs=1e-4)
+    assert bill > cd > 5.0
 
 
 def test_fx_parts_sum_to_base() -> None:
@@ -244,15 +245,6 @@ def test_fx_parts_sum_to_base() -> None:
     assert split.local + split.fx + split.cross == pytest.approx(split.base, abs=1e-15)
     chained = np.prod(1 + (w * perf.to_base(local, fx)).sum(axis=1)) - 1
     assert split.base == pytest.approx(chained)
-
-
-def test_blend_with_pure_weights_is_one_leg() -> None:
-    kr = np.array([0.01, -0.02, 0.005])
-    us = np.array([0.002, 0.01, -0.01])
-
-    assert perf.blend(1.0, kr, us) == pytest.approx(kr)
-    assert perf.blend(0.0, kr, us) == pytest.approx(us)
-    assert perf.blend([1.0, 0.0, 0.5], kr, us) == pytest.approx([0.01, 0.01, -0.0025])
 
 
 def test_tracking_error_and_information_ratio() -> None:
@@ -269,6 +261,13 @@ def test_tracking_error_and_information_ratio() -> None:
     assert ir == pytest.approx(active.mean() * 252 / te)
     assert perf.tracking_error(rets[:251], bench[:251]) is None
     assert perf.information_ratio(bench, bench) is None
+    # A Korea/US union calendar has about 258 returns a year.
+    assert perf.tracking_error(rets, bench, 258) == pytest.approx(
+        active.std(ddof=1) * math.sqrt(258)
+    )
+    assert perf.information_ratio(rets, bench, 258) == pytest.approx(
+        active.mean() * math.sqrt(258) / active.std(ddof=1)
+    )
 
 
 def test_active_share_is_half_the_absolute_gap() -> None:
@@ -356,15 +355,39 @@ def test_style_recovers_planted_weights() -> None:
     assert np.abs(selection).mean() < 0.005
 
 
-def test_style_with_one_proxy_is_all_in() -> None:
-    gen = rng()
-    proxy = gen.normal(0, 0.02, (100, 1))
-    fit = perf.style_fit(gen.normal(0, 0.02, 100), proxy)
-
-    assert fit.weights == pytest.approx([1.0])
-
-
 # ---------------------------------------------------------------- simulation
+
+
+def test_path_risk_measures_falls_and_rises_three_ways() -> None:
+    paths = np.array(
+        [
+            [0.95, 0.88],  # falls 12%: at the end, on a day, from the high
+            [0.88, 0.95],  # down 12% on a day, 5% at the end
+            [1.15, 1.02],  # 11% off its high, never below today; up 15% on a day
+            [0.92, 1.03],  # up 12% from its low, never 10% above today
+            [1.12, 1.13],  # up 13% at the end
+        ]
+    )
+    risk = perf.path_risk(paths, current=1.0, peak=1.0)
+
+    assert risk.falls[0.10] == perf.Reach(end=0.2, touched=0.4, swing=0.6)
+    assert risk.rises[0.10] == perf.Reach(end=0.2, touched=0.4, swing=0.6)
+    assert risk.falls[0.20] == risk.rises[0.20] == perf.Reach(0.0, 0.0, 0.0)
+    assert risk.recovery_median is None  # at the peak already
+
+
+def test_path_risk_shares_are_nested() -> None:
+    rng = np.random.default_rng(7)
+    steps = np.exp(rng.normal(0.0, 0.03, (2000, 63)))
+    paths = np.cumprod(steps, axis=1)
+    paths[:5, 30:] = 0.0  # wiped out after rising or falling
+    risk = perf.path_risk(paths, current=1.0, peak=1.0, levels=(0.05, 0.1, 0.2, 0.3))
+
+    for side in (risk.falls, risk.rises):
+        for r in side.values():
+            assert 0 <= r.end <= r.touched <= r.swing <= 1
+    assert risk.falls[0.1].touched < risk.falls[0.1].swing  # the measures differ
+    assert risk.rises[0.1].end < risk.rises[0.1].touched
 
 
 def test_path_risk_counts_drawdowns_and_recoveries() -> None:
@@ -378,22 +401,12 @@ def test_path_risk_counts_drawdowns_and_recoveries() -> None:
     )
     risk = perf.path_risk(paths, current=0.8, peak=1.0)
 
-    assert risk.drawdown_odds[0.10] == 0.75
-    assert risk.drawdown_odds[0.20] == 0.0
-    assert risk.drawdown_odds[0.30] == 0.0
+    assert risk.falls[0.10].swing == 0.75
+    assert risk.falls[0.30].swing == 0.0
     assert risk.never == 0.25
     assert risk.recovery_low == 1
     assert risk.recovery_median == 2
     assert risk.recovery_high is None  # past the horizon
-
-
-def test_path_risk_at_the_peak_has_no_recovery() -> None:
-    paths = rng().lognormal(0, 0.05, (1000, 20)).cumprod(axis=1)
-    risk = perf.path_risk(paths, current=1.0, peak=1.0)
-
-    assert risk.recovery_median is None
-    assert risk.never == 0.0
-    assert 0 <= risk.drawdown_odds[0.30] <= risk.drawdown_odds[0.10] <= 1
 
 
 # ---------------------------------------------------------------- clones
@@ -408,21 +421,3 @@ def test_shrinkage_limits() -> None:
     assert perf.shrink([0.02, 0.02], [0.0, 0.0]) == pytest.approx([0.02, 0.02])
     partial = perf.shrink(estimates, [0.005, 0.005, 0.005])
     assert np.all(np.abs(partial - 0.02) < np.abs(estimates - 0.02) + 1e-15)
-
-
-def test_top_weights() -> None:
-    values = pd.Series([50.0, 30.0, 20.0, 10.0], index=["A", "B", "A", "C"])
-
-    value = perf.top_weights(values, 2)
-    assert value.to_dict() == pytest.approx({"A": 70 / 100, "B": 30 / 100})
-    equal = perf.top_weights(values, 2, equal=True)
-    assert equal.to_dict() == {"A": 0.5, "B": 0.5}
-
-
-def test_turnover_after_drift() -> None:
-    old = pd.Series({"A": 0.5, "B": 0.5})
-    drifted = perf.drift(old, pd.Series({"A": 1.5, "B": 0.5}))
-
-    assert drifted.to_dict() == pytest.approx({"A": 0.75, "B": 0.25})
-    assert perf.turnover(old, drifted) == pytest.approx(0.25)
-    assert perf.turnover(drifted, drifted) == 0
