@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import threading
+from dataclasses import fields
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import TYPE_CHECKING, cast
@@ -105,9 +107,9 @@ FUNDAMENTALS: dict[str, dict[str, object]] = {
     "UP2": {"fcf": 3e9, "roe": 0.20, "book_value": 10.0, "trailing_eps": 2.0},
     "UP3": {"fcf": 1e9, "roe": 0.10, "book_value": 10.0, "trailing_eps": 4.0},
     "FLAT": {"fcf": 1e9, "roe": 0.25, "book_value": 10.0, "trailing_eps": 5.0},
-    "DOWN": {"fcf": -1e9, "roe": 0.05, "book_value": 10.0, "trailing_eps": 3.0},
+    "DOWN": {"fcf": -2e9, "roe": 0.05, "book_value": 10.0, "trailing_eps": 3.0},
     "BANK": {"roe": 0.12, "book_value": 50.0, "trailing_eps": 4.0},
-    "OIL": {"fcf": 2e9, "roe": 0.15, "book_value": 30.0, "trailing_eps": 5.0},
+    "OIL": {"fcf": 2e9, "roe": 0.15, "book_value": 30.0, "trailing_eps": 6.0},
     "THIN": {"fcf": 1e8, "roe": 0.05, "book_value": 5.0, "trailing_eps": 5.0},
 }
 
@@ -143,7 +145,7 @@ def fundamentals(ticker: str) -> dict[str, object]:
         "wc_change": 0.0,
         "total_assets": 5e10,
         **{f"fcf_y{year}": fcf for year in range(3)},
-        **{f"opa_y{year}": roe / 5 - 0.002 * year for year in range(4)},
+        **{f"gpa_y{year}": roe / 5 - 0.002 * year for year in range(4)},
         "last_fy_end": "2025-12-31",
         "next_fy_end": "2026-12-31",
         "currency": "USD",
@@ -202,7 +204,7 @@ class FakeSource:
     def prices(self, tickers: Sequence[str], start: date, end: date) -> pd.DataFrame:
         self.price_calls.append((tuple(tickers), start, end))
         frames = [
-            ohlcv(t, start, end, GROWTH[t], 1e5 if t == "THIN" else 1e6)
+            ohlcv(t, start, end, GROWTH.get(t, 0.0), 1e5 if t == "THIN" else 1e6)
             for t in tickers
         ]
         frames = [f for f in frames if not f.empty]
@@ -280,7 +282,12 @@ def test_fundamentals_row_reads_info_and_statements() -> None:
         ],
     )
     statements = screen.Statements(
-        income=yearly(TotalRevenue=[90.0, 100.0], OperatingIncome=[9.0, 20.0]),
+        income=yearly(
+            TotalRevenue=[90.0, 100.0],
+            OperatingIncome=[9.0, 20.0],
+            GrossProfit=[36.0, math.nan],
+            CostOfRevenue=[54.0, 60.0],
+        ),
         trailing=ttm(GrossProfit=40.0, OperatingIncome=12.0, InterestExpense=3.0),
         cash=ttm(ChangeInWorkingCapital=-5.0),
         cash_yearly=yearly(FreeCashFlow=[1.0, -2.0, 3.0]),
@@ -308,8 +315,8 @@ def test_fundamentals_row_reads_info_and_statements() -> None:
     assert (row["total_assets"], row["tbv"], row["shares"]) == (100.0, 7.0, 2.0)
     assert [row[f"fcf_y{i}"] for i in range(3)] == [1.0, -2.0, 3.0]
     assert math.isnan(cast("float", row["fcf_y3"]))
-    assert row["opa_y0"] == pytest.approx(9 / 90)  # the same year's assets
-    assert row["opa_y1"] == pytest.approx(20 / 80)
+    assert row["gpa_y0"] == pytest.approx(36 / 90)  # the same year's assets
+    assert row["gpa_y1"] == pytest.approx((100 - 60) / 80)  # no gross profit row
     assert (row["last_fy_end"], row["next_fy_end"]) == ("2025-12-31", "2026-12-31")
     assert set(row) == set(screen.FUNDAMENTAL_COLUMNS) - {"ticker", "error"}
 
@@ -317,8 +324,41 @@ def test_fundamentals_row_reads_info_and_statements() -> None:
     assert math.isnan(cast("float", bare["nd_ebitda"]))
     assert math.isnan(cast("float", bare["rev_growth"]))
     assert math.isnan(cast("float", bare["eq_ratio"]))
-    assert math.isnan(cast("float", bare["opa_y0"]))
+    assert math.isnan(cast("float", bare["gpa_y0"]))
+    revenue_only = screen.fundamentals_row(
+        {},
+        screen.Statements(
+            income=yearly(TotalRevenue=[90.0]),
+            balance_yearly=yearly(TotalAssets=[90.0]),
+        ),
+    )
+    assert math.isnan(cast("float", revenue_only["gpa_y0"]))  # not revenue less 0
     assert bare["last_fy_end"] == ""
+
+
+def test_sec_gross_profit_over_assets_and_its_change() -> None:
+    years = pd.DataFrame(
+        {
+            "end": ["2025-12-31", "2024-12-31", "2023-12-31", "2022-12-31"],
+            "revenue": [100.0, 90.0, 80.0, 70.0],
+            "op_income": [10.0, 9.0, 8.0, 7.0],
+            "gross_profit": [50.0, math.nan, 32.0, 21.0],
+            "cost_of_revenue": [math.nan, 54.0, math.nan, math.nan],
+            "assets": [100.0, 100.0, 100.0, 100.0],
+        }
+    ).assign(**dict.fromkeys(("net_income", "ocf", "capex", "equity"), math.nan))
+
+    row = screen.sec_row(years, pd.DataFrame(columns=["end"]))
+
+    assert row["sec_gpa_y0"] == 0.5
+    assert row["sec_gpa_y1"] == pytest.approx(0.36)  # revenue less cost of revenue
+    assert row["sec_gpa_y3"] == pytest.approx(0.21)
+    table = pd.DataFrame([row]).assign(
+        **{f"gpa_y{year}": math.nan for year in range(screen.ANNUAL_YEARS)}
+    )
+    change = screen.improvement(table, 3).iloc[0]
+    assert change["improve"] == pytest.approx(0.5 - 0.21)
+    assert (change["improve_years"], change["improve_source"]) == (3, "SEC")
 
 
 # ---------------------------------------------------------------- indicators
@@ -337,6 +377,60 @@ def test_tech_row_needs_the_minimum_history() -> None:
     assert full["near_high"] == pytest.approx(full["from_high"] + 1)
     assert full["near_high"] <= 1
     assert full["mom12_1"] > 0
+
+
+def test_tech_row_follows_the_criteria_windows() -> None:
+    frame = ohlcv("UP1", date(2025, 9, 1), DAY, 0.002)
+    close = frame["adj_close"].to_numpy()
+    c = screen.criteria(
+        {
+            "mom_bars": 126,
+            "skip_bars": 0,
+            "high_bars": 63,
+            "ma_short": 5,
+            "ma_long": 300,
+            "surge_bars": 10,
+        },
+        [],
+    )
+    row = screen.tech_row(frame, c)
+
+    assert len(frame) < 300
+    assert row["mom12_1"] == pytest.approx(close[-1] / close[-127] - 1)
+    assert row["near_high"] == pytest.approx(close[-1] / (close[-63:] * 1.01).max())
+    assert row["ma_short"] == pytest.approx(close[-5:].mean())
+    assert math.isnan(row["ma_long"])  # fewer bars than the long average
+    assert math.isnan(row["ma_dist"])
+    assert row["surge_ret"] == pytest.approx(close[-1] / close[-11] - 1)
+    longer = screen.tech_row(frame, screen.criteria({"mom_bars": 504}, []))
+    assert math.isnan(longer["mom12_1"])  # short of 504 + 21 bars
+
+
+def test_momentum_crash_follows_the_criteria_windows() -> None:
+    prices = pd.concat(
+        [
+            ohlcv("AAA", date(2025, 6, 2), DAY, -0.001),
+            ohlcv("BBB", date(2025, 6, 2), DAY, -0.002),
+        ]
+    )
+    caps = pd.DataFrame({"ticker": ["AAA", "BBB"], "mcap": [1e10, 3e10]})
+
+    assert screen.momentum_crash(prices, caps).state == screen.NOT_COMPUTED
+    c = screen.criteria({"bear_bars": 252, "variance_bars": 21}, [])
+    crash = screen.momentum_crash(prices, caps, c)
+    assert crash.state in {screen.CRASH_WATCH, screen.CRASH_CLEAR}
+    assert crash.market_return < 0
+
+
+def test_every_criteria_number_has_one_input() -> None:
+    inputs = [x.field for r in screen.RULES for x in r.limits]
+
+    assert sorted(inputs) == sorted(
+        f.name for f in fields(screen.Criteria) if f.name != "off"
+    )
+    assert screen.windows(screen.criteria({"surge_bars": 10, "split": 0.6}, [])) == (
+        screen.criteria({"surge_bars": 10}, [])
+    )
 
 
 # ---------------------------------------------------------------- fundamentals
@@ -411,37 +505,36 @@ def years_of(values: Sequence[float], prefix: str = "fcf_y") -> dict[str, float]
 
 def test_cash_flow_disqualifier() -> None:
     nan = math.nan
+    insurer = {"sector": "Financials", "industry": "Property & Casualty Insurance"}
     result = status(
         frame(tce_ratio=0.01, eq_ratio=0.01),  # capital ratios: financials only
         frame(ocf=-1.0),
-        frame(**years_of([5.0, -1.0, -5.0])),  # 3-year sum -1
+        frame(**years_of([5.0, -1.0, -5.0])),  # 3-year FCF -1: not a disqualifier
         frame(**years_of([5.0, -1.0, -5.0, 100.0])),  # the fourth year is out
         frame(ocf=nan),
         frame(**years_of([]), fcf=nan),
-        frame(**years_of([-9.0]), fcf=2.0),  # one year: the TTM FCF decides
-        frame(**years_of([-1.0, -1.0, -1.0]), sector="Utilities", peer="Utilities"),
+        frame(**years_of([-9.0]), fcf=2.0),  # one year: the TTM FCF stands in
         frame(ocf=-1.0, sector="Real Estate", peer="Real Estate"),
+        frame(**insurer, eq_ratio=0.01, ocf=nan),  # no capital ratio test
+        frame(**insurer, roe=-0.01, ocf=nan),
     )
 
     assert screen.FCF_YEARS == 3
     assert result["dq_cash"].tolist() == [
         "통과",
         "결격",
-        "결격",
-        "결격",
-        "미확인",
+        "통과",
+        "통과",
         "미확인",
         "통과",
-        "통과",  # utilities: operating cash flow only
+        "통과",
+        "결격",
+        "통과",
         "결격",
     ]
     assert result["dq_state"].tolist()[:2] == ["통과", "결격"]
+    assert (result.loc[2, "fcf_cum"], result.loc[3, "fcf_cum"]) == (-1.0, -1.0)
     assert result.loc[6, "fcf_source"] == "TTM"
-    longer = status(
-        frame(**years_of([5.0, -1.0, -5.0, 2.0])),
-        c=screen.criteria({"fcf_years": 4}, []),
-    )
-    assert longer["fcf_cum"].iloc[0] == 1.0
 
 
 BANK = {
@@ -477,12 +570,47 @@ def test_net_debt_disqualifier() -> None:
     floor = status(frame(nd_ebitda=1.0), frame(nd_ebitda=1.0), frame(nd_ebitda=4.1))
     assert floor["nd_limit"].iloc[0] == 4.0  # max(1.0 x 2, 4.0)
     assert floor["dq_debt"].tolist() == ["통과", "통과", "결격"]
+    cap = status(frame(nd_ebitda=5.0), frame(nd_ebitda=5.0), frame(nd_ebitda=6.5))
+    assert cap["nd_limit"].iloc[0] == 6.0  # min(5.0 x 2, 6.0)
+    assert cap["dq_debt"].tolist() == ["통과", "통과", "결격"]
 
 
 # ---------------------------------------------------------------- 보류
 
 
 OIL = {"sector": "Energy", "industry": "Integrated Oil & Gas", "peer": "Energy"}
+
+
+def test_peak_earnings_needs_the_margin_and_a_flat_forward_eps() -> None:
+    margins = {
+        "long_years": 10,
+        "margin_years": 5,
+        "margin_avg": 0.10,
+        "long_med": 0.10,
+        "long_mad": 0.01,
+        "long_std": 0.015,
+        "trailing_eps": 5.0,
+    }
+    rows = [
+        OIL | margins | {"op_margin": 0.14, "fwd_eps": 5.0},  # z 2.7, +4%p
+        OIL | margins | {"op_margin": 0.14, "fwd_eps": 6.0},  # EPS still growing
+        OIL | margins | {"op_margin": 0.13, "fwd_eps": 5.0},  # z 2.0: below 2.5
+        OIL
+        | margins
+        | {
+            "op_margin": 0.14,
+            "fwd_eps": 5.0,
+            "sector": "Health Care",
+            "industry": "Health Care Equipment",
+            "long_std": 0.005,  # the steadiest: not cyclical by its margins
+        },
+    ]
+
+    flags = screen.hold_flags(pd.DataFrame(rows))
+
+    assert flags["peak"].tolist() == [True, False, False, False]
+    assert flags["tailwind"].tolist() == [False, True, False, False]
+    assert flags["margin_jump"].tolist() == [False, False, False, True]
 
 
 # ---------------------------------------------------------------- 퀄리티 and 밸류에이션
@@ -516,7 +644,7 @@ def test_cells_of_quality_by_valuation() -> None:
         cell_row(valuation=math.nan),
         cell_row(dq_state="결격"),
         cell_row(dq_state="미확인", peak=True),
-        cell_row(tailwind=True),
+        cell_row(tailwind=True),  # a label, not a hold
         cell_row(tailwind=True, dq_state="결격"),
     ) == [
         "prime",
@@ -529,7 +657,7 @@ def test_cells_of_quality_by_valuation() -> None:
         "hold",
         "",  # judgment withheld
         "",
-        "hold",  # 업황 순풍
+        "prime",
         "",
     ]
 
@@ -607,16 +735,18 @@ def test_evaluate_on_stored_data(tmp_path: Path) -> None:
     by = table.set_index("ticker")
 
     assert set(table["ticker"]) == set(UNIVERSE["ticker"])
-    left_out = by[by["liquidity"] != ""]
-    assert list(left_out.index) == ["THIN"]  # lowest dollar volume (ceil 0.4)
+    assert (by["liquidity"] == "").all()  # no dollar volume cut by default
+    cut = screen.liquidity(table, screen.criteria({"illiquid_share": 0.05}, []))
+    assert table.loc[cut != "", "ticker"].tolist() == ["THIN"]
     kept = screen.liquid(table)
     assert kept["score"].between(0, 100).all()
     assert by.loc["UP1", "score"] > by.loc["DOWN", "score"]
-    assert by.loc["DOWN", "dq_cash"] == "결격"  # three years of negative FCF
+    assert by.loc["DOWN", "dq_cash"] == "결격"  # negative operating cash flow
     assert by.loc["BANK", "dq_debt"] == "해당 없음"
     assert by.loc["BANK", "peer"] == "Financials"  # one bank: the sector
     assert by.loc["BANK", "dq_cash"] == "통과"  # TCE/TA 6%
-    assert bool(by.loc["OIL", "tailwind"])  # cyclical, margin twice its median
+    assert bool(by.loc["OIL", "peak"])  # cyclical, margin twice its median, EPS flat
+    assert not bool(by.loc["OIL", "tailwind"])
     assert by.loc["OIL", "group"] == "hold"
     assert by.loc["DOWN", "group"] == ""  # 결격
     assert by.loc["BANK", "v_book"] == 0.5  # alone in its group: the median
@@ -625,7 +755,7 @@ def test_evaluate_on_stored_data(tmp_path: Path) -> None:
     # 70 of 365 days left in FY1: forward EPS leans on FY2.
     w = 70 / 365.25
     assert by.loc["UP1", "fwd_eps"] == pytest.approx(w * 5.0 + (1 - w) * 6.0)
-    assert screen.failures(table)["ticker"].tolist() == ["THIN"]
+    assert screen.failures(table).empty
     assert all(
         screen.group(kept, key).shape[0] <= screen.TOP_N for key in screen.GROUPS
     )
@@ -703,6 +833,81 @@ def test_first_update_writes_every_part(tmp_path: Path) -> None:
     assert start == DAY - timedelta(days=screen.HISTORY_DAYS)
     assert end == DAY + timedelta(days=1)
     assert screen.parts(root) == screen.Parts(DAY, DAY, "2026-Q4", DAY)
+
+
+def test_update_keeps_pricing_the_stocks_of_recent_snapshots(tmp_path: Path) -> None:
+    root = tmp_path / "data" / "screen"
+    folder = root / screen.SNAPSHOT_FOLDER
+    folder.mkdir(parents=True)
+    _ = (folder / "2026-09-01.csv").write_text("ticker,group\nGONE,prime\n")
+    _ = (folder / "2025-01-02.csv").write_text("ticker,group\nOLD,prime\n")
+
+    message = run_update(FakeSource(), root)
+
+    priced = set(screen.read_prices(root)["ticker"])
+    assert "GONE" in priced  # left the index after the snapshot
+    assert "OLD" not in priced  # past SNAPSHOT_REACH_DAYS
+    assert "시세 받은 종목 8" in message  # the index's own
+
+
+def test_snapshot_keeps_every_criteria_number(tmp_path: Path) -> None:
+    table = stored(tmp_path)
+
+    path = screen.write_snapshot(tmp_path, table, screen.DEFAULT, DAY)
+
+    meta = json.loads(path.with_suffix(".json").read_text("utf-8"))
+    assert meta["values"]["weak_share"] == screen.WEAK_SHARE  # a default too
+    assert meta["as_of"] == "2026-10-22"
+    assert "sector" in pd.read_csv(path).columns
+
+
+def snapshot(folder: Path, day: str, as_of: str, rows: str) -> None:
+    _ = (folder / f"{day}.csv").write_text(f"ticker,sector,group\n{rows}")
+    _ = (folder / f"{day}.json").write_text(f'{{"as_of": "{as_of}"}}')
+
+
+def test_snapshot_check_against_the_stocks_screened(tmp_path: Path) -> None:
+    days = pd.bdate_range("2025-01-01", periods=300)
+    steps = np.arange(len(days), dtype="float64")
+    paths = {"A": 100 * 1.001**steps, "B": np.full(len(days), 100.0)}
+    prices = pd.concat(
+        [
+            *(
+                pd.DataFrame({"date": days, "ticker": t, "adj_close": v})
+                for t, v in paths.items()
+            ),
+            pd.DataFrame({"date": days[:10], "ticker": "C", "adj_close": 50.0}),
+        ],
+        ignore_index=True,
+    )
+    folder = tmp_path / screen.SNAPSHOT_FOLDER
+    folder.mkdir()
+    labels = cast("list[str]", days.strftime("%Y-%m-%d").tolist())
+    first = labels[0]
+    snapshot(folder, first, first, "A,Tech,prime\nB,Tech,weak\nC,Energy,prime\n")
+    late = labels[290]
+    snapshot(folder, late, late, "A,Tech,prime\n")  # no horizon reached yet
+    snapshot(folder, "2024-06-03", "2024-06-03", "A,Tech,prime\n")  # not stored
+
+    check = screen.snapshot_check(tmp_path, prices)
+
+    assert set(check["day"]) == {first}
+    assert len(check) == len(screen.HORIZONS) * len(screen.SNAPSHOT_GROUPS)
+    month = check[check["horizon"] == "1개월"].set_index("group")
+    gain = 1.001**21 - 1
+    assert (month.loc["prime", "stocks"], month.loc["prime", "priced"]) == (2, 1)
+    assert month.loc["prime", "excess"] == pytest.approx(gain / 2)  # C: no price
+    assert month.loc["weak", "excess"] == pytest.approx(-gain / 2)
+    assert month.loc["prime", "sector_excess"] == pytest.approx(gain / 2)
+    assert (month.loc["prime", "beat"], month.loc["weak", "beat"]) == (1.0, 0.0)
+    assert month.loc["trap", "stocks"] == 0
+
+    summary = screen.check_summary(check)
+    assert list(summary["horizon"].unique()) == list(screen.HORIZONS)
+    row = summary.iloc[0]
+    assert (row["horizon"], row["group"]) == ("1개월", "검토 우선")
+    assert (row["snapshots"], row["stocks"], row["missing"]) == (1, 2.0, 0.5)
+    assert "밸류 트랩 점검" not in set(summary["group"])  # no stock in it
 
 
 def no_pauses(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -235,7 +235,7 @@ class DemoSource:
             "wc_change": 0.0,
             "total_assets": 5e10,
             **{f"fcf_y{year}": fcf for year in range(3)},
-            **{f"opa_y{year}": roe / 5 - 0.002 * year for year in range(4)},
+            **{f"gpa_y{year}": roe / 5 - 0.002 * year for year in range(4)},
             "last_fy_end": "2025-12-31",
             "next_fy_end": "2026-12-31",
             "currency": "USD",

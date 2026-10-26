@@ -1175,20 +1175,40 @@ def screen_updater(root: str, universe: str) -> screen.Updater:
 
 @st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=2)
 def screen_prepared(
-    root: str, stamp: tuple[tuple[str, int], ...]
+    root: str, stamp: tuple[tuple[str, int], ...], windows: screen.Criteria
 ) -> pd.DataFrame | None:
-    """The stored files with indicators; ``stamp`` changes whenever one does."""
+    """The stored files with indicators; ``stamp`` changes whenever one does.
+
+    ``windows`` (``screen.windows``) keeps the other rules from recomputing it.
+    """
     inputs = screen.load(Path(root)) if stamp else None
-    return None if inputs is None else screen.prepare(inputs)
+    return None if inputs is None else screen.prepare(inputs, windows)
 
 
 @st.cache_data(show_spinner=False, max_entries=2)
-def screen_crash(root: str, stamp: tuple[tuple[str, int], ...]) -> screen.Crash:
+def screen_crash(
+    root: str, stamp: tuple[tuple[str, int], ...], windows: screen.Criteria
+) -> screen.Crash:
     """The momentum crash notice from the stored prices."""
     inputs = screen.load(Path(root)) if stamp else None
     if inputs is None:
         return screen.Crash()
-    return screen.momentum_crash(inputs.prices, inputs.fundamentals)
+    prices = inputs.prices
+    listed = cast("pd.Series", prices["ticker"]).isin(inputs.universe["ticker"])
+    return screen.momentum_crash(
+        cast("pd.DataFrame", prices[listed]), inputs.fundamentals, windows
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def screen_check(
+    root: str, stamp: tuple[tuple[str, int], ...], snapshots: tuple[str, ...]
+) -> pd.DataFrame:
+    """The snapshots' forward returns by cell; ``stamp`` and ``snapshots`` key it."""
+    path = Path(root)
+    if not stamp or not snapshots:
+        return pd.DataFrame(columns=[column for column, _, _ in screen.CHECK_TABLE])
+    return screen.check_summary(screen.snapshot_check(path, screen.read_prices(path)))
 
 
 @st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=8)
@@ -1196,7 +1216,7 @@ def screen_table(
     root: str, stamp: tuple[tuple[str, int], ...], criteria: screen.Criteria
 ) -> pd.DataFrame | None:
     """The table screened by ``criteria``; only a changed rule recomputes it."""
-    prepared = screen_prepared(root, stamp)
+    prepared = screen_prepared(root, stamp, screen.windows(criteria))
     return None if prepared is None else screen.judge(prepared, criteria)
 
 
@@ -1730,8 +1750,8 @@ def group_map(
         if c.on("crash") and crash.state == screen.CRASH_WATCH:
             st.warning(
                 "시장이 큰 폭으로 하락한 뒤 변동성이 높은 반등기입니다. 모멘텀 급락"
-                " 위험이 커서 기술 점수(12-1 모멘텀)를 조심해서 보세요 · 시장 24개월"
-                f" {screen.fmt('signed', crash.market_return)}",
+                " 위험이 커서 기술 점수(12-1 모멘텀)를 조심해서 보세요 · 시장"
+                f" {c.bear_bars}거래일 {screen.fmt('signed', crash.market_return)}",
                 icon=":material/warning:",
             )
         st.altair_chart(
@@ -1815,6 +1835,38 @@ def screen_results(
     for index, column in event.selection.cells:
         if column in {"ticker", "name"}:
             open_stock(root, records[index], c)
+
+
+def snapshot_section(root: Path, stamp: tuple[tuple[str, int], ...]) -> None:
+    """The saved snapshots' cells against the stocks they screened, later."""
+    files = tuple(path.name for path in screen.snapshot_files(root))
+    with st.expander(f"스냅샷 검증 · 스냅샷 {len(files)}개"):
+        try:
+            summary = screen_check(str(root), stamp, files)
+        except (OSError, ValueError, KeyError) as error:
+            st.error(f"스냅샷을 읽지 못했습니다: {error}")
+            return
+        if summary.empty:
+            st.caption(
+                "아직 21거래일이 지난 스냅샷이 없습니다 · 갱신할 때마다 그날의"
+                " 칸 배정이 스냅샷으로 쌓입니다"
+            )
+            return
+        shown = cast("pd.DataFrame", summary[[c for c, _, _ in screen.CHECK_TABLE]])
+        signed = [c for c, _, kind in screen.CHECK_TABLE if kind == "signed"]
+        styled = shown.style.map(return_style, subset=signed).format(
+            {c: partial(screen.fmt, kind) for c, _, kind in screen.CHECK_TABLE if kind}
+        )
+        st.dataframe(
+            styled,
+            hide_index=True,
+            column_config={
+                column: st.column_config.Column(label)
+                for column, label, _ in screen.CHECK_TABLE
+            },
+            alt="스냅샷 검증",
+        )
+        st.caption(screen.CHECK_NOTE)
 
 
 # ---------------------------------------------------------------- portfolio
@@ -6755,13 +6807,14 @@ def screen_help(name: str, c: screen.Criteria) -> str:
             "illiquid": f"20일 평균 거래대금 하위 {c.illiquid_share:.0%}",
         }
     )
+    if c.illiquid_share == 0:
+        _ = liquidity.pop("illiquid", None)
     checks = c.kept(screen.DQ_NAMES)
     hold = c.kept(
         {
-            "peak": f"정점 이익(TTM 영업이익률 ≥ 10년 중앙값 × {c.peak_ratio:g} 그리고"
-            f" 선행 EPS ≤ 후행 × {c.peak_eps_ratio:g})",
-            "tailwind": f"업황 순풍(z ≥ {c.tailwind_z:g} 그리고 TTM − 10년 중앙값 ≥"
-            f" {c.tailwind_gap * 100:g}%p)",
+            "peak": f"정점 이익(영업이익률 z ≥ {c.tailwind_z:g} 그리고 TTM − 10년"
+            f" 중앙값 ≥ {c.tailwind_gap * 100:g}%p 그리고 선행 EPS ≤ 후행 ×"
+            f" {c.peak_eps_ratio:g})",
         }
     )
     rules = [
@@ -6814,7 +6867,7 @@ def screening() -> None:
     try:
         stamp = screen.stamp(root)
         table = screen_table(str(root), stamp, criteria)
-        crash = screen_crash(str(root), stamp)
+        crash = screen_crash(str(root), stamp, screen.windows(criteria))
     except (OSError, ValueError, KeyError) as error:
         st.error(f"`{screen.SNAPSHOT_DIR}/`의 파일을 읽지 못했습니다: {error}")
         return
@@ -6822,6 +6875,7 @@ def screening() -> None:
         st.info("아직 받은 데이터가 없습니다.")
         return
     screen_results(root, table, criteria, crash)
+    snapshot_section(root, stamp)
 
 
 def portfolio_page() -> None:

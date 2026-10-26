@@ -130,9 +130,9 @@ REFUSED: Final = frozenset({403, 429})  # SEC's answers to a missing or fast age
 # value, ties at the cutline included.
 MIN_BARS: Final = 250
 MIN_PRICE: Final = 5.0
-ILLIQUID_SHARE: Final = 0.05  # lowest 20-day dollar volume, left out
-STRONG_SHARE: Final = 0.20  # top tech scores: 차트 강
-WEAK_SHARE: Final = 0.40  # bottom tech scores: 차트 약
+ILLIQUID_SHARE: Final = 0.0  # lowest 20-day dollar volume, left out: none
+STRONG_SHARE: Final = 0.30  # top tech scores: 차트 강
+WEAK_SHARE: Final = 0.30  # bottom tech scores: 차트 약
 SURGE_SHARE: Final = 0.10  # top 21-day return or MAX: 단기 급등
 SPLIT: Final = 0.5  # 퀄리티 and 밸류에이션 percentiles split at the middle of the peers
 NEAR_BAND: Final = 0.05  # 경계 근처: within this of the split
@@ -140,19 +140,17 @@ QUALITY_MIN: Final = 3  # 퀄리티 measures a non-financial needs
 QUALITY_MIN_FIN: Final = 2  # and a financial
 VALUATION_MIN: Final = 2  # 밸류에이션 measures needed
 PEER_MIN: Final = 15  # members a GICS level needs, else the next wider one
-FCF_YEARS: Final = 3  # fiscal years of the cumulative FCF disqualifier
+FCF_YEARS: Final = 3  # fiscal years of the cumulative FCF column
 FCF_YEARS_LEAST: Final = 2  # fewer than N years: the ones there, at least this many
 NET_DEBT_FLOOR: Final = 4.0
+NET_DEBT_CAP: Final = 6.0  # the limit never above this, however high the median
 NET_DEBT_MEDIAN_TIMES: Final = 2.0
-EQUITY_MEDIAN_SHARE: Final = 0.5
 COVERAGE_FLOOR: Final = 1.5  # EBIT / interest expense
-# 정점 이익: TTM operating margin at least this times the normal (10-year
-# median) one, and forward EPS at most trailing EPS times the second.
-PEAK_RATIO: Final = 1.5
-PEAK_EPS_RATIO: Final = 1.05
-# 업황 순풍: the TTM margin's robust z against the 10-year median and MAD, and
-# its gap over that median.
-TAILWIND_Z: Final = 2.0
+# 정점 이익: the TTM margin's robust z against the 10-year median and MAD,
+# its gap over that median, and forward EPS at most trailing EPS times this.
+# The margin alone is the 업황 순풍 label.
+PEAK_EPS_RATIO: Final = 1.0
+TAILWIND_Z: Final = 2.5
 TAILWIND_GAP: Final = 0.03
 MAD_SCALE: Final = 1.4826  # MAD to a normal standard deviation
 # With fewer than ``LONG_YEARS`` years in ``LONG_WINDOW``, the 5-year median
@@ -162,7 +160,6 @@ SHORT_GAP: Final = 0.05
 LONG_WINDOW: Final = 10
 LONG_YEARS: Final = 7
 SHORT_YEARS: Final = 4  # the least a 5-year median needs for the hold rules
-REVENUE_FLOOR: Final = -0.15  # 매출 급감 label
 RELIANCE_RATIO: Final = 1.5  # 추정 의존 label: forward EPS against trailing
 WEAK_TREND_SHARE: Final = 0.20  # 가격·추정치 약세: bottom 12-1 momentum
 CYCLICAL_STD_SHARE: Final = 1 / 3  # top 10-year margin deviations: 경기순환
@@ -225,6 +222,8 @@ SEC_FLOWS: Final = {
         "InterestAndDebtExpense",
     ),
     "interest_paid": ("InterestPaidNet", "InterestPaid"),
+    "gross_profit": ("GrossProfit",),
+    "cost_of_revenue": ("CostOfRevenue", "CostOfGoodsAndServicesSold"),
 }
 SEC_INSTANTS: Final = {
     "assets": ("Assets",),
@@ -236,8 +235,6 @@ SEC_INSTANTS: Final = {
 TOP_N: Final = 20
 FINANCIALS: Final = "Financials"
 BANKS: Final = "Banks"
-# Sectors that report operating cash flow but whose FCF is capex by design.
-CASH_ONLY: Final = frozenset({"Utilities", "Real Estate"})
 # GICS (March 2023 revision, checked against MSCI's GICS methodology of March
 # 2023): industry group → industry → sub-industries, each in code order.
 # Wikipedia gives the sector and sub-industry; peers widen through industry
@@ -532,7 +529,8 @@ CYCLICAL_GROUPS: Final = frozenset(
 SMA_DAYS: Final = (20, 21, 60, 200)
 YEAR_BARS: Final = 252
 MONTH_BARS: Final = 21
-MOMENTUM_BARS: Final = 273  # 12-1 momentum: a year back, skipping the last month
+MA_SHORT: Final = 21  # 이동평균 거리: the short SMA over the long one
+MA_LONG: Final = 200
 TECH_COLUMNS: Final = (
     "bars",
     "price",  # last close as traded, for the price floor and the table
@@ -546,7 +544,10 @@ TECH_COLUMNS: Final = (
     "mom12_1",
     "ret_1m",
     "ret_3m",
-    "max_1m",  # the largest daily return of the last month
+    "surge_ret",  # 단기 급등: the return over the surge window
+    "surge_max",  # and the largest daily return in it
+    "ma_short",
+    "ma_long",
 )
 
 # Status words the page shows for a check that is not a plain pass or fail.
@@ -619,7 +620,7 @@ BALANCE_ROWS: Final = {
     "tbv": "TangibleBookValue",
     "shares": "OrdinarySharesNumber",
 }
-ANNUAL_YEARS: Final = 5  # yearly FCF and operating income / assets kept, newest first
+ANNUAL_YEARS: Final = 5  # yearly FCF and gross profit / assets kept, newest first
 FUNDAMENTAL_COLUMNS: Final = (
     "ticker",
     *INFO_FIELDS,
@@ -640,7 +641,7 @@ FUNDAMENTAL_COLUMNS: Final = (
     *CASH_ROWS,
     *BALANCE_ROWS,
     *(f"fcf_y{year}" for year in range(ANNUAL_YEARS)),
-    *(f"opa_y{year}" for year in range(ANNUAL_YEARS)),
+    *(f"gpa_y{year}" for year in range(ANNUAL_YEARS)),
     "last_fy_end",  # the newest fiscal year reported
     "next_fy_end",  # the end of the fiscal year after it
     "currency",
@@ -683,10 +684,10 @@ TECH_ITEMS: Final = {
 }
 TECH_VALUES: Final = {"t_mom": "mom12_1", "t_high": "near_high", "t_trend": "ma_dist"}
 SURGE: Final = {
-    "s_ret": "21거래일 수익률",
-    "s_max": "21거래일 최대 일간 수익률",
+    "s_ret": "기간 수익률",
+    "s_max": "기간 최대 일간 수익률",
 }
-SURGE_VALUES: Final = {"s_ret": "ret_1m", "s_max": "max_1m"}
+SURGE_VALUES: Final = {"s_ret": "surge_ret", "s_max": "surge_max"}
 # 퀄리티 measures: column → name. Each is a percentile within the peer group,
 # higher is better.
 QUALITY: Final = {
@@ -712,7 +713,6 @@ VALUATION: Final = {
 }
 # Display-only labels the 기준 panel can turn off.
 LABEL_RULES: Final = {
-    "l_revdrop": "매출 급감",
     "l_reliance": "추정 의존",
     "l_margin_jump": "마진 급등",
     "l_near": "경계 근처",
@@ -816,7 +816,7 @@ NON_FINANCIAL_ONLY: Final = frozenset(
     {"q_cbop", "q_gpa", "q_improve", "q_stability", "q_leverage", "v_ebitda", "v_fcf"}
 )
 DQ_RULES: Final = {
-    "dq_cash": "현금흐름·자본(금융업은 ROE·자기자본비율, 은행은 ROE·TCE/TA)",
+    "dq_cash": "현금흐름·자본(금융업은 ROE, 은행은 ROE·TCE/TA)",
     "dq_debt": "순부채/EBITDA(금융업 해당 없음)",
     "dq_cover": "이자보상배율(금융업 해당 없음)",
 }
@@ -848,22 +848,29 @@ class Criteria:
     min_price: float = MIN_PRICE
     illiquid_share: float = ILLIQUID_SHARE
     peer_min: int = PEER_MIN
-    fcf_years: int = FCF_YEARS
-    equity_median_share: float = EQUITY_MEDIAN_SHARE
     bank_tce_floor: float = BANK_TCE_FLOOR
     net_debt_median_times: float = NET_DEBT_MEDIAN_TIMES
     net_debt_floor: float = NET_DEBT_FLOOR
+    net_debt_cap: float = NET_DEBT_CAP
     coverage_floor: float = COVERAGE_FLOOR
     quality_min: int = QUALITY_MIN
     quality_min_fin: int = QUALITY_MIN_FIN
     split: float = SPLIT
-    peak_ratio: float = PEAK_RATIO
     peak_eps_ratio: float = PEAK_EPS_RATIO
     tailwind_z: float = TAILWIND_Z
     tailwind_gap: float = TAILWIND_GAP
+    short_ratio: float = SHORT_RATIO
+    short_gap: float = SHORT_GAP
+    mom_bars: int = YEAR_BARS
+    skip_bars: int = MONTH_BARS
+    high_bars: int = YEAR_BARS
+    ma_short: int = MA_SHORT
+    ma_long: int = MA_LONG
+    surge_bars: int = MONTH_BARS
+    bear_bars: int = BEAR_BARS
+    variance_bars: int = VARIANCE_BARS
     strong_share: float = STRONG_SHARE
     weak_share: float = WEAK_SHARE
-    revenue_floor: float = REVENUE_FLOOR
     reliance_ratio: float = RELIANCE_RATIO
     near_band: float = NEAR_BAND
     weak_trend_share: float = WEAK_TREND_SHARE
@@ -905,6 +912,23 @@ class Criteria:
 
 
 DEFAULT: Final = Criteria()
+# The fields the indicators from the stored prices take (``prepare``,
+# ``momentum_crash``); the rest only screen them.
+WINDOWS: Final = (
+    "mom_bars",
+    "skip_bars",
+    "high_bars",
+    "ma_short",
+    "ma_long",
+    "surge_bars",
+    "bear_bars",
+    "variance_bars",
+)
+
+
+def windows(c: Criteria) -> Criteria:
+    """The defaults with ``c``'s windows: what the price indicators depend on."""
+    return replace(DEFAULT, **{name: getattr(c, name) for name in WINDOWS})
 
 
 @dataclass(frozen=True, slots=True)
@@ -954,13 +978,33 @@ class Rule:
     part: str = ""
 
 
-CRASH_HELP: Final = (
-    "**정의** 시장(유니버스 종목 시가총액 가중 일간 수익률)의 지난"
-    f" {BEAR_BARS}거래일 누적 수익률 < 0 그리고 직전 {VARIANCE_BARS}거래일 일간"
-    " 수익률 분산 > 저장 기간 중앙값이면 주의\n\n"
-    "**해석** 큰 폭 하락 뒤 변동성 높은 반등기에는 모멘텀 급락 위험이 큼(Daniel·"
-    "Moskowitz) · 현재 구성 종목으로 만든 지수라 과거 수익률이 조금 좋게 나옴"
-)
+def crash_help(c: Criteria = DEFAULT) -> str:
+    return (
+        "**정의** 시장(유니버스 종목 시가총액 가중 일간 수익률)의 지난"
+        f" {c.bear_bars}거래일 누적 수익률 < 0 그리고 직전 {c.variance_bars}거래일"
+        " 일간 수익률 분산 > 저장 기간 중앙값이면 주의\n\n"
+        "**해석** 큰 폭 하락 뒤 변동성 높은 반등기에는 모멘텀 급락 위험이 큼(Daniel·"
+        "Moskowitz) · 현재 구성 종목으로 만든 지수라 과거 수익률이 조금 좋게 나옴"
+    )
+
+
+# The numbers of a 기술 점수 measure's rule, and their defaults.
+TECH_LIMITS: Final = {
+    "t_mom": (
+        Limit("mom_bars", "기간 (거래일)", 126, 504, 21),
+        Limit("skip_bars", "최근 제외 (거래일)", 0, 63, 21),
+    ),
+    "t_high": (Limit("high_bars", "기간 (거래일)", 63, 504, 21),),
+    "t_trend": (
+        Limit("ma_short", "단기선 (일)", 5, 60, 1),
+        Limit("ma_long", "장기선 (일)", 100, 300, 10),
+    ),
+}
+TECH_DEFAULTS: Final = {
+    "t_mom": f"{YEAR_BARS}거래일 · 최근 {MONTH_BARS}거래일 제외",
+    "t_high": f"{YEAR_BARS}거래일",
+    "t_trend": f"{MA_SHORT}일선 ÷ {MA_LONG}일선",
+}
 # The numbers of a 퀄리티 measure's rule.
 QUALITY_LIMITS: Final = {
     "q_improve": (Limit("improve_years", "변화 (년)", 2, ANNUAL_YEARS - 1, 1),),
@@ -971,8 +1015,9 @@ QUALITY_HELP: Final = {
     "**해석** 높을수록 현금으로 뒷받침되는 영업 수익성 우위",
     "q_gpa": "매출총이익(TTM) ÷ 총자산 · 매출총이익이 없으면 매출 − 매출원가 · 금융업"
     " 해당 없음\n\n**해석** 높을수록 자산 대비 총이익 우위",
-    "q_improve": "영업이익 ÷ 총자산의 N년 변화 · SEC 10-K, 없으면 야후 연간 · 1개 연도"
-    " 모자라면 N − 1년 변화(짧은 창) · 금융업 해당 없음\n\n"
+    "q_improve": "매출총이익 ÷ 총자산의 N년 변화 · 매출총이익이 없으면 매출 −"
+    " 매출원가 · SEC 10-K, 없으면 야후 연간 · 1개 연도 모자라면 N − 1년 변화(짧은"
+    " 창) · 금융업 해당 없음\n\n"
     "**해석** 높을수록 수익성이 좋아지는 중\n\n"
     f"**기준** 기본 {IMPROVE_YEARS}년",
     "q_stability": f"영업이익률 {SEC_YEARS}년 표준편차 · SEC 10-K, 없으면 야후 연간"
@@ -998,12 +1043,18 @@ VALUATION_HELP: Final = {
     "v_book": "은행: 주당 유형장부가치 ÷ 주가 · 그 밖의 금융업: 주당 장부가치 ÷ 주가 ·"
     " 장부가치 0 이하는 가장 비싼 쪽 · 금융업 전용",
 }
-TECH_HELP: Final = {
-    "t_mom": f"수정 종가 기준 {YEAR_BARS}거래일 전부터 {MONTH_BARS}거래일 전까지의"
-    f" 수익률(최근 1개월 제외) · 일봉 {MOMENTUM_BARS}개 미만이면 미산출",
-    "t_high": f"종가 ÷ 최근 {YEAR_BARS}거래일 최고가",
-    "t_trend": "21일선 ÷ 200일선",
-}
+
+
+def tech_help(c: Criteria = DEFAULT) -> dict[str, str]:
+    """Each 기술 점수 measure's definition with the windows of ``c``."""
+    return {
+        "t_mom": f"수정 종가 기준 {c.mom_bars}거래일 전부터 {c.skip_bars}거래일"
+        f" 전까지의 수익률 · 일봉 {c.mom_bars + c.skip_bars}개 미만이면 미산출",
+        "t_high": f"종가 ÷ 최근 {c.high_bars}거래일 최고가",
+        "t_trend": f"{c.ma_short}일선 ÷ {c.ma_long}일선 · 일봉이 모자라면 미산출",
+    }
+
+
 RULES: Final = (
     Rule(
         "min_bars",
@@ -1029,7 +1080,9 @@ RULES: Final = (
         "거래대금",
         "**정의** 20일 평균 거래대금 하위 비율 제외 · 일봉·주가 통과 종목 기준, 경계"
         " 동률 포함\n\n"
-        "**해석** 사고팔기 어려운 종목 제외\n\n"
+        "**해석** 사고팔기 어려운 종목 제외 · 대형주에서는 유동성 프리미엄 근거가"
+        " 없고 S&P 편입 요건이 이미 유동성을 보므로 기본은 끔(0%), 주문 크기에"
+        " 맞춰 올려 쓰기\n\n"
         f"**기준** 기본 하위 {ILLIQUID_SHARE:.0%}",
         (Limit("illiquid_share", "하위 (%)", 0, 50, 1, percent=True),),
     ),
@@ -1048,34 +1101,28 @@ RULES: Final = (
         "dq_cash",
         "결격 점검",
         "현금흐름·자본",
-        "**정의** 일반: 영업현금흐름(TTM) < 0 또는 최근 N개 회계연도 누적 FCF < 0 ·"
-        " 유틸리티·부동산은 영업현금흐름만 · 금융업: ROE < 0 또는 자기자본비율 <"
-        " 업종 중앙값 × 비율 · 은행: ROE < 0 또는 TCE/TA < 하한 · 해당하면 결격\n\n"
-        f"**해석** 현금을 못 버는 회사, 자본 완충이 얇은 금융사 제외 · 연도가 모자라면"
-        f" 있는 연도({FCF_YEARS_LEAST}개 이상), 그것도 없으면 FCF(TTM) < 0 · SEC 10-K"
-        " 영업현금흐름 − 설비투자 우선, 없으면 야후 연간\n\n"
-        f"**기준** 기본 {FCF_YEARS}개 연도 · 중앙값의 {EQUITY_MEDIAN_SHARE:.0%} ·"
-        f" TCE/TA {BANK_TCE_FLOOR:.0%}",
-        (
-            Limit("fcf_years", "누적 FCF (년)", 2, 5, 1),
-            Limit(
-                "equity_median_share", "금융업 중앙값 대비 (%)", 0, 100, 5, percent=True
-            ),
-            Limit("bank_tce_floor", "은행 TCE/TA (%)", 0, 20, 0.5, percent=True),
-        ),
+        "**정의** 일반: 영업현금흐름(TTM) < 0 · 금융업: ROE < 0 · 은행: ROE < 0 또는"
+        " TCE/TA < 하한 · 해당하면 결격\n\n"
+        "**해석** 현금을 못 버는 회사, 자본 완충이 얇은 은행 제외 · 영업현금흐름 < 0은"
+        " Piotroski F-score의 CFO 조건 · 설비투자로 인한 FCF 적자는 결격이 아님(누적"
+        " FCF 열에서 참고)\n\n"
+        f"**기준** 기본 TCE/TA {BANK_TCE_FLOOR:.0%}",
+        (Limit("bank_tce_floor", "은행 TCE/TA (%)", 0, 20, 0.5, percent=True),),
     ),
     Rule(
         "dq_debt",
         "결격 점검",
         "순부채/EBITDA",
-        "**정의** 순부채/EBITDA > max(업종 중앙값 × 배수, 하한)이면 결격 · 순현금은"
-        " 통과 · EBITDA 0 이하이면서 순부채 > 0이면 결격 · 금융업 해당 없음\n\n"
+        "**정의** 순부채/EBITDA > min(max(업종 중앙값 × 배수, 하한), 상한)이면 결격"
+        " · 순현금은 통과 · EBITDA 0 이하이면서 순부채 > 0이면 결격 · 금융업 해당"
+        " 없음\n\n"
         "**해석** 업종보다 빚이 무거운 회사 제외\n\n"
         f"**기준** 기본 중앙값 × {NET_DEBT_MEDIAN_TIMES:g} · 하한"
-        f" {NET_DEBT_FLOOR:.1f}x",
+        f" {NET_DEBT_FLOOR:.1f}x · 상한 {NET_DEBT_CAP:.1f}x",
         (
             Limit("net_debt_median_times", "중앙값 × (배)", 0.5, 10, 0.5),
             Limit("net_debt_floor", "하한 (x)", 0, 20, 0.5),
+            Limit("net_debt_cap", "상한 (x)", 0, 20, 0.5),
         ),
     ),
     Rule(
@@ -1178,30 +1225,23 @@ RULES: Final = (
         "peak",
         "칸 배정·보류",
         "정점 이익",
-        "**정의** 경기순환 기업에서 TTM 영업이익률 ≥ 10년 중앙값 × 배수 그리고 선행"
-        " EPS ≤ 후행 EPS × 비율이면 보류 · 후행 EPS > 0, 중앙값 > 0일 때만\n\n"
-        "**해석** 이익 정점에서 싸 보이는 경기순환주 분리 · 10년 이력이 모자라면 5년"
-        " 중앙값(짧은 창, 이익률 이력 참고)\n\n"
-        f"**기준** 기본 × {PEAK_RATIO:g} · {PEAK_EPS_RATIO:g}",
-        (
-            Limit("peak_ratio", "중앙값 × (배)", 1.1, 3, 0.1),
-            Limit("peak_eps_ratio", "선행 ÷ 후행 EPS", 0.8, 1.3, 0.05),
-        ),
-    ),
-    Rule(
-        "tailwind",
-        "칸 배정·보류",
-        "업황 순풍",
         f"**정의** 경기순환 기업에서 z = (TTM 영업이익률 − 10년 중앙값) ÷ ({MAD_SCALE}"
-        " × 10년 MAD) ≥ 하한 그리고 TTM − 중앙값 ≥ 차이면 보류 · 금융업 해당 없음\n\n"
-        "**해석** 업황 호조로 일시적으로 부푼 이익 분리 · 10년 이력이 모자라면"
+        " × 10년 MAD) ≥ 하한, TTM − 중앙값 ≥ 차이, 그리고 선행 EPS ≤ 후행 EPS ×"
+        " 비율이면 보류 · 후행 EPS > 0일 때만 · 금융업 해당 없음\n\n"
+        "**해석** 마진이 평소보다 크게 부풀었는데 애널리스트도 이익 증가를 보지 않는"
+        " 경기순환주, 즉 이익 정점에서 싸 보이는 종목 분리 · 10년 이력이 모자라면"
         f" TTM ≥ 5년 중앙값 × {SHORT_RATIO:g} 그리고 ≥ 중앙값 +"
-        f" {SHORT_GAP * 100:.0f}%p(짧은 창) · 비경기순환 기업은 같은 조건이면 마진"
-        " 급등 라벨\n\n"
-        f"**기준** 기본 z {TAILWIND_Z:g} · +{TAILWIND_GAP * 100:.0f}%p",
+        f" {SHORT_GAP * 100:.0f}%p(짧은 창) · z 하한 2.5는 Leys 외(2013)의 MAD 이상치"
+        " 기본값 · 마진 조건만 맞으면 업황 순풍(경기순환)·마진 급등(그 밖) 라벨\n\n"
+        f"**기준** 기본 z {TAILWIND_Z:g} · +{TAILWIND_GAP * 100:.0f}%p ·"
+        f" 선행 ÷ 후행 EPS {PEAK_EPS_RATIO:g} · 짧은 창 × {SHORT_RATIO:g} ·"
+        f" +{SHORT_GAP * 100:.0f}%p",
         (
             Limit("tailwind_z", "z 하한", 1, 4, 0.5),
             Limit("tailwind_gap", "중앙값 + (%p)", 0, 15, 1, percent=True),
+            Limit("peak_eps_ratio", "선행 ÷ 후행 EPS", 0.8, 1.3, 0.05),
+            Limit("short_ratio", "짧은 창 중앙값 × (배)", 1.1, 3, 0.1),
+            Limit("short_gap", "짧은 창 중앙값 + (%p)", 0, 15, 1, percent=True),
         ),
     ),
     *(
@@ -1209,8 +1249,10 @@ RULES: Final = (
             key,
             "표시 지표",
             name,
-            f"**정의** {TECH_HELP[key]} · 유동성 통과 종목 전체 안 백분위\n\n"
-            "**해석** 기술 점수 = 켠 항목 백분위의 평균",
+            f"**정의** {tech_help()[key]} · 유동성 통과 종목 전체 안 백분위\n\n"
+            "**해석** 기술 점수 = 켠 항목 백분위의 평균\n\n"
+            f"**기준** 기본 {TECH_DEFAULTS[key]}",
+            TECH_LIMITS[key],
             part="기술 점수",
         )
         for key, name in TECH_ITEMS.items()
@@ -1248,21 +1290,15 @@ RULES: Final = (
         "surge",
         "표시 지표",
         "급등 기준",
-        "**정의** 21거래일 수익률·최대 일간 수익률 각각 상위 비율이면 단기 급등\n\n"
-        f"**기준** 기본 상위 {SURGE_SHARE:.0%}",
-        (Limit("surge_share", "상위 (%)", 1, 30, 1, percent=True),),
+        "**정의** 기간 수익률·기간 중 최대 일간 수익률 각각 상위 비율이면 단기"
+        " 급등\n\n"
+        f"**기준** 기본 {MONTH_BARS}거래일 · 상위 {SURGE_SHARE:.0%}",
+        (
+            Limit("surge_bars", "기간 (거래일)", 5, 63, 1),
+            Limit("surge_share", "상위 (%)", 1, 30, 1, percent=True),
+        ),
         toggle=False,
         part="단기 급등",
-    ),
-    Rule(
-        "l_revdrop",
-        "표시 지표",
-        LABEL_RULES["l_revdrop"],
-        "**정의** 연간 매출 성장률 ≤ 하한 그리고 추정치 방향 하향 · 전년 매출 0 이하면"
-        " 해석 부적절\n\n**해석** 라벨만 표시, 칸 배정 그대로\n\n"
-        f"**기준** 기본 {REVENUE_FLOOR:.0%}",
-        (Limit("revenue_floor", "하한 (%)", -50, 0, 1, percent=True),),
-        part="점검 라벨",
     ),
     Rule(
         "l_reliance",
@@ -1275,10 +1311,20 @@ RULES: Final = (
         part="점검 라벨",
     ),
     Rule(
+        "tailwind",
+        "표시 지표",
+        "업황 순풍",
+        "**정의** 경기순환 기업이 정점 이익의 마진 조건을 충족하지만 선행 EPS 조건은"
+        " 아님(애널리스트가 이익 증가를 봄) · 숫자는 정점 이익과 같음\n\n"
+        "**해석** 라벨만 표시, 칸 배정 그대로",
+        part="점검 라벨",
+    ),
+    Rule(
         "l_margin_jump",
         "표시 지표",
         LABEL_RULES["l_margin_jump"],
-        "**정의** 비경기순환 기업이 업황 순풍 조건을 충족 · 숫자는 업황 순풍과 같음\n\n"
+        "**정의** 비경기순환 기업이 정점 이익의 마진 조건을 충족 · 숫자는 정점 이익과"
+        " 같음\n\n"
         "**해석** 라벨만 표시, 칸 배정 그대로",
         part="점검 라벨",
     ),
@@ -1318,7 +1364,12 @@ RULES: Final = (
         "crash",
         "표시 지표",
         "모멘텀 붕괴 주의",
-        CRASH_HELP + " · 분포 위에 경고만 표시, 점수·칸 배정 그대로",
+        crash_help() + " · 분포 위에 경고만 표시, 점수·칸 배정 그대로\n\n"
+        f"**기준** 기본 {BEAR_BARS}거래일 · 분산 {VARIANCE_BARS}거래일",
+        (
+            Limit("bear_bars", "수익률 (거래일)", 252, 756, 21),
+            Limit("variance_bars", "분산 (거래일)", 21, 252, 21),
+        ),
         part="시장",
     ),
 )
@@ -1388,7 +1439,7 @@ def tech_basis(c: Criteria) -> str:
     return (
         "**정의** 켠 항목의 유동성 통과 종목 전체 안 백분위 평균(0–100) · "
         + (
-            " · ".join(f"{name}: {TECH_HELP[key]}" for key, name in items.items())
+            " · ".join(f"{name}: {tech_help(c)[key]}" for key, name in items.items())
             or "없음"
         )
         + "\n\n**해석** 높을수록 가격 추세 우위 · 값이 없는 항목은 평균에서 빠짐\n\n"
@@ -1408,7 +1459,7 @@ def chart_rules(c: Criteria) -> list[str]:
 
 def hold_rules(c: Criteria) -> list[str]:
     """The 보류 labels in force."""
-    return list(c.kept({"peak": "정점 이익", "tailwind": "업황 순풍"}).values())
+    return list(c.kept({"peak": "정점 이익"}).values())
 
 
 def score_help(c: Criteria) -> str:
@@ -1468,7 +1519,8 @@ def labels_help(c: Criteria) -> str:
 def surge_help(c: Criteria) -> str:
     flags = list(c.kept(SURGE).values())
     return (
-        f"**정의** 단기 급등 신호 {len(flags)}개, 각각 상위 {c.surge_share:.0%}"
+        f"**정의** 단기 급등 신호 {len(flags)}개, 각각 {c.surge_bars}거래일 기준"
+        f" 상위 {c.surge_share:.0%}"
         + "".join(f" · {flag}" for flag in flags)
         + "\n\n**해석** 기술 점수와 별개 · 매도 신호가 아니라 진입 시점 참고용"
     )
@@ -1515,12 +1567,12 @@ def column_help(c: Criteria) -> dict[str, str]:
         "**해석** 높을수록 좋은 회사를 싸게 · 전체 칸의 정렬 기준",
         "peer_level": f"**정의** 백분위를 낸 비교 업종 단계 · {peers_note(c)}",
         "counted": "**정의** 산출된 퀄리티 / 밸류에이션 항목 수",
-        "mom12_1": f"**정의** {TECH_HELP['t_mom']}",
+        "mom12_1": f"**정의** {tech_help(c)['t_mom']}",
         "rev_strength": "**정의** (현재 − 90일 전 컨센서스 EPS) ÷ 주가 · FY1·FY2 평균"
         "(결산 대기면 FY2만)",
         "cbop": f"**정의** {QUALITY_HELP['q_cbop']}",
         "coverage": "**정의** EBIT(TTM) ÷ 이자비용 · 이자비용 0이면 비움",
-        "fcf_cum": f"**정의** 최근 {c.fcf_years}개 회계연도 FCF 합계 · SEC 10-K"
+        "fcf_cum": f"**정의** 최근 {FCF_YEARS}개 회계연도 FCF 합계 · SEC 10-K"
         " 영업현금흐름 − 설비투자, 없으면 야후 연간",
         "sources": "**정의** SEC 10-K 값으로 대체하거나 교차 확인한 항목",
     }
@@ -1709,8 +1761,9 @@ def fundamentals_row(info: Mapping[str, object], s: Statements) -> dict[str, obj
     income statement: OperatingIncome over TotalRevenue summed across the
     latest four quarters, NaN unless all four have both values and the
     revenue is above zero (``info["operatingMargins"]`` is only the latest
-    quarter). ``fcf_y*`` are yearly free cash flows and ``opa_y*`` yearly
-    operating income over the same year's total assets, newest first.
+    quarter). ``fcf_y*`` are yearly free cash flows and ``gpa_y*`` yearly
+    gross profit (else revenue less cost of revenue) over the same year's
+    total assets, newest first.
     """
     row: dict[str, object] = {
         column: _number(info.get(field)) for column, field in INFO_FIELDS.items()
@@ -1764,8 +1817,12 @@ def fundamentals_row(info: Mapping[str, object], s: Statements) -> dict[str, obj
             else pd.DataFrame()
         )
         total = _row_value(same, "TotalAssets")
-        profit = _row_value(yearly, "OperatingIncome", year)
-        row[f"opa_y{year}"] = profit / total if total > 0 else math.nan
+        gross = _row_value(yearly, "GrossProfit", year)
+        if math.isnan(gross):
+            gross = _row_value(yearly, "TotalRevenue", year) - _row_value(
+                yearly, "CostOfRevenue", year
+            )
+        row[f"gpa_y{year}"] = gross / total if total > 0 else math.nan
     row["last_fy_end"] = _epoch_day(info.get("lastFiscalYearEnd"))
     row["next_fy_end"] = _epoch_day(info.get("nextFiscalYearEnd"))
     currency = info.get("financialCurrency")
@@ -2090,7 +2147,7 @@ SEC_SUMMARY: Final = (
     "long_mad",
     "long_std",
     "long_years",
-    *(f"sec_opa_y{year}" for year in range(ANNUAL_YEARS)),
+    *(f"sec_gpa_y{year}" for year in range(ANNUAL_YEARS)),
     *(f"sec_fcf_y{year}" for year in range(ANNUAL_YEARS)),
     "sec_roe_std",
     "sec_interest",
@@ -2115,8 +2172,9 @@ def sec_row(years: pd.DataFrame, quarters: pd.DataFrame) -> dict[str, object]:
     Margins count in years with operating income and revenue above zero:
     the ``sec_window`` median, its years and standard deviation, and over
     ``LONG_WINDOW`` years the median, median absolute deviation and standard
-    deviation. By year back in the window, ``sec_opa_y*`` is operating income
-    over year-end assets and ``sec_fcf_y*`` operating cash flow less capex;
+    deviation. By year back in the window, ``sec_gpa_y*`` is gross profit
+    (else revenue less cost of revenue) over year-end assets and
+    ``sec_fcf_y*`` operating cash flow less capex;
     ``sec_roe_std`` the deviation of net income over year-end equity.
     ``sec_interest``, ``sec_interest_paid``, ``sec_fy_end`` and ``sec_filed``
     are the newest year's.
@@ -2129,11 +2187,10 @@ def sec_row(years: pd.DataFrame, quarters: pd.DataFrame) -> dict[str, object]:
     window = _kept(margin, ends.isin(sec_window(list(ends))))
     long = _kept(margin, ends.isin(sec_window(list(ends), LONG_WINDOW)))
     long_med = float(long.median())
-    profit = cast("pd.Series", years["op_income"] / years["assets"]).where(
-        years["assets"] > 0
-    )
+    gross = years["gross_profit"].fillna(years["revenue"] - years["cost_of_revenue"])
+    profit = cast("pd.Series", gross / years["assets"]).where(years["assets"] > 0)
     recent = ends.isin(sec_window(list(ends)))
-    opa = cast("pd.Series", profit[recent]).tolist()
+    gpa = cast("pd.Series", profit[recent]).tolist()
     fcf = cast("pd.Series", years["ocf"] - years["capex"])[recent].tolist()
     roe = cast("pd.Series", years["net_income"] / years["equity"]).where(
         years["equity"] > 0
@@ -2150,7 +2207,7 @@ def sec_row(years: pd.DataFrame, quarters: pd.DataFrame) -> dict[str, object]:
         "long_std": _spread(long),
         "long_years": len(long),
         **{
-            f"sec_opa_y{year}": opa[year] if year < len(opa) else math.nan
+            f"sec_gpa_y{year}": gpa[year] if year < len(gpa) else math.nan
             for year in range(ANNUAL_YEARS)
         },
         **{
@@ -2204,11 +2261,11 @@ def adjusted(frame: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def tech_row(frame: pd.DataFrame) -> dict[str, float]:
-    """One ticker's indicators on its last bar; ``frame`` is sorted by date.
+def tech_row(frame: pd.DataFrame, c: Criteria = DEFAULT) -> dict[str, float]:
+    """One ticker's indicators on its last bar, by ``c``'s windows.
 
-    Fewer than ``MIN_BARS`` bars give only the liquidity inputs, fewer than
-    ``MOMENTUM_BARS`` no 12-1 momentum.
+    ``frame`` is sorted by date. Fewer than ``MIN_BARS`` bars give only the
+    liquidity inputs, fewer than ``mom_bars`` + ``skip_bars`` no 12-1 momentum.
     """
     bars = len(frame)
     raw = cast("pd.Series", frame["close"])
@@ -2226,19 +2283,25 @@ def tech_row(frame: pd.DataFrame) -> dict[str, float]:
         row[f"sma{days}"] = float(sma(close, days).iloc[-1])
     high52 = float(cast("pd.Series", adj["high"]).tail(YEAR_BARS).max())
     last = float(close.iloc[-1])
-    month = close.iloc[-MONTH_BARS - 1 :]
+    window = close.iloc[-c.surge_bars - 1 :]
+    short = float(sma(close, c.ma_short).iloc[-1])
+    long = float(sma(close, c.ma_long).iloc[-1])
     row |= {
         "close": last,
         "high52": high52,
         "from_high": last / high52 - 1,
-        "near_high": last / high52,
-        "ma_dist": row["sma21"] / row["sma200"],
-        "mom12_1": float(close.iloc[-MONTH_BARS - 1] / close.iloc[-YEAR_BARS - 1] - 1)
-        if bars >= MOMENTUM_BARS
+        "near_high": last
+        / float(cast("pd.Series", adj["high"]).tail(c.high_bars).max()),
+        "ma_short": short,
+        "ma_long": long,
+        "ma_dist": short / long,
+        "mom12_1": float(close.iloc[-c.skip_bars - 1] / close.iloc[-c.mom_bars - 1] - 1)
+        if bars >= c.mom_bars + c.skip_bars
         else math.nan,
         "ret_1m": float(last / close.iloc[-MONTH_BARS - 1] - 1),
         "ret_3m": float(last / close.iloc[-64] - 1),
-        "max_1m": float(month.pct_change().max()),
+        "surge_ret": float(last / window.iloc[0] - 1),
+        "surge_max": float(window.pct_change().max()),
     }
     return row
 
@@ -2248,8 +2311,8 @@ class Crash:
     """The momentum crash notice: ``state`` is 주의, 정상 or 미산출."""
 
     state: str = NOT_COMPUTED
-    market_return: float = math.nan  # over ``BEAR_BARS`` days
-    variance: float = math.nan  # of daily returns over ``VARIANCE_BARS`` days
+    market_return: float = math.nan  # over ``bear_bars`` days
+    variance: float = math.nan  # of daily returns over ``variance_bars`` days
     median: float = math.nan  # of that variance over the stored days
 
 
@@ -2257,12 +2320,14 @@ CRASH_WATCH: Final = "주의"
 CRASH_CLEAR: Final = "정상"
 
 
-def momentum_crash(prices: pd.DataFrame, fundamentals: pd.DataFrame) -> Crash:
+def momentum_crash(
+    prices: pd.DataFrame, fundamentals: pd.DataFrame, c: Criteria = DEFAULT
+) -> Crash:
     """The market's 24-month return and variance state, from the stored prices.
 
     The market is the cap-weighted daily return of the stocks with a market
     cap: each day weighted by the cap implied by today's cap and the adjusted
-    close's path. Fewer than ``BEAR_BARS`` returns leave it 미산출.
+    close's path. Fewer than ``bear_bars`` returns leave it 미산출.
     """
     if prices.empty or "mcap" not in fundamentals.columns:
         return Crash()
@@ -2276,18 +2341,18 @@ def momentum_crash(prices: pd.DataFrame, fundamentals: pd.DataFrame) -> Crash:
     returns = wide.pct_change(fill_method=None)
     weights = implied.shift(1).where(returns.notna())
     market = ((returns * weights).sum(axis=1) / weights.sum(axis=1)).iloc[1:].dropna()
-    if len(market) < BEAR_BARS:
+    if len(market) < c.bear_bars:
         return Crash()
-    total = float((1 + market.tail(BEAR_BARS)).prod() - 1)
-    variance = market.rolling(VARIANCE_BARS).var().dropna()
+    total = float((1 + market.tail(c.bear_bars)).prod() - 1)
+    variance = market.rolling(c.variance_bars).var().dropna()
     now, median = float(variance.iloc[-1]), float(variance.median())
     watch = total < 0 and now > median
     return Crash(CRASH_WATCH if watch else CRASH_CLEAR, total, now, median)
 
 
-def technicals(prices: pd.DataFrame) -> pd.DataFrame:
+def technicals(prices: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFrame:
     rows = [
-        {"ticker": ticker, **tech_row(group.sort_values("date"))}
+        {"ticker": ticker, **tech_row(group.sort_values("date"), c)}
         for ticker, group in prices.groupby("ticker", sort=False)
     ]
     return pd.DataFrame(rows, columns=["ticker", *TECH_COLUMNS])
@@ -2595,18 +2660,14 @@ def fundamentals_status(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFr
 
     bank = financial_group(t) == BANKS
     other = financial & ~bank
-    eq_ratio = cast("pd.Series", t["eq_ratio"]).where(other)
-    out["eq_med"] = within_peers(eq_ratio, t, "median")
-    out["eq_limit"] = out["eq_med"] * c.equity_median_share
-    other_fail = (t["roe"] < 0) | (eq_ratio < out["eq_limit"])
-    other_unknown = t["roe"].isna() | eq_ratio.isna() | out["eq_limit"].isna()
+    other_fail = t["roe"] < 0
+    other_unknown = t["roe"].isna()
     bank_fail = (t["roe"] < 0) | (t["tce_ratio"] < c.bank_tce_floor)
     bank_unknown = t["roe"].isna() | t["tce_ratio"].isna()
-    flows = cumulative_fcf(t, c.fcf_years)
+    flows = cumulative_fcf(t, FCF_YEARS)
     out[list(flows.columns)] = flows
-    cash_only = t["sector"].isin(list(CASH_ONLY))
-    cash_fail = (t["ocf"] < 0) | (~cash_only & (out["fcf_cum"] < 0))
-    cash_unknown = t["ocf"].isna() | (~cash_only & out["fcf_cum"].isna())
+    cash_fail = t["ocf"] < 0
+    cash_unknown = t["ocf"].isna()
     out["dq_cash"] = np.select(
         [
             bank & bank_fail,
@@ -2625,7 +2686,10 @@ def fundamentals_status(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFr
     net_debt = t["total_debt"] - t["total_cash"]
     nd = cast("pd.Series", t["nd_ebitda"]).where(~financial)
     out["nd_med"] = within_peers(nd, t, "median")
-    out["nd_limit"] = np.fmax(out["nd_med"] * c.net_debt_median_times, c.net_debt_floor)
+    out["nd_limit"] = np.fmin(
+        np.fmax(out["nd_med"] * c.net_debt_median_times, c.net_debt_floor),
+        c.net_debt_cap,
+    )
     out["dq_debt"] = np.select(
         [
             financial,
@@ -2669,13 +2733,14 @@ def fundamentals_status(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFr
 
 
 def hold_flags(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFrame:
-    """경기순환, the margin basis, 정점 이익, 업황 순풍 and 마진 급등.
+    """경기순환, the margin basis, 정점 이익 and the 업황 순풍·마진 급등 labels.
 
     The basis is the ``LONG_WINDOW``-year median (``long_med``) with
     ``long_years`` years, else the 5-year one (``margin_avg``) with
-    ``short_years`` (``short``: 짧은 창), else none and no flag. The surge test
-    is the robust z and gap on the long basis, the ratio and gap on the short.
-    Financials have none of these.
+    ``short_years`` (``short``: 짧은 창), else none and no flag. The margin test
+    is the robust z and gap on the long basis, the ratio and gap on the short;
+    정점 이익 adds a stalled forward EPS, and a cyclical meeting the margin test
+    without it is 업황 순풍. Financials have none of these.
     """
     t = table
     plain = t["sector"] != FINANCIALS
@@ -2701,25 +2766,20 @@ def hold_flags(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFrame:
     jumped = (long_ok & (z >= c.tailwind_z) & (ttm - median >= c.tailwind_gap)) | (
         short
         & (median > 0)
-        & (ttm >= median * SHORT_RATIO)
-        & (ttm >= median + SHORT_GAP)
+        & (ttm >= median * c.short_ratio)
+        & (ttm >= median + c.short_gap)
     )
     eps, forward = t["trailing_eps"], t["fwd_eps"]
-    peak = (
-        cyclical
-        & (eps > 0)
-        & (median > 0)
-        & (ttm >= median * c.peak_ratio)
-        & (forward <= eps * c.peak_eps_ratio)
-    )
+    peak = cyclical & jumped & (eps > 0) & (forward <= eps * c.peak_eps_ratio)
+    held = peak & c.on("peak")
     return pd.DataFrame(
         {
             "cyclical": cyclical,
             "hold_median": median,
             "hold_z": z.where(long_ok),
             "short": short,
-            "peak": peak & c.on("peak"),
-            "tailwind": cyclical & jumped & c.on("tailwind"),
+            "peak": held,
+            "tailwind": cyclical & jumped & ~held & c.on("tailwind"),
             "margin_jump": plain & ~cyclical & jumped & c.on("l_margin_jump"),
         },
         index=t.index,
@@ -2810,7 +2870,7 @@ def groups(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.Series:
     """Each stock's cell of 퀄리티 by 밸류에이션, "hold", or "" if 결격/미확인."""
     t = table
     placed = t["quality"].notna() & t["valuation"].notna()
-    hold = t["peak"].eq(other=True) | t["tailwind"].eq(other=True) | ~placed
+    hold = t["peak"].eq(other=True) | ~placed
     good = t["quality"] >= c.split
     cheap = t["valuation"] < c.split
     key = np.select(
@@ -2835,10 +2895,6 @@ def labels(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFrame:
     improve_short = t["q_improve"].notna() & (t["improve_years"] < c.improve_years)
     return pd.DataFrame(
         {
-            "revdrop": (t["revenue_prior"] > 0)
-            & (t["rev_growth"] <= c.revenue_floor)
-            & down
-            & c.on("l_revdrop"),
             "reliance": (
                 ((eps > 0) & (forward >= eps * c.reliance_ratio))
                 | ((eps <= 0) & (forward > 0))
@@ -2857,24 +2913,25 @@ def labels(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFrame:
 
 def evaluate(inputs: Inputs, criteria: Criteria = DEFAULT) -> pd.DataFrame:
     """Each constituent with liquidity, score, checks, 퀄리티, 밸류에이션, cell."""
-    return judge(prepare(inputs), criteria)
+    return judge(prepare(inputs, criteria), criteria)
 
 
-def prepare(inputs: Inputs) -> pd.DataFrame:
+def prepare(inputs: Inputs, c: Criteria = DEFAULT) -> pd.DataFrame:
     """The stored parts as one row per constituent with its indicators.
 
-    Nothing here depends on the criteria. The operating margin median
-    (``margin_avg``) and its deviation (``margin_spread``) are SEC's
-    ``SEC_YEARS`` 10-K years where they are all there, else Yahoo's
-    (``margin_source``). A stock on SEC's median takes SEC's TTM too when its
-    four quarters are there and end no earlier than Yahoo's newest quarter
-    (``STALE_SLACK_DAYS`` aside), else Yahoo's (``op_margin_source``);
+    Of the criteria only the price windows (``WINDOWS``) count. The
+    operating margin median (``margin_avg``) and its deviation
+    (``margin_spread``) are SEC's ``SEC_YEARS`` 10-K years where they are
+    all there, else Yahoo's (``margin_source``). A stock on SEC's median
+    takes SEC's TTM too when its four quarters are there and end no earlier
+    than Yahoo's newest quarter (``STALE_SLACK_DAYS`` aside), else Yahoo's
+    (``op_margin_source``);
     ``op_margin_end`` is the end of the used TTM's newest quarter.
-    ``improve`` (수익성 개선) is SEC's, else Yahoo's yearly operating income
+    ``improve`` (수익성 개선) is SEC's, else Yahoo's yearly gross profit
     over assets: three years back, else two. ``as_of`` is the newest price
     day, which the fiscal year state and the forward EPS go by.
     """
-    table = inputs.universe.merge(technicals(inputs.prices), on="ticker", how="left")
+    table = inputs.universe.merge(technicals(inputs.prices, c), on="ticker", how="left")
     table = table.merge(inputs.fundamentals, on="ticker", how="left")
     table = table.merge(
         inputs.estimates, on="ticker", how="left", suffixes=("", "_estimates")
@@ -2940,14 +2997,14 @@ def prepare(inputs: Inputs) -> pd.DataFrame:
 
 
 def improvement(table: pd.DataFrame, years: int) -> pd.DataFrame:
-    """수익성 개선: operating income / assets, newest less ``years`` back.
+    """수익성 개선: gross profit / assets, newest less ``years`` back.
 
     A year short, ``years`` - 1 back (짧은 창); SEC's 10-K first, else
     Yahoo's yearly statements.
     """
     t = table
     changes: dict[str, tuple[pd.Series, pd.Series]] = {}
-    for source, prefix in (("SEC", "sec_opa_y"), ("야후", "opa_y")):
+    for source, prefix in (("SEC", "sec_gpa_y"), ("야후", "gpa_y")):
         full = t[f"{prefix}0"] - t[f"{prefix}{years}"]
         short = t[f"{prefix}0"] - t[f"{prefix}{years - 1}"]
         span = pd.Series(np.where(full.notna(), years, years - 1), index=t.index)
@@ -3088,9 +3145,7 @@ def map_rows(table: pd.DataFrame) -> list[dict[str, object]]:
 
 def group_help(c: Criteria) -> str:
     """Every group's name and conditions, for a tooltip."""
-    held = ", ".join(
-        c.kept({"peak": "정점 이익(경기순환 기업)", "tailwind": "업황 순풍"}).values()
-    )
+    held = ", ".join(c.kept({"peak": "정점 이익(경기순환 기업)"}).values())
     reasons = (
         f"{held} 또는 퀄리티·밸류에이션 산출 불가"
         if held
@@ -3189,7 +3244,6 @@ TAGS: Final = {
     "tailwind": "업황 순풍",
     "margin_jump": "마진 급등",
     "reliance": "추정 의존",
-    "revdrop": "매출 급감",
     "near": "경계 근처",
     "weak_trend": "가격·추정치 약세",
     "short_window": "짧은 창",
@@ -3205,7 +3259,7 @@ def tag_list(row: Mapping[str, object]) -> list[str]:
         for key, name in (("quality", "퀄리티"), ("valuation", "밸류에이션"))
         if math.isnan(_number(row.get(key)))
     ]
-    holds = sum(row.get(key) is True for key in ("peak", "tailwind"))
+    holds = int(row.get("peak") is True)
     return [*out[:holds], *missing, *out[holds:]]
 
 
@@ -3275,7 +3329,7 @@ def verdict(row: Mapping[str, object]) -> str:
 
 
 def hot(row: Mapping[str, object]) -> str:
-    names = {"s_ret": "21일 수익률", "s_max": "MAX"}
+    names = {"s_ret": "수익률", "s_max": "MAX"}
     return " · ".join(name for key, name in names.items() if row.get(key) is True)
 
 
@@ -3285,19 +3339,20 @@ def tech_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str, s
         "t_mom": fmt("signed", row.get("mom12_1")),
         "t_high": fmt("pct", row.get("near_high")),
         "t_trend": fmt("num", row.get("ma_dist"))
-        + f" (21일선 {fmt('num', row.get('sma21'))} ÷ 200일선"
-        f" {fmt('num', row.get('sma200'))})",
+        + f" ({c.ma_short}일선 {fmt('num', row.get('ma_short'))} ÷ {c.ma_long}일선"
+        f" {fmt('num', row.get('ma_long'))})",
     }
+    helps = tech_help(c)
     return [
-        (_standing(row.get(key)), f"{name} · {TECH_HELP[key]}", values[key])
+        (_standing(row.get(key)), f"{name} · {helps[key]}", values[key])
         for key, name in c.kept(TECH_ITEMS).items()
     ]
 
 
 def surge_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[bool, str, str]]:
     details = {
-        "s_ret": fmt("signed", row.get("ret_1m")),
-        "s_max": fmt("signed", row.get("max_1m")),
+        "s_ret": fmt("signed", row.get("surge_ret")),
+        "s_max": fmt("signed", row.get("surge_max")),
     }
     return [
         (row.get(key) is True, label, details[key])
@@ -3308,7 +3363,6 @@ def surge_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[bool, str,
 def dq_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str, str]]:
     """Each disqualifier: status, the test, and the values against it."""
     roe = f"ROE {fmt('pct', row.get('roe'))} (TTM)"
-    share = f"{c.equity_median_share:.0%}"
     if GICS.get(str(row.get("industry")), ("", ""))[1] == BANKS:
         cash = (
             f"은행: ROE < 0 또는 TCE/TA < {percent(c.bank_tce_floor)}",
@@ -3316,17 +3370,7 @@ def dq_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str, str
             " 유형 보통주자본 ÷ (총자산 − 영업권·무형자산))",
         )
     elif row.get("sector") == FINANCIALS:
-        cash = (
-            f"금융업: ROE < 0 또는 자기자본비율 < 업종 중앙값의 {share}",
-            f"{roe} · 자기자본비율 {fmt('pct', row.get('eq_ratio'))} (최근 분기) ·"
-            f" 기준 {fmt('pct', row.get('eq_limit'))}"
-            f" ({row.get('peer')} 중앙값의 {share})",
-        )
-    elif row.get("sector") in CASH_ONLY:
-        cash = (
-            "영업현금흐름 < 0 (유틸리티·부동산)",
-            f"영업현금흐름 {fmt('big', row.get('ocf'))} (TTM)",
-        )
+        cash = ("금융업: ROE < 0", roe)
     else:
         source = str(row.get("fcf_source") or "—")
         years = _number(row.get("fcf_cum_years"))
@@ -3338,13 +3382,14 @@ def dq_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str, str
             else source
         )
         cash = (
-            f"영업현금흐름 < 0 또는 최근 {c.fcf_years}개 회계연도 누적 FCF < 0",
-            f"영업현금흐름 {fmt('big', row.get('ocf'))} (TTM) · 누적 FCF"
+            "영업현금흐름 < 0",
+            f"영업현금흐름 {fmt('big', row.get('ocf'))} (TTM) · 참고: 누적 FCF"
             f" {fmt('big', row.get('fcf_cum'))} ({basis})",
         )
     debt = (
-        f"순부채/EBITDA > max(업종 중앙값×{c.net_debt_median_times:g},"
-        f" {c.net_debt_floor:.1f}) · EBITDA 0 이하면서 순부채 > 0",
+        f"순부채/EBITDA > min(max(업종 중앙값×{c.net_debt_median_times:g},"
+        f" {c.net_debt_floor:.1f}), {c.net_debt_cap:.1f}) · EBITDA 0 이하면서"
+        " 순부채 > 0",
         f"{fmt('x', row.get('nd_ebitda'))} · 기준 {fmt('x', row.get('nd_limit'))}"
         f" (EBITDA TTM {fmt('big', row.get('ebitda'))})",
     )
@@ -3372,10 +3417,13 @@ def _standing(value: object) -> str:
 
 
 def _hold_line(row: Mapping[str, object], key: str, c: Criteria) -> str:
-    """정점 이익 or 업황 순풍's result for the dialog (업황 순풍 also 마진 급등)."""
+    """정점 이익 or its margin test's result for the dialog.
+
+    The margin test shows 업황 순풍, 마진 급등 or 정점 이익, whichever it met.
+    """
     if not c.on(key):
         return UNUSED
-    shown = (key, "margin_jump") if key == "tailwind" else (key,)
+    shown = (key, "margin_jump", "peak") if key == "tailwind" else (key,)
     hit = next((TAGS[k] for k in shown if row.get(k) is True), "")
     if hit:
         return hit
@@ -3418,7 +3466,7 @@ def label_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str, 
             f"매출총이익 {fmt('big', row.get('gross_profit'))} · {assets}",
         ),
         "q_improve": (
-            f"영업이익 ÷ 총자산의 {c.improve_years}년 변화",
+            f"매출총이익 ÷ 총자산의 {c.improve_years}년 변화",
             f"{fmt('signed', row.get('improve'))}"
             + (
                 f" ({row.get('improve_source')}, {improve_years:.0f}년 변화)"
@@ -3510,17 +3558,18 @@ def label_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str, 
         ),
         (
             _hold_line(row, "peak", c),
-            f"경기순환 기업: TTM 영업이익률 ≥ 중앙값 × {c.peak_ratio:g} 그리고 선행 EPS"
-            f" ≤ 후행 EPS × {c.peak_eps_ratio:g}",
-            f"TTM {ttm} · {basis} · 선행 EPS {fmt('num', row.get('fwd_eps'))} ·"
-            f" 후행 EPS {fmt('num', row.get('trailing_eps'))}"
+            f"경기순환 기업: z ≥ {c.tailwind_z:g} 그리고 TTM − 중앙값 ≥"
+            f" {c.tailwind_gap * 100:g}%p (짧은 창: × {c.short_ratio:g}, +"
+            f"{c.short_gap * 100:g}%p) 그리고 선행 EPS ≤ 후행 EPS ×"
+            f" {c.peak_eps_ratio:g}",
+            f"TTM {ttm} · {basis} · z {fmt('num', row.get('hold_z'))} · 선행 EPS"
+            f" {fmt('num', row.get('fwd_eps'))} · 후행 EPS"
+            f" {fmt('num', row.get('trailing_eps'))}"
             f" · 경기순환 {'예' if row.get('cyclical') is True else '아님'}",
         ),
         (
             _hold_line(row, "tailwind", c),
-            f"업황 순풍: z ≥ {c.tailwind_z:g} 그리고 TTM − 중앙값 ≥"
-            f" {c.tailwind_gap * 100:g}%p (짧은 창: × {SHORT_RATIO:g}, +"
-            f"{SHORT_GAP * 100:g}%p)",
+            "업황 순풍·마진 급등 라벨: 정점 이익의 마진 조건만 충족",
             f"TTM {ttm} · {basis} · z {fmt('num', row.get('hold_z'))}",
         ),
     ]
@@ -3601,6 +3650,7 @@ def _stem_date(path: Path, prefix: str) -> date:
 SNAPSHOT_FOLDER: Final = "snapshots"
 SNAPSHOT_COLUMNS: Final = (
     "ticker",
+    "sector",
     "group",
     "quality",
     "valuation",
@@ -3618,8 +3668,10 @@ SNAPSHOT_COLUMNS: Final = (
 def write_snapshot(root: Path, table: pd.DataFrame, c: Criteria, day: date) -> Path:
     """Each liquid stock's cell, scores and labels on ``day``, with the criteria.
 
-    For checking the screen later; the page never reads these back. One CSV
-    and one JSON (the criteria, ``DEFINITIONS`` and the price day) per day.
+    For checking the screen later (``snapshot_check``). One CSV and one JSON
+    (every criteria number, ``DEFINITIONS`` and the price day) per day; all
+    the numbers, not only the changed ones, so a later default change cannot
+    reread an old snapshot.
     """
     folder = root / SNAPSHOT_FOLDER
     rows = liquid(table).reset_index(drop=True)
@@ -3629,13 +3681,163 @@ def write_snapshot(root: Path, table: pd.DataFrame, c: Criteria, day: date) -> P
     )
     path = folder / f"{day.isoformat()}.csv"
     _write(frame, path)
-    values, off = saved(c)
+    values = {f.name: getattr(c, f.name) for f in fields(c) if f.name != "off"}
     as_of = str(rows["as_of"].iloc[0]) if len(rows) else ""
-    meta = {"definitions": DEFINITIONS, "as_of": as_of, "values": values, "off": off}
+    meta = {"definitions": DEFINITIONS, "as_of": as_of, "values": values, "off": c.off}
     temp = folder / f"{day.isoformat()}.json.tmp"
     _ = temp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), "utf-8")
     _ = temp.replace(folder / f"{day.isoformat()}.json")
     return path
+
+
+# Forward returns of the snapshots: label → bars after the price day.
+HORIZONS: Final = {"1개월": 21, "3개월": 63, "6개월": 126, "12개월": 252}
+# Calendar days a snapshot's tickers stay priced after it: the longest
+# horizon and slack.
+SNAPSHOT_REACH_DAYS: Final = 400
+SNAPSHOT_GROUPS: Final = {**GROUP_NAMES, "": "결격·미확인"}
+CHECK_COLUMNS: Final = (
+    "day",
+    "horizon",
+    "group",
+    "stocks",
+    "priced",
+    "excess",
+    "sector_excess",
+    "beat",
+)
+
+
+# The 스냅샷 검증 table: column, label and ``fmt`` kind ("" for text).
+CHECK_TABLE: Final = (
+    ("horizon", "기간", ""),
+    ("group", "칸", ""),
+    ("snapshots", "스냅샷", "int"),
+    ("stocks", "평균 종목 수", "num"),
+    ("missing", "가격 없음", "pct"),
+    ("excess", "초과수익 (전체 대비)", "signed"),
+    ("sector_excess", "초과수익 (섹터 대비)", "signed"),
+    ("beat", "전체 평균 상회 비율", "pct"),
+)
+CHECK_NOTE: Final = (
+    "**정의** 스냅샷 날의 종가부터 21·63·126·252거래일 뒤까지의 수정 종가 수익률 ·"
+    " 초과수익은 칸의 동일가중 평균 − 그날 유동성 통과 종목 전체 평균, 섹터 대비는"
+    " 종목마다 같은 섹터 평균을 뺀 값의 평균 · 스냅샷마다 계산해 같은 비중으로"
+    " 평균\n\n"
+    "**해석** 스냅샷 간격이 기간보다 짧으면 기간이 겹쳐 결과가 서로 독립이 아님 ·"
+    " 지수에서 빠진 종목도 1년 남짓 시세를 계속 받지만 상장폐지·인수 종목은 가격"
+    " 없음으로 빠짐 · 시세는 약 3년만 보관해 그보다 오래된 스냅샷은 빠짐 · 과거"
+    " 성과이며 앞으로의 성과를 보장하지 않음"
+)
+
+
+def snapshot_files(root: Path) -> list[Path]:
+    return sorted((root / SNAPSHOT_FOLDER).glob("????-??-??.csv"))
+
+
+def snapshot_tickers(root: Path, today: date) -> list[str]:
+    """The tickers of the snapshots ``SNAPSHOT_REACH_DAYS`` old or newer.
+
+    The update keeps pricing them after they leave the index, so a cell's
+    forward returns do not lose the stocks that were dropped.
+    """
+    cutoff = today - timedelta(days=SNAPSHOT_REACH_DAYS)
+    found: set[str] = set()
+    for path in snapshot_files(root):
+        if _stem_date(path, "") >= cutoff:
+            frame = pd.read_csv(path, usecols=["ticker"], dtype="str")
+            found.update(frame["ticker"].dropna())
+    return sorted(found)
+
+
+def _price_day(path: Path) -> date:
+    """The snapshot's price day from its JSON, else the day it was taken."""
+    try:
+        meta = json.loads(path.with_suffix(".json").read_text("utf-8"))
+        return date.fromisoformat(str(meta["as_of"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return _stem_date(path, "")
+
+
+def snapshot_check(root: Path, prices: pd.DataFrame) -> pd.DataFrame:
+    """Each snapshot's cells against all the stocks it screened, by horizon.
+
+    A stock's return runs from the snapshot's price day to ``HORIZONS`` bars
+    later, both from the stored adjusted closes (Yahoo re-adjusts history, so
+    a price kept in the snapshot would not match); a horizon not reached yet
+    gives no rows. Per cell: ``stocks`` in it, ``priced`` with a return,
+    ``excess`` its mean return less the snapshot's (every liquid stock it
+    screened, equal weight), ``sector_excess`` the mean of each return less
+    its sector's in the snapshot, ``beat`` the share above the snapshot's.
+    """
+    wide = prices.pivot_table(index="date", columns="ticker", values="adj_close")
+    days = [pd.Timestamp(day) for day in wide.index]
+    rows: list[dict[str, object]] = []
+    for path in snapshot_files(root):
+        start = pd.Timestamp(_price_day(path))
+        if start not in days:
+            continue  # the price day is no longer stored
+        at = days.index(start)
+        snap = pd.read_csv(path, dtype={"ticker": "str", "sector": "str"})
+        snap["group"] = snap["group"].fillna("")
+        for label, bars in HORIZONS.items():
+            if at + bars >= len(days):
+                continue
+            first = cast("pd.Series", wide.iloc[at])
+            last = cast("pd.Series", wide.iloc[at + bars])
+            gain = (last / first - 1).reindex(snap["ticker"]).to_numpy()
+            ret = pd.Series(gain, index=snap.index, dtype="float")
+            sector = ret - ret.groupby(snap["sector"]).transform("mean")
+            mean = float(ret.mean())
+            for key in SNAPSHOT_GROUPS:
+                cell = cast("pd.Series", ret[snap["group"] == key])
+                found = cell.dropna()
+                rows.append(
+                    {
+                        "day": path.stem,
+                        "horizon": label,
+                        "group": key,
+                        "stocks": len(cell),
+                        "priced": len(found),
+                        "excess": float(found.mean()) - mean,
+                        "sector_excess": float(sector[cell.index].mean()),
+                        "beat": float((found > mean).mean()),
+                    }
+                )
+    return pd.DataFrame(rows, columns=list(CHECK_COLUMNS))
+
+
+def check_summary(check: pd.DataFrame) -> pd.DataFrame:
+    """``snapshot_check`` averaged over the snapshots, each one weighing the same.
+
+    A cell with no priced stock in a snapshot is left out of its averages;
+    ``missing`` is the share of the cell's stocks without a return.
+    """
+    kept = cast("pd.DataFrame", check[check["priced"] > 0])
+    keys = ["horizon", "group"]
+    out = cast(
+        "pd.DataFrame",
+        kept.groupby(keys, sort=False).agg(
+            snapshots=("day", "nunique"),
+            stocks=("stocks", "mean"),
+            excess=("excess", "mean"),
+            sector_excess=("sector_excess", "mean"),
+            beat=("beat", "mean"),
+        ),
+    )
+    sums = cast(
+        "pd.DataFrame", kept.groupby(keys, sort=False)[["stocks", "priced"]].sum()
+    )
+    out["missing"] = 1 - sums["priced"] / sums["stocks"]
+    out = out.reset_index()
+    horizons = {label: i for i, label in enumerate(HORIZONS)}
+    groups = {key: i for i, key in enumerate(SNAPSHOT_GROUPS)}
+    rank = cast("pd.Series", out["horizon"]).map(horizons) * len(groups) + cast(
+        "pd.Series", out["group"]
+    ).map(groups)
+    out = out.iloc[np.argsort(rank.to_numpy(), kind="stable")].reset_index(drop=True)
+    out["group"] = cast("pd.Series", out["group"]).map(SNAPSHOT_GROUPS)
+    return out
 
 
 def prune(root: Path) -> None:
@@ -4134,8 +4336,13 @@ def update(  # noqa: PLR0913 - the SEC source is optional
     assert universe_path is not None  # noqa: S101 - written just above
     universe = read_universe(universe_path)
     tickers = [str(ticker) for ticker in universe["ticker"]]
-
-    prices = update_prices(source, root, tickers, last_session(now), report, sleep)
+    # Stocks of recent snapshots that left the index keep being priced (one
+    # delisted for good gets nothing from Yahoo); only the prices.
+    listed = set(tickers)
+    dropped = [t for t in snapshot_tickers(root, today) if t not in listed]
+    prices = update_prices(
+        source, root, [*tickers, *dropped], last_session(now), report, sleep
+    )
     failed = update_rows(
         lambda t: [source.fundamentals(t)],
         root / f"fundamentals-{quarter(today)}.csv",
@@ -4163,7 +4370,7 @@ def update(  # noqa: PLR0913 - the SEC source is optional
         else:
             note += f" · SEC 받지 못한 값 {missed}" if missed else ""
     prune(root)
-    priced = len(set(prices["ticker"]))
+    priced = len(set(prices["ticker"]) & listed)
     newest = cast("pd.Timestamp", prices["date"].max()).date() if priced else None
     return f"{len(tickers)}종목 · 시세 {newest or '—'} · 시세 받은 종목 {priced}{note}"
 
