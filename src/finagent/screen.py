@@ -3107,6 +3107,12 @@ def pick(table: pd.DataFrame, key: str, chosen: Sequence[str] = ()) -> pd.DataFr
     return rows.reset_index(drop=True)
 
 
+def _point(value: object) -> float | None:
+    """A map value: None, not NaN, when missing, since the chart's data is JSON."""
+    number = _number(value)
+    return None if math.isnan(number) else number
+
+
 def map_rows(table: pd.DataFrame) -> list[dict[str, object]]:
     """Stocks in the four cells, and held ones with both axes, as map points.
 
@@ -3132,10 +3138,10 @@ def map_rows(table: pd.DataFrame) -> list[dict[str, object]]:
             "valuation": float(cast("float", row["valuation"])),
             "counted": counted(row),
             "peer": f"{peer_level(row)} · {row['peer']}",
-            "score": _number(row.get("score")),
+            "score": _point(row.get("score")),
             "band": str(row.get("band", NOT_COMPUTED)),
             "est": str(row["est"]),
-            "revision": _number(row.get("rev_strength")),
+            "revision": _point(row.get("rev_strength")),
             "tags": tags(row),
             "labels": tag_list(row),
         }

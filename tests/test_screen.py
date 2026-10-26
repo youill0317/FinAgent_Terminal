@@ -763,6 +763,8 @@ def test_evaluate_on_stored_data(tmp_path: Path) -> None:
     both = kept[kept["quality"].notna() & kept["valuation"].notna()]
     assert len(points) == len(both[both["dq_state"] == screen.CLEAR])
     assert "DOWN" not in {point["ticker"] for point in points}
+    missing = kept.assign(rev_strength=math.nan, score=math.nan)
+    _ = json.dumps(screen.map_rows(missing), allow_nan=False)  # the chart's JSON
 
 
 # ---------------------------------------------------------------- criteria
