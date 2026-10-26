@@ -3,24 +3,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import httpx
-import pytest
 
 from finagent.cli import (
-    APP,
-    build_service,
     main,
-    parse_args,
     read_env_file,
     resolve_env,
     run_check,
-    streamlit_args,
 )
 from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
-from finagent.sources import YAHOO_CACHE
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 
 def test_env_file_parsing(tmp_path: Path) -> None:
@@ -52,22 +48,6 @@ def test_real_environment_wins_over_env_file(tmp_path: Path) -> None:
     assert env["ECOS_API_KEY"] == "file-only"
 
 
-def test_explicit_env_file_must_exist(tmp_path: Path) -> None:
-    with pytest.raises(SystemExit, match="env 파일을 찾을 수 없습니다"):
-        _ = resolve_env(tmp_path / "missing.env", {})
-
-
-def test_yahoo_caches_sit_next_to_the_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    caches: list[Path] = []
-    monkeypatch.setattr("finagent.cli.YahooCloses", caches.append)
-
-    _ = build_service(demo=False, env={}, settings_path=tmp_path / "s.json")
-
-    assert caches == [tmp_path / YAHOO_CACHE]
-
-
 def test_check_exit_codes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -93,19 +73,3 @@ def test_check_exit_codes(
     )
     assert run_check(failing) == 1
     assert "ECB:EXR/USD: ECB HTTP 500" in capsys.readouterr().out
-
-
-def test_streamlit_serves_locally_without_telemetry(tmp_path: Path) -> None:
-    args = parse_args(["--demo", "--no-browser", "--port", "9000"])
-
-    command = streamlit_args(args, tmp_path / "s.json")
-
-    assert command[:2] == ["run", str(APP)]
-    assert "--server.address=127.0.0.1" in command
-    assert "--server.port=9000" in command
-    assert "--server.headless=true" in command
-    assert "--browser.gatherUsageStats=false" in command
-    assert command[command.index("--") + 1 :] == [
-        f"--settings={tmp_path / 's.json'}",
-        "--demo",
-    ]

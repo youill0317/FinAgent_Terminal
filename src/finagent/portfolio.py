@@ -81,6 +81,7 @@ PERCENTILES: Final = (5, 25, 50, 75, 95)
 BINS: Final = 40
 WINDOWS: Final = {"6M": 6, "1Y": 12, "3Y": 36}
 HORIZONS: Final = {"1M": 21, "3M": 63, "6M": 126, "1Y": 252}
+ERP: Final = 0.05  # annual equity premium over the risk-free rate at S&P 500 beta 1
 KRW_SUFFIXES: Final = (".KS", ".KQ")
 VAR_LEVELS: Final = (0.95, 0.975, 0.99)
 REVERSE_LOSS: Final = 0.30
@@ -1843,6 +1844,21 @@ def asset_betas(j: Joint) -> NDArray[np.float64]:
     )
 
 
+def expected_returns(j: Joint, rf: pd.Series) -> NDArray[np.float64]:
+    """CAPM daily expected returns on ``j.full``'s days: rf + beta x ``ERP``.
+
+    ``rf``: daily risk-free returns (``risk_free``), 0 where missing; beta
+    the portfolio's to the S&P 500 over the window (``asset_betas``), 1 when
+    it cannot be estimated.
+    """
+    beta = float(j.w @ asset_betas(j))
+    if not math.isfinite(beta):
+        beta = 1.0
+    premium = (1 + ERP) ** (1 / per_year(j.full.index)) - 1
+    known = rf.reindex(j.full.index).fillna(0.0).to_numpy(dtype="float64")
+    return known + beta * premium
+
+
 def added(j: Joint, cov: NDArray[np.float64], ticker: str, fraction: float) -> Added:
     """``quant.what_if`` and ``quant.incremental_es`` for ``ticker`` in ``j``.
 
@@ -2035,9 +2051,17 @@ class Simulation:
 
 
 def simulation(
-    paths: NDArray[np.float64], value: float, current: float, peak: float
+    paths: NDArray[np.float64],
+    value: float,
+    current: float,
+    peak: float,
+    drift: float = 0.0,
 ) -> Simulation:
-    """Summary of growth ``paths``; ``current`` and ``peak`` are past wealth."""
+    """Summary of growth ``paths``; ``current`` and ``peak`` are past wealth.
+
+    The paths are zero drift; ``drift`` (daily) compounds onto them.
+    """
+    paths = paths * (1 + drift) ** np.arange(paths.shape[1])
     return Simulation(
         perf.path_risk(paths[:, 1:], current, peak),
         fan(paths, value),
@@ -2198,7 +2222,10 @@ class Density:
 
 
 def density(
-    j: Joint, f: quant.Devolatilised | None = None, paths: int = DENSITY_PATHS
+    j: Joint,
+    f: quant.Devolatilised | None = None,
+    paths: int = DENSITY_PATHS,
+    drift: NDArray[np.float64] | None = None,
 ) -> Density:
     """Berkowitz test of 1-month forecasts made as the 1M fan makes them.
 
@@ -2209,7 +2236,8 @@ def density(
     stationary-bootstrapped from the window's length of days before the
     block, its mean block re-estimated there (``quant.block_length``), as
     the fan resamples the window; blocks with fewer days before them are
-    left out.
+    left out. ``drift`` (daily, on ``j.full``'s days) compounds onto each
+    block's months at its first day's rate, as ``simulation`` onto the fan's.
     """
     held = j.full.to_numpy(dtype="float64")
     if f is not None:
@@ -2234,6 +2262,9 @@ def density(
                 else quant.model_paths(f, j.w, picks, f.model.states[start])
             )
             samples[i] = np.prod(1 + np.maximum(daily, -1.0), axis=1) - 1
+    if drift is not None:
+        rates = drift[-len(held) :][starts]
+        samples = (1 + samples) * (1 + rates[:, None]) ** quant.MONTH_DAYS - 1
     return Density(quant.berkowitz(quant.pit(outcomes, samples)), len(starts))
 
 

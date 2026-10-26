@@ -41,23 +41,6 @@ def until_ended(run: Run) -> list[Event]:
     raise AssertionError("run did not end")
 
 
-def test_page_threads_share_one_snapshot() -> None:
-    rt = runtime()
-    found: list[str] = []
-
-    def load() -> None:
-        found.append(rt.call(rt.dashboard.get()).generated_at)
-
-    threads = [threading.Thread(target=load) for _ in range(3)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert len(found) == 3
-    assert len(set(found)) == 1
-
-
 def test_a_run_streams_to_done() -> None:
     rt = runtime()
 

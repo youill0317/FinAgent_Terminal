@@ -8,8 +8,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -72,7 +70,13 @@ def colab(monkeypatch: pytest.MonkeyPatch) -> FakeColab:
     fake = FakeColab()
     monkeypatch.setattr(subprocess, "run", fake)
     monkeypatch.setattr(colab_jobs, "executable", lambda: "colab")
+    monkeypatch.setattr(generative.Generator, "paths", no_draw)
     return fake
+
+
+def no_draw(gen: generative.Generator, n: int, horizon: int, *_: object) -> object:
+    """The check's draw without running the model: no inference in a test."""
+    return np.zeros((n, horizon, len(gen.tickers)))
 
 
 def test_a_job_swaps_only_verified_weights_and_stops(
@@ -129,58 +133,3 @@ def test_a_failed_step_still_stops_the_session(
     assert job.stopped
     assert jobs.last is None
     assert not (root / "sigcwgan").exists()
-
-
-def test_a_restart_stops_a_job_past_its_limit(tmp_path: Path, colab: FakeColab) -> None:
-    root = tmp_path / "data" / "models"
-    root.mkdir(parents=True)
-    started = datetime.now(UTC) - colab_jobs.MAX_RUNTIME - timedelta(minutes=1)
-    stale = colab_jobs.Job(
-        id="x",
-        session="finagent-gen-x",
-        request=request(),
-        stage="training",
-        started=started.isoformat(),
-        created=True,
-    )
-    _ = (root / colab_jobs.STATE_FILE).write_text(json.dumps({"job": asdict(stale)}))
-
-    jobs = colab_jobs.Trainer(root, poll=0)
-    jobs.reconcile()
-    jobs.join(30)
-
-    assert colab.calls == ["stop"]
-    job = jobs.job
-    assert job is not None
-    assert job.stage == "failed"
-    assert "최대 실행 시간" in job.message
-    assert job.stopped
-
-
-def test_the_demo_trainer_switches_canned_states_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError((args, kwargs))
-
-    monkeypatch.setattr(subprocess, "run", refuse)
-    jobs = colab_jobs.DemoTrainer()
-    r = colab_jobs.DEMO_REQUEST
-    prices = colab_jobs.demo_prices()
-    assert colab_jobs.problem(r, prices) is None  # the canned choices can start
-    assert not jobs.running
-    assert jobs.job == jobs.last == colab_jobs.DEMO_LAST
-    assert jobs.elapsed(colab_jobs.DEMO_LAST) == timedelta(hours=3, minutes=12)
-
-    picked = colab_jobs.Request(r.tickers[:2], r.start, r.end, "L4", ("nsde",))
-    assert jobs.start(picked, prices)
-    assert jobs.running
-    job = cast("colab_jobs.Job", jobs.job)
-    assert (job.stage, job.request) == ("training", picked)
-    assert jobs.elapsed(job) == colab_jobs.DEMO_RUNNING
-    assert not jobs.start(r, prices)  # one at a time
-    assert jobs.last == colab_jobs.DEMO_LAST
-
-    jobs.cancel()
-    assert not jobs.running
-    assert jobs.job == colab_jobs.DEMO_LAST

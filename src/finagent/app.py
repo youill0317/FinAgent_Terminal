@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import math
 import os
 import sys
@@ -31,6 +32,8 @@ import streamlit as st
 from finagent import (
     catalog,
     colab_jobs,
+    demo_results,
+    demo_workspace,
     display,
     generative,
     investors,
@@ -129,6 +132,12 @@ def headed(text: str, help_: str | None = None, warns: Sequence[str] = ()) -> No
 
 
 @st.cache_resource(show_spinner=False)
+def demo_settings() -> Path:
+    """The demo's own settings and data, made once per process."""
+    return demo_workspace.workspace()
+
+
+@st.cache_resource(show_spinner=False)
 def runtime(demo: bool, env_file: str, settings: str) -> Runtime:
     env = resolve_env(Path(env_file) if env_file else None, os.environ)
     settings_path = resolve_settings(Path(settings) if settings else None)
@@ -140,6 +149,8 @@ st.set_page_config(
     page_title="FinAgent", page_icon=":material/monitoring:", layout="wide"
 )
 args = parse_args(sys.argv[1:])
+if args.demo and args.settings is None:
+    args.settings = demo_settings()
 rt = runtime(args.demo, str(args.env_file or ""), str(args.settings or ""))
 state = st.session_state
 state.setdefault("toast", "")
@@ -195,36 +206,36 @@ def ai_settings() -> None:
     """Provider, model and scope for the AI analysis; saved by 적용."""
     providers = rt.analysis.providers
     found = rt.call(rt.analysis.statuses())
-    with st.expander("AI 분석", icon=":material/smart_toy:"):
-        provider_id = st.selectbox(
-            "공급자",
-            list(providers),
-            index=list(providers).index(rt.analysis.choice.provider),
-            format_func=lambda pid: (
-                f"{providers[pid].title} · "
-                f"{display.STATUS_TEXT.get(found[pid].kind, found[pid].kind)}"
-            ),
-            key="set_provider",
-            help="**정의** AI 분석을 실행할 공급자 · 옆은 상태(준비됨 · 키 없음 ·"
-            " 설치 안 됨)",
-        )
-        _ = st.text_input(
-            "모델",
-            value=rt.analysis.model_for(provider_id),
-            placeholder=providers[provider_id].default_model,
-            key=f"set_model_{provider_id}",
-            help="**정의** 공급자에 보낼 모델 이름 · 비우면 기본 모델",
-        )
-        _ = st.segmented_control(
-            "새 대화의 범위",
-            list(SCOPES),
-            format_func=SCOPES.__getitem__,
-            default=rt.analysis.choice.scope,
-            key="set_scope",
-            help="**정의** 새 대화가 읽는 지표 범위 · 지금 보기: 보기 설정에서 켠"
-            " 지표 · 전체 매크로: 모든 지표\n\n**기준** 진행 중인 대화는 시작 시점의"
-            " 범위 유지",
-        )
+    provider_col, model_col, scope_col = st.columns(3)
+    provider_id = provider_col.selectbox(
+        "공급자",
+        list(providers),
+        index=list(providers).index(rt.analysis.choice.provider),
+        format_func=lambda pid: (
+            f"{providers[pid].title} · "
+            f"{display.STATUS_TEXT.get(found[pid].kind, found[pid].kind)}"
+        ),
+        key="set_provider",
+        help="**정의** AI 분석을 실행할 공급자 · 옆은 상태(준비됨 · 키 없음 ·"
+        " 설치 안 됨)",
+    )
+    _ = model_col.text_input(
+        "모델",
+        value=rt.analysis.model_for(provider_id),
+        placeholder=providers[provider_id].default_model,
+        key=f"set_model_{provider_id}",
+        help="**정의** 공급자에 보낼 모델 이름 · 비우면 기본 모델",
+    )
+    _ = scope_col.segmented_control(
+        "새 대화의 범위",
+        list(SCOPES),
+        format_func=SCOPES.__getitem__,
+        default=rt.analysis.choice.scope,
+        key="set_scope",
+        help="**정의** 새 대화가 읽는 지표 범위 · 지금 보기: 보기 설정에서 켠"
+        " 지표 · 전체 매크로: 모든 지표\n\n**기준** 진행 중인 대화는 시작 시점의"
+        " 범위 유지",
+    )
 
 
 def apply_ai() -> None:
@@ -430,142 +441,163 @@ def training_settings() -> None:
         adjusted = pf_prices(str(root), pf_files_stamp(root)).adjusted
         jobs = trainer(str(gen_root()))
         saved = load_training(resolve_settings(args.settings)) or TrainingChoice()
-    with st.expander("생성 모델 학습", icon=":material/model_training:"):
-        if adjusted.empty:
-            st.info("저장된 가격이 없습니다.")
-            return
-        options = [t for t in priced_tickers(adjusted) if trainable(t)]
-        wanted = saved.tickers or portfolio.book_tickers(portfolio.load_book(root))
-        _ = st.multiselect(
-            "종목",
-            options,
-            # Only on the first draw: train_fetch may have set the value.
-            default=None
-            if "train_tickers" in state
-            else [t for t in dict.fromkeys(wanted) if t in options],
-            key="train_tickers",
-            on_change=train_fetch_later,
-            accept_new_options=typed,
-            placeholder="티커 입력 (예: NVDA, 005930.KS)" if typed else None,
-            help="**정의** 생성 모델 학습 종목 · 포트폴리오 페이지에 수정 종가가 저장된"
-            " 종목"
-            + (" · 목록에 없는 티커는 입력하면 가격을 받아 추가" if typed else "")
-            + f" · 환율 {portfolio.FX}는 항상 포함 · 지수·금리 제외"
-            "\n\n**기준** 꼬리위험·전망 탭 사용 조건: 보유 종목을 모두 담은 모델 ·"
-            f" 기준 통화와 다른 종목은 {portfolio.FX}로 환산",
+    if adjusted.empty:
+        st.info("저장된 가격이 없습니다.")
+        return
+    options = [t for t in priced_tickers(adjusted) if trainable(t)]
+    wanted = saved.tickers or portfolio.book_tickers(portfolio.load_book(root))
+    tickers_col, span_col = st.columns(2)
+    _ = tickers_col.multiselect(
+        "종목",
+        options,
+        # Only on the first draw: train_fetch may have set the value.
+        default=None
+        if "train_tickers" in state
+        else [t for t in dict.fromkeys(wanted) if t in options],
+        key="train_tickers",
+        on_change=train_fetch_later,
+        accept_new_options=typed,
+        placeholder="티커 입력 (예: NVDA, 005930.KS)" if typed else None,
+        help="**정의** 생성 모델 학습 종목 · 포트폴리오 페이지에 수정 종가가 저장된"
+        " 종목"
+        + (" · 목록에 없는 티커는 입력하면 가격을 받아 추가" if typed else "")
+        + f" · 환율 {portfolio.FX}는 항상 포함 · 지수·금리 제외"
+        "\n\n**기준** 꼬리위험·전망 탭 사용 조건: 보유 종목을 모두 담은 모델 ·"
+        f" 기준 통화와 다른 종목은 {portfolio.FX}로 환산",
+    )
+    if error := state.pop("train_error", ""):
+        st.error(error)
+    first = cast("pd.Timestamp", adjusted.index[0]).date()
+    last = cast("pd.Timestamp", adjusted.index[-1]).date()
+    start = min(max(date.fromisoformat(saved.start or first.isoformat()), first), last)
+    end = min(max(date.fromisoformat(saved.end or last.isoformat()), first), last)
+    if start > end:
+        start, end = first, last
+    _ = span_col.date_input(
+        "학습 기간",
+        value=(start, end),
+        min_value=first,
+        max_value=last,
+        key="train_span",
+        help="**정의** 학습 자료 기간 · 고른 모든 종목에 종가가 있는 날\n\n**기준**"
+        " 시간순 앞 80% 학습 · 뒤 20% 평가",
+    )
+    request = train_request()
+    if request is not None and request.tickers:
+        rows = colab_jobs.returns_table(
+            adjusted,
+            request.tickers,
+            date.fromisoformat(request.start),
+            date.fromisoformat(request.end),
         )
-        if error := state.pop("train_error", ""):
-            st.error(error)
-        first = cast("pd.Timestamp", adjusted.index[0]).date()
-        last = cast("pd.Timestamp", adjusted.index[-1]).date()
-        start = min(
-            max(date.fromisoformat(saved.start or first.isoformat()), first), last
+        span = (
+            f"{cast('pd.Timestamp', rows.index[0]):%Y-%m-%d}–"
+            f"{cast('pd.Timestamp', rows.index[-1]):%Y-%m-%d}, {len(rows):,}일"
+            if len(rows)
+            else "없음"
         )
-        end = min(max(date.fromisoformat(saved.end or last.isoformat()), first), last)
-        if start > end:
-            start, end = first, last
-        _ = st.date_input(
-            "학습 기간",
-            value=(start, end),
-            min_value=first,
-            max_value=last,
-            key="train_span",
-            help="**정의** 학습 자료 기간 · 고른 모든 종목에 종가가 있는 날\n\n**기준**"
-            " 시간순 앞 80% 학습 · 뒤 20% 평가",
+        span_col.caption(f"겹치는 기간 {span}")
+    models_col, gpu_col = st.columns(2)
+    _ = gpu_col.segmented_control(
+        "Colab GPU",
+        colab_jobs.GPUS,
+        default=saved.gpu if saved.gpu in colab_jobs.GPUS else "T4",
+        required=True,
+        key="train_gpu",
+        help="**정의** 학습에 쓸 Colab 런타임 GPU",
+    )
+    _ = models_col.multiselect(
+        "모델",
+        generative.METHODS,
+        default=[m for m in generative.METHODS if m in saved.models]
+        or list(generative.METHODS),
+        format_func=GEN_LABELS.__getitem__,
+        key="train_models",
+        help="**정의** 학습할 생성 모델 · Tail-GAN(Cont 외) · SigCWGAN(Liao 외"
+        " 2020) · 신경망 SDE(Issa 외 2023)",
+    )
+    training_status(jobs)
+    request = train_request()
+    blocked = (
+        (None if args.demo else colab_jobs.blocker())
+        or busy(jobs)
+        or (None if state.get("train_tickers") else "종목을 고르세요")
+        or (
+            colab_jobs.problem(request, adjusted)
+            if request is not None
+            else "학습 기간을 고르세요"
         )
-        request = train_request()
-        if request is not None and request.tickers:
-            rows = colab_jobs.returns_table(
-                adjusted,
-                request.tickers,
-                date.fromisoformat(request.start),
-                date.fromisoformat(request.end),
-            )
-            span = (
-                f"{cast('pd.Timestamp', rows.index[0]):%Y-%m-%d}–"
-                f"{cast('pd.Timestamp', rows.index[-1]):%Y-%m-%d}, {len(rows):,}일"
-                if len(rows)
-                else "없음"
-            )
-            st.markdown(f"**겹치는 기간** {span}")
-        _ = st.segmented_control(
-            "Colab GPU",
-            colab_jobs.GPUS,
-            default=saved.gpu if saved.gpu in colab_jobs.GPUS else "T4",
-            required=True,
-            key="train_gpu",
-            help="**정의** 학습에 쓸 Colab 런타임 GPU",
-        )
-        _ = st.multiselect(
-            "모델",
-            generative.METHODS,
-            default=[m for m in generative.METHODS if m in saved.models]
-            or list(generative.METHODS),
-            format_func=GEN_LABELS.__getitem__,
-            key="train_models",
-            help="**정의** 학습할 생성 모델 · Tail-GAN(Cont 외) · SigCWGAN(Liao 외"
-            " 2020) · 신경망 SDE(Issa 외 2023)",
-        )
-        training_status(jobs)
-        request = train_request()
-        blocked = (
-            (None if args.demo else colab_jobs.blocker())
-            or busy(jobs)
-            or (None if state.get("train_tickers") else "종목을 고르세요")
-            or (
-                colab_jobs.problem(request, adjusted)
-                if request is not None
-                else "학습 기간을 고르세요"
-            )
-        )
-        with st.container(horizontal=True):
-            st.button(
-                "학습 시작",
-                icon=":material/play_arrow:",
-                key="train_start",
-                disabled=blocked is not None,
-                help=blocked
-                or "**정의** Colab VM 설치 뒤 고른 모델 순차 학습 · 받은 모델 검증 뒤"
-                " 교체(이전 모델은 data/models/<모델>.prev)\n\n**기준** 상태 확인"
-                f" {colab_jobs.POLL_SECONDS / 60:.0f}분 간격 · 종료 시 Colab 세션 중지",
-                on_click=start_training,
-                args=(jobs, adjusted),
-            )
-            if jobs.running:
-                st.button(
-                    "중지",
-                    icon=":material/stop:",
-                    key="train_cancel",
-                    on_click=jobs.cancel,
-                )
-
-
-@st.dialog("보기 설정", width="medium")
-def settings_dialog(d: Dashboard) -> None:
+    )
     with st.container(horizontal=True):
+        st.button(
+            "학습 시작",
+            icon=":material/play_arrow:",
+            key="train_start",
+            disabled=blocked is not None,
+            help=blocked
+            or "**정의** Colab VM 설치 뒤 고른 모델 순차 학습 · 받은 모델 검증 뒤"
+            " 교체(이전 모델은 data/models/<모델>.prev)\n\n**기준** 상태 확인"
+            f" {colab_jobs.POLL_SECONDS / 60:.0f}분 간격 · 종료 시 Colab 세션 중지",
+            on_click=start_training,
+            args=(jobs, adjusted),
+        )
+        if jobs.running:
+            st.button(
+                "중지",
+                icon=":material/stop:",
+                key="train_cancel",
+                on_click=jobs.cancel,
+            )
+
+
+def view_settings(d: Dashboard, on: frozenset[str]) -> None:
+    """The 보기 tab: a card of switches per page, three to a row."""
+    with st.container(horizontal=True, vertical_alignment="center"):
         st.button("핵심만", on_click=check_all, args=(d,), kwargs={"on": False})
         st.button("전체 매크로", on_click=check_all, args=(d,), kwargs={"on": True})
+        st.caption(display.view_summary(d, on))
     sections = [("개요", ":material/dashboard:", ("curve",))] + [
         (title, icon, ids) for _, title, icon, ids in display.PANEL_PAGES
     ]
-    for title, icon, ids in sections:
-        views = [view for view in d.views if view.id in ids]
-        switchable = [view for view in views if view.extra]
-        count = sum(bool(state.get(f"view_{view.id}")) for view in switchable)
-        with st.expander(f"{title} · {count}/{len(switchable)}", icon=icon):
+    for row in itertools.batched(sections, 3):
+        for col, (title, icon, ids) in zip(
+            st.columns(3, border=True), row, strict=False
+        ):
+            views = [view for view in d.views if view.id in ids]
+            switchable = [view for view in views if view.extra]
+            count = sum(view.id in on for view in switchable)
+            col.markdown(f"{icon} **{title}** :gray[{count}/{len(switchable)}]")
             for view in views:
                 note = display.view_note(
                     view.core, view.extra, curve=view.id == "curve"
                 )
-                st.checkbox(
+                col.checkbox(
                     f"{view.title} :gray[{note}]",
                     key=f"view_{view.id}",
                     disabled=not view.extra,
                 )
-    ai_settings()
-    training_settings()
+
+
+@st.dialog("보기 설정", width="large")
+def settings_dialog(d: Dashboard) -> None:
     on = frozenset(view.id for view in d.views if state.get(f"view_{view.id}"))
-    st.caption(display.view_summary(d, on))
+    # Fixed labels: a changed one would reopen the first tab.
+    views, ai, training, criteria = st.tabs(
+        [
+            ":material/visibility: 보기",
+            ":material/smart_toy: AI 분석",
+            ":material/model_training: 생성 모델 학습",
+            ":material/filter_alt: 스크리닝 기준",
+        ]
+    )
+    with views:
+        view_settings(d, on)
+    with ai:
+        ai_settings()
+    with training:
+        training_settings()
+    with criteria:
+        criteria_panel()
     with st.container(horizontal=True, horizontal_alignment="right"):
         if st.button("취소"):
             st.rerun()
@@ -573,6 +605,7 @@ def settings_dialog(d: Dashboard) -> None:
             set_deep(on)
             apply_ai()
             apply_training()
+            save_criteria()
             st.rerun()
 
 
@@ -1149,6 +1182,15 @@ def screen_prepared(
     return None if inputs is None else screen.prepare(inputs)
 
 
+@st.cache_data(show_spinner=False, max_entries=2)
+def screen_crash(root: str, stamp: tuple[tuple[str, int], ...]) -> screen.Crash:
+    """The momentum crash notice from the stored prices."""
+    inputs = screen.load(Path(root)) if stamp else None
+    if inputs is None:
+        return screen.Crash()
+    return screen.momentum_crash(inputs.prices, inputs.fundamentals)
+
+
 @st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=8)
 def screen_table(
     root: str, stamp: tuple[tuple[str, int], ...], criteria: screen.Criteria
@@ -1169,11 +1211,20 @@ def crit_values(c: screen.Criteria) -> dict[str, bool | float]:
     return out
 
 
-def crit_state() -> screen.Criteria:
-    """The criteria the 기준 widgets hold, seeded from the settings file."""
+def saved_criteria() -> screen.Criteria:
+    """The criteria in the settings file: the ones the screening page uses."""
     saved = load_screen(resolve_settings(args.settings))
-    for key, value in crit_values(screen.criteria(saved.values, saved.off)).items():
-        state.setdefault(key, value)
+    return screen.criteria(saved.values, saved.off)
+
+
+def seed_criteria() -> None:
+    """Set the 스크리닝 기준 widgets to the saved criteria as 설정 opens."""
+    for key, value in crit_values(saved_criteria()).items():
+        state[key] = value
+
+
+def crit_draft() -> screen.Criteria:
+    """The criteria the 스크리닝 기준 widgets hold, applied by 적용."""
     values = {
         limit.field: limit.stored(state[f"crit_{limit.field}"])
         for rule in screen.RULES
@@ -1184,7 +1235,7 @@ def crit_state() -> screen.Criteria:
 
 
 def save_criteria() -> None:
-    values, off = screen.saved(crit_state())
+    values, off = screen.saved(crit_draft())
     choice = ScreenChoice(values, off)
     path = resolve_settings(args.settings)
     if load_screen(path) == choice:
@@ -1198,75 +1249,89 @@ def save_criteria() -> None:
 def reset_criteria() -> None:
     for key, value in crit_values(screen.DEFAULT).items():
         state[key] = value
-    save_criteria()
 
 
 def crit_number(limit: screen.Limit, *, disabled: bool) -> None:
-    if limit.whole:
+    """A limit's number with its label beside it; the fixed width lines them up."""
+    with st.container(
+        horizontal=True, vertical_alignment="center", gap="xsmall", width="content"
+    ):
+        st.caption(limit.label, width=170)
+        if limit.whole:
+            st.number_input(
+                limit.label,
+                min_value=int(limit.low),
+                max_value=int(limit.high),
+                step=int(limit.step),
+                format="%d",
+                key=f"crit_{limit.field}",
+                disabled=disabled,
+                label_visibility="collapsed",
+                width=110,
+            )
+            return
+        digits = len(f"{limit.step:g}".partition(".")[2])
         st.number_input(
             limit.label,
-            min_value=int(limit.low),
-            max_value=int(limit.high),
-            step=int(limit.step),
-            format="%d",
+            min_value=float(limit.low),
+            max_value=float(limit.high),
+            step=float(limit.step),
+            format=f"%.{digits}f",
             key=f"crit_{limit.field}",
             disabled=disabled,
-            on_change=save_criteria,
-            width=150,
+            label_visibility="collapsed",
+            width=110,
         )
-        return
-    digits = len(f"{limit.step:g}".partition(".")[2])
-    st.number_input(
-        limit.label,
-        min_value=float(limit.low),
-        max_value=float(limit.high),
-        step=float(limit.step),
-        format=f"%.{digits}f",
-        key=f"crit_{limit.field}",
-        disabled=disabled,
-        on_change=save_criteria,
-        width=150,
-    )
 
 
 def crit_switch(rule: screen.Rule, *, changed: bool) -> None:
-    with st.container(horizontal=True, vertical_alignment="bottom"):
+    with st.container(horizontal=True, vertical_alignment="center", width="content"):
         st.checkbox(
             rule.name,
             key=f"crit_on_{rule.key}",
             help=rule.help,
-            on_change=save_criteria,
         )
         if changed:
             st.badge("변경", color="blue")
 
 
 def crit_row(rule: screen.Rule, *, changed: bool) -> None:
-    """A rule with numbers: its switch (or name), the numbers and a 변경 mark."""
-    with st.container(horizontal=True, vertical_alignment="bottom"):
+    """A rule with numbers: its switch (or name), the numbers and a 변경 mark.
+
+    The numbers stack beside the name rather than wrap under it.
+    """
+    with st.container(horizontal=True, vertical_alignment="top"):
         if rule.toggle:
             st.checkbox(
                 rule.name,
                 key=f"crit_on_{rule.key}",
                 help=rule.help,
-                on_change=save_criteria,
-                width=200,
+                width=180,
             )
         else:
-            st.markdown(rule.name, help=rule.help, width=200)
+            st.markdown(f":small[{rule.name}]", help=rule.help, width=180)
         off = rule.toggle and not state[f"crit_on_{rule.key}"]
-        for limit in rule.limits:
-            crit_number(limit, disabled=off)
+        with st.container(gap="xsmall", width="content"):
+            for limit in rule.limits:
+                crit_number(limit, disabled=off)
         if changed:
             st.badge("변경", color="blue")
 
 
-def criteria_panel(c: screen.Criteria) -> None:
-    """The 기준 expander: every rule by section, with a reset to the defaults."""
-    changed = set(screen.changed(c))
-    label = f"기준 · 변경 {len(changed)}" if changed else "기준"
-    # Tracked by key, so a new count in the label keeps it open.
-    with st.expander(label, icon=":material/tune:", key="crit_open", on_change="rerun"):
+def crit_lines(parts: dict[str, list[screen.Rule]]) -> int:
+    """About how many lines a section of the panel takes, to balance the columns."""
+    return 1 + sum(
+        bool(part)
+        + any(not r.limits for r in rules)
+        + sum(len(r.limits) for r in rules)
+        for part, rules in parts.items()
+    )
+
+
+def criteria_panel() -> None:
+    """The 스크리닝 기준 tab of 설정: every rule by section, with a reset."""
+    changed = set(screen.changed(crit_draft()))
+    with st.container(horizontal=True, vertical_alignment="center"):
         st.button(
             "기본값으로",
             icon=":material/restart_alt:",
@@ -1274,24 +1339,32 @@ def criteria_panel(c: screen.Criteria) -> None:
             disabled=not changed,
             on_click=reset_criteria,
         )
-        heads: dict[tuple[str, str], list[screen.Rule]] = {}
-        for rule in screen.RULES:
-            heads.setdefault((rule.section, rule.part), []).append(rule)
-        section = ""
-        for (title, part), rules in heads.items():
-            if title != section:
-                section = title
-                st.markdown(f"**{title}**")
-            if part:
-                st.markdown(f":gray[{part}]")
-            switches = [rule for rule in rules if not rule.limits]
-            if switches:
-                with st.container(horizontal=True):
-                    for rule in switches:
-                        crit_switch(rule, changed=rule.key in changed)
-            for rule in rules:
-                if rule.limits:
-                    crit_row(rule, changed=rule.key in changed)
+        if changed:
+            st.caption(f"기본값에서 {len(changed)}개 변경 · 적용을 눌러야 반영")
+    sections: dict[str, dict[str, list[screen.Rule]]] = {}
+    for rule in screen.RULES:
+        sections.setdefault(rule.section, {}).setdefault(rule.part, []).append(rule)
+    # Sections in order down two columns, split where the heights come closest.
+    lines = [crit_lines(parts) for parts in sections.values()]
+    split = min(
+        range(len(lines) + 1),
+        key=lambda k: abs(sum(lines[:k]) - sum(lines[k:])),
+    )
+    columns = st.columns(2)
+    for n, (title, parts) in enumerate(sections.items()):
+        with columns[n >= split], st.container(border=True):
+            st.markdown(f"**{title}**")
+            for part, rules in parts.items():
+                if part:
+                    st.caption(part)
+                switches = [rule for rule in rules if not rule.limits]
+                if switches:
+                    with st.container(horizontal=True):
+                        for rule in switches:
+                            crit_switch(rule, changed=rule.key in changed)
+                for rule in rules:
+                    if rule.limits:
+                        crit_row(rule, changed=rule.key in changed)
 
 
 def parts_line(parts: screen.Parts) -> str:
@@ -1302,8 +1375,13 @@ def parts_line(parts: screen.Parts) -> str:
     )
 
 
-def screen_bar(updater: screen.Updater, root: Path, help_: str) -> None:
-    """Data dates with the page's ``help_``, the 갱신 button and any progress."""
+def screen_bar(
+    updater: screen.Updater, root: Path, help_: str, criteria: screen.Criteria
+) -> None:
+    """Data dates with the page's ``help_``, the 갱신 button and any progress.
+
+    A finished update saves a snapshot screened by ``criteria``.
+    """
     polling = updater.progress.running
     missing = screen.missing_packages()
 
@@ -1323,7 +1401,7 @@ def screen_bar(updater: screen.Updater, root: Path, help_: str) -> None:
                 disabled=progress.running or bool(missing) or args.demo,
             ):
                 # Rerun the page even if another tab started first, so it polls.
-                updater.start(sec_agent())
+                updater.start(sec_agent(), criteria)
                 st.rerun()
         if progress.running:
             done = progress.done / progress.total if progress.total else 0.0
@@ -1401,8 +1479,7 @@ def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
         st.metric("시가총액", fmt("big", row["mcap"]), border=True, height="stretch")
         st.metric(
             "기술 점수",
-            f"{fmt('int', row['score'])}/{len(c.kept(screen.TECH_CHECKS))}"
-            f" {row['chart']}",
+            f"{fmt('int', row['score'])}/100 {row['chart']}",
             help=screen.score_help(c),
             border=True,
             height="stretch",
@@ -1438,9 +1515,9 @@ def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
         headed("**기술 점수**", display.md(screen.tech_basis(c)))
-        st.markdown(check_lines(screen.tech_lines(row, c)))
-        headed("**과열 표시**", screen.overheat_help(c))
-        st.markdown(check_lines(screen.overheat_lines(row, c)))
+        st.markdown(status_lines(screen.tech_lines(row, c)))
+        headed("**단기 급등**", screen.surge_help(c))
+        st.markdown(check_lines(screen.surge_lines(row, c)))
     with right, st.container(border=True, height="stretch"):
         headed("**결격 점검**", screen.dq_help(c))
         st.markdown(status_lines(screen.dq_lines(row, c)))
@@ -1454,6 +1531,7 @@ def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
             f"**EPS 추정치** :gray[{row['est_currency'] or '—'}]",
             screen.ESTIMATE_HELP,
         )
+        st.caption(display.md(screen.estimate_note(row)))
         st.dataframe(screen.estimate_table(row), hide_index=True, alt="EPS 추정치")
     points = screen.chart_rows(screen.history(root, str(row["ticker"])))
     if len(points) > 1:
@@ -1475,32 +1553,121 @@ def open_stock(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
     st.dialog(title, width="large", on_dismiss="rerun")(stock_body)(root, row, c)
 
 
-def map_chart(
-    points: list[dict[str, str | float]], current: str, split: float
-) -> alt.LayerChart:
-    """밸류에이션 against 퀄리티, colored by the FY1 estimate direction.
+MAP_COLORS = {"기술 점수": "band", "추정치 방향": "est", "없음": ""}
+MAP_LEGENDS = {
+    "band": (
+        "기술 점수",
+        list(screen.CHART_ORDER),
+        [display.UP_COLOR, "gray", display.DOWN_COLOR, "lightgray"],
+    ),
+    "est": (
+        "FY1 추정치",
+        list(screen.EST_ORDER),
+        [display.UP_COLOR, "gray", display.DOWN_COLOR, "lightgray"],
+    ),
+}
+MAP_NO_LABEL = "없음"
+MAP_LABELS = [
+    MAP_NO_LABEL,
+    screen.TAGS["weak_trend"],
+    *(name for key, name in screen.TAGS.items() if key != "weak_trend"),
+]
+JITTER = 0.006  # of the axis: where points sit, not their values
 
-    Points outside the chosen cell are dimmed; the chart takes no clicks.
+
+def map_points(
+    points: list[dict[str, object]], current: str, label: str, *, held: bool
+) -> list[dict[str, object]]:
+    """The map's points: held ones only when ``held``, each lit or dimmed.
+
+    A point is lit when it is in the chosen cell (any, for 전체) and carries
+    ``label`` (any, for 없음). ``x`` and ``y`` sit a fixed hash-driven nudge
+    off the values, so overlapping points part without changing them.
     """
-    cells = {key for _, keys in screen.MAP_ROWS for key in keys}
-    opacity = (
-        alt.condition(alt.datum.group == current, alt.value(0.9), alt.value(0.15))
-        if current in cells
-        else alt.value(0.9)
+    shown: list[dict[str, object]] = []
+    for point in points:
+        if point["held"] and not held:
+            continue
+        in_cell = current == "all" or point["group"] == current
+        tagged = label == MAP_NO_LABEL or label in cast("list[str]", point["labels"])
+        seed = sum(ord(ch) for ch in str(point["ticker"]))
+        nudge = ((seed % 7) - 3) / 3 * JITTER, ((seed % 5) - 2) / 2 * JITTER
+        shown.append(
+            point
+            | {
+                "lit": in_cell and tagged,
+                "x": float(cast("float", point["valuation"])) + nudge[0],
+                "y": float(cast("float", point["quality"])) + nudge[1],
+            }
+        )
+    return shown
+
+
+def map_guides(split: float, band: float) -> list[alt.Chart]:
+    """The split crosshair, the 경계 근처 band and lines of equal 통합 점수."""
+    rule = alt.Chart(alt.Data(values=[{"v": split}])).mark_rule(
+        strokeDash=[2, 3], color="gray"
     )
+    strip = alt.Chart(
+        alt.Data(values=[{"low": max(split - band, 0), "high": min(split + band, 1)}])
+    ).mark_rect(color="gray", opacity=0.08)
+    diagonals = [
+        {"k": k, "x": x, "y": x + k}
+        for k in (-0.5, 0.0, 0.5)
+        for x in (max(0.0, -k), min(1.0, 1 - k))
+    ]
+    iso = (
+        alt.Chart(alt.Data(values=diagonals))
+        .mark_line(color="gray", opacity=0.25, strokeDash=[1, 3])
+        .encode(x="x:Q", y="y:Q", detail="k:N")
+    )
+    guides: list[alt.Chart] = [
+        strip.encode(x="low:Q", x2="high:Q"),
+        strip.encode(y="low:Q", y2="high:Q"),
+        iso,
+        rule.encode(x="v:Q"),
+        rule.encode(y="v:Q"),
+    ]
+    return guides
+
+
+def map_chart(  # noqa: PLR0913 - the map's four toggles
+    points: list[dict[str, object]],
+    current: str,
+    c: screen.Criteria,
+    color: str,
+    label: str,
+    *,
+    held: bool,
+    guides: bool,
+) -> alt.LayerChart:
+    """밸류에이션 against 퀄리티, colored as ``color`` picks; held stocks hollow.
+
+    Points outside the chosen cell or without ``label`` are dimmed; the chart
+    takes no clicks.
+    """
+    field = MAP_COLORS[color]
+    if field:
+        title, domain, colors = MAP_LEGENDS[field]
+        paint = alt.Color(
+            f"{field}:N",
+            title=title,
+            scale=alt.Scale(domain=domain, range=colors),
+            # One line above the plot at its right end, to leave the plot room.
+            legend=alt.Legend(orient="top", direction="horizontal", titleOrient="left"),
+        )
+    else:
+        paint = alt.Color("held:N", legend=None, scale=alt.Scale(range=["steelblue"]))
     share = alt.Axis(format=".0%")
-    stocks = (
-        alt.Chart(alt.Data(values=points))
-        .mark_circle(size=40)
-        .encode(
+    base = alt.Chart(alt.Data(values=map_points(points, current, label, held=held)))
+
+    def dots(chart: alt.Chart) -> alt.Chart:
+        return chart.encode(
             x=alt.X(
-                "valuation:Q",
-                title="밸류에이션",
-                scale=alt.Scale(domain=[0, 1]),
-                axis=share,
+                "x:Q", title="밸류에이션", scale=alt.Scale(domain=[0, 1]), axis=share
             ),
             y=alt.Y(
-                "quality:Q",
+                "y:Q",
                 title="퀄리티",
                 scale=alt.Scale(domain=[0, 1]),
                 # Level, above the axis at its top left, not turned on its side.
@@ -1514,50 +1681,76 @@ def map_chart(
                     titleY=-8,
                 ),
             ),
-            color=alt.Color(
-                "est:N",
-                title="FY1 추정치",
-                scale=alt.Scale(
-                    domain=list(screen.EST_ORDER),
-                    range=[display.UP_COLOR, "gray", display.DOWN_COLOR, "lightgray"],
-                ),
-                # One line above the plot at its right end, to leave the plot room.
-                legend=alt.Legend(
-                    orient="top", direction="horizontal", titleOrient="left"
-                ),
-            ),
-            opacity=opacity,
+            color=paint,
+            opacity=alt.condition(alt.datum.lit, alt.value(0.75), alt.value(0.12)),
             tooltip=[
                 alt.Tooltip("ticker:N", title="티커"),
                 alt.Tooltip("name:N", title="종목"),
                 alt.Tooltip("cell:N", title="칸"),
                 alt.Tooltip("quality:Q", title="퀄리티", format=".0%"),
                 alt.Tooltip("valuation:Q", title="밸류에이션", format=".0%"),
+                alt.Tooltip("counted:N", title="산출 항목 수"),
+                alt.Tooltip("peer:N", title="비교 업종"),
+                alt.Tooltip("score:Q", title="기술 점수", format=".0f"),
                 alt.Tooltip("est:N", title="추정치"),
+                alt.Tooltip("revision:Q", title="수정 강도", format="+.2%"),
+                alt.Tooltip("tags:N", title="라벨"),
             ],
         )
+
+    placed = dots(base.transform_filter(~alt.datum.held).mark_circle(size=40))
+    hollow = dots(
+        base.transform_filter(alt.datum.held).mark_point(size=40, filled=False)
     )
-    rule = alt.Chart(alt.Data(values=[{"v": split}])).mark_rule(
-        strokeDash=[2, 3], color="gray"
-    )
+    layers: list[alt.Chart] = [
+        *(map_guides(c.split, c.near_band) if guides else []),
+        placed,
+        hollow,
+    ]
     return (
-        alt.LayerChart(layer=[rule.encode(x="v:Q"), rule.encode(y="v:Q"), stocks])
+        alt.LayerChart(layer=layers)
         .properties(height=2 * CHART_HEIGHT)
         .configure_legend(layout=alt.ExprRef("{top: {anchor: 'end'}}"))
     )
 
 
-def group_map(rows: pd.DataFrame, current: str, c: screen.Criteria) -> None:
-    """The stocks as 퀄리티 by 밸류에이션 points, boxed with the 칸 help."""
+def group_map(
+    rows: pd.DataFrame, current: str, c: screen.Criteria, crash: screen.Crash
+) -> None:
+    """The stocks as 퀄리티 by 밸류에이션 points with their toggles, boxed."""
     with st.container(border=True):
         headed("**퀄리티·밸류에이션 분포** · 업종 백분위", screen.group_help(c))
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            color = st.segmented_control(
+                "색 기준", list(MAP_COLORS), key="map_color", default="기술 점수"
+            )
+            label = st.selectbox("강조 라벨", MAP_LABELS, key="map_label", width=200)
+            held = st.toggle("보류 종목", value=True, key="map_held")
+            guides = st.toggle("안내선", value=True, key="map_guides")
+        if c.on("crash") and crash.state == screen.CRASH_WATCH:
+            st.warning(
+                "시장이 큰 폭으로 하락한 뒤 변동성이 높은 반등기입니다. 모멘텀 급락"
+                " 위험이 커서 기술 점수(12-1 모멘텀)를 조심해서 보세요 · 시장 24개월"
+                f" {screen.fmt('signed', crash.market_return)}",
+                icon=":material/warning:",
+            )
         st.altair_chart(
-            map_chart(screen.map_rows(rows), current, c.split),
+            map_chart(
+                screen.map_rows(rows),
+                current,
+                c,
+                color or "없음",
+                label or MAP_NO_LABEL,
+                held=held,
+                guides=guides,
+            ),
             alt="퀄리티와 밸류에이션 분포",
         )
 
 
-def screen_results(root: Path, table: pd.DataFrame, c: screen.Criteria) -> None:
+def screen_results(
+    root: Path, table: pd.DataFrame, c: screen.Criteria, crash: screen.Crash
+) -> None:
     liquid = screen.liquid(table)
     chosen: list[str] = state.get("screen_sectors") or []
     filtered = screen.pick(table, "all", chosen)
@@ -1584,7 +1777,7 @@ def screen_results(root: Path, table: pd.DataFrame, c: screen.Criteria) -> None:
             width=320,
         )
     key = picked or "all"
-    group_map(filtered, key, c)
+    group_map(filtered, key, c, crash)
     rows = screen.pick(table, key, sectors)
     shown = screen.view(rows, c)
     columns = [c for c, _, _ in screen.TABLE if c in shown.columns]
@@ -1879,6 +2072,8 @@ def cached_draws(
     Any weight vector reuses them; read-only, so the cached array is shared.
     """
     del stamp
+    if args.demo:  # the canned paths read only the horizon
+        return np.zeros((1, horizon), dtype=np.int64)
     picks = quant.stationary_indices(n, portfolio.PATHS, horizon, block)
     picks.flags.writeable = False
     return picks
@@ -1890,6 +2085,9 @@ def cached_filter(
 ) -> quant.Devolatilised:
     """``key`` stands for ``_j`` and the filter's options ``_v``."""
     del key
+    if args.demo:
+        days = min(len(_j.full), quant.FILTER_DAYS)
+        return demo_results.volatility(len(_j.names), days)
     return portfolio.volatility(_j, _v)
 
 
@@ -1903,15 +2101,19 @@ def cached_paths(
     _picks: NDArray[np.int64],
     _w: NDArray[np.float64] | None = None,
     _f: quant.Devolatilised | None = None,
+    drift: float = 0.0,
 ) -> portfolio.Simulation:
     """The summary, fan and histogram; the paths themselves are not kept.
 
     ``_w`` replaces ``_j``'s weights on the same draws; ``key`` stands for it.
-    ``_f`` is the volatility filter when ``fhs``.
+    ``_f`` is the volatility filter when ``fhs``; ``drift`` the daily
+    expected return (``portfolio.simulation``).
     """
     del key
+    if args.demo:
+        return demo_results.simulation(value, _picks.shape[1], drift)
     growth = portfolio.growth(_j, _picks, _f if fhs else None, _w)
-    return portfolio.simulation(growth, value, *standing)
+    return portfolio.simulation(growth, value, *standing, drift)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1922,16 +2124,23 @@ def cached_tails(
     _v: portfolio.Vol | None = None,
 ) -> portfolio.Tails:
     del key
+    if args.demo:
+        return demo_results.tails(len(_j.names), len(_j.window))
     return portfolio.tails(_j, _f, _v)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def cached_density(
-    key: Key, _j: portfolio.Joint, _f: quant.Devolatilised | None
+    key: Key,
+    _j: portfolio.Joint,
+    _f: quant.Devolatilised | None,
+    _drift: NDArray[np.float64] | None = None,
 ) -> portfolio.Density:
-    """``key`` stands for ``_j`` and whether ``_f`` is given, and which."""
+    """``key`` stands for ``_j``, whether ``_f`` is given and which, and ``_drift``."""
     del key
-    return portfolio.density(_j, _f)
+    if args.demo:
+        return demo_results.density()
+    return portfolio.density(_j, _f, drift=_drift)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -3722,6 +3931,7 @@ def pf_end_chart(
             ),
             x2="end:Q",
             y=alt.Y("count:Q", title="경로 수"),
+            y2=alt.datum(0),  # without it Vega draws a thin bar at the count
             tooltip=[
                 alt.Tooltip("start:Q", title="부터", format=number),
                 alt.Tooltip("end:Q", title="까지", format=number),
@@ -3731,7 +3941,7 @@ def pf_end_chart(
     )
     now = (
         alt.Chart(alt.Data(values=[{"x": value}]))
-        .mark_rule(strokeDash=[3, 3], color="gray")
+        .mark_rule(strokeDash=[3, 3], color=pf_ink())  # gray is lost on the bars
         .encode(x="x:Q")
     )
     return alt.LayerChart(layer=[bars, now, pf_break(low, 0, angle=90)]).properties(
@@ -3887,7 +4097,10 @@ def pf_reach_chart(paths: perf.PathRisk) -> alt.LayerChart:
     )
 
 
-def pf_reach_help(paths: perf.PathRisk) -> str:
+PF_ZERO_DRIFT = "평균 수익 0 가정"
+
+
+def pf_reach_help(paths: perf.PathRisk, drift: str = PF_ZERO_DRIFT) -> str:
     """The 하락·상승 chart's help, with the recovery figures under 기준."""
     low, mid, high = paths.recovery_low, paths.recovery_median, paths.recovery_high
     if paths.never == 0 and mid is None:
@@ -3912,7 +4125,7 @@ def pf_reach_help(paths: perf.PathRisk) -> str:
         " 고점(지금 포함) 대비 하락 · 저점 대비: 그때까지의 저점(지금 포함) 대비 상승 ·"
         " 숫자: 막대 바깥 열 · 열 머리 색 견본: 해당 겹\n\n**해석** 겹 사이 간격:"
         " 기간 중 겪었지만 기간 끝에 남지 않은 손실(하락 쪽) · 기회(상승 쪽)\n\n"
-        f"**기준** 평균 수익 0 가정 · 경로 {portfolio.PATHS:,}개 · {recovery}"
+        f"**기준** {drift} · 경로 {portfolio.PATHS:,}개 · {recovery}"
     )
 
 
@@ -4032,14 +4245,18 @@ def pf_vol(
     return PfVol(v, chosen, f, label)
 
 
-def pf_density(d: portfolio.Density, *, fhs: bool) -> None:
+def pf_density(d: portfolio.Density, *, fhs: bool, capm: bool = False) -> None:
     drawn = (
         f"필터 추정 기간의 겹치지 않는 {quant.MONTH_DAYS}일 구간마다 첫날 변동성"
         " 기준 모의"
         if fhs
         else f"전체 기간의 겹치지 않는 {quant.MONTH_DAYS}일 구간마다 직전 선택 기간"
-        " 수익률의 평균 수익 0 묶음 재표본(Politis–White 2004, 묶음 길이도 그 기간"
+        " 수익률의 묶음 재표본(Politis–White 2004, 묶음 길이도 그 기간"
         " 추정) · 앞에 선택 기간만큼 자료가 있는 구간"
+    ) + (
+        " · 기대수익: 구간 첫날 무위험수익률 + 지금 베타 × 위험프리미엄"
+        if capm
+        else f" · {PF_ZERO_DRIFT}"
     )
     headed(
         f"**분포 검증** · 1개월, {d.blocks}구간",
@@ -4059,6 +4276,9 @@ def pf_density(d: portfolio.Density, *, fhs: bool) -> None:
             "구간": [f"{d.blocks}개"],
             "LR": [f"{d.test.lr:.2f}"],
             "p": [f"{d.test.p:.2f}"],
+            "평균": [f"{d.test.mean:+.2f}"],
+            "표준편차": [f"{d.test.sd:.2f}"],
+            "자기상관": [f"{d.test.rho:+.2f}"],
         },
         "분포 검증",
     )
@@ -4098,6 +4318,10 @@ def pf_gens(
     j: portfolio.Joint, base: portfolio.Currency, adjusted: pd.DataFrame
 ) -> PfGens:
     """Ready generators whose tickers hold every name, and USD/KRW if needed."""
+    if args.demo:  # every model to choose, none loaded
+        tickers = (*j.names, portfolio.FX)
+        usable = {m: demo_results.generator(m, tickers) for m in generative.METHODS}
+        return PfGens(usable, {"Kronos": generative.IN_PROGRESS}, base, adjusted)
     root = gen_root()
     usable: dict[str, generative.Generator] = {}
     blocked: dict[str, str] = {}
@@ -4165,6 +4389,8 @@ def pf_history(adjusted: pd.DataFrame, gen: generative.Generator) -> pd.DataFram
 
 
 def pf_gen_key(gen: generative.Generator) -> Key:
+    if args.demo:
+        return (gen.method,)
     return (gen.method, *pf_gen_stamp(gen_root() / gen.method))
 
 
@@ -4173,6 +4399,7 @@ def pf_gen_note(
     base: portfolio.Currency,
     j: portfolio.Joint,
     recent: bool,
+    drift: str,
 ) -> str:
     """How the generator's paths are drawn, for the method notes."""
     span = f"{gen.meta.get('train_start', '?')}–{gen.meta.get('train_end', '?')}"
@@ -4192,7 +4419,7 @@ def pf_gen_note(
     )
     return (
         f"{GEN_LABELS[gen.method]}({span} 학습) 생성 경로 {portfolio.PATHS:,}개,"
-        f" {how}{fx} · 평균 수익 0 가정 · 지금 비중 매일 재조정"
+        f" {how}{fx} · {drift} · 지금 비중 매일 재조정"
     )
 
 
@@ -4220,7 +4447,7 @@ def pf_generated(
 
 
 @st.cache_data(show_spinner="생성 모델 경로 계산 중…", max_entries=8)
-def cached_generated(
+def cached_generated(  # noqa: PLR0913 - every input of the cached result
     key: Key,
     base: portfolio.Currency,
     days: int,
@@ -4229,11 +4456,14 @@ def cached_generated(
     _gen: generative.Generator,
     _j: portfolio.Joint,
     _history: pd.DataFrame | None,
+    drift: float = 0.0,
 ) -> portfolio.Simulation:
     """``cached_paths`` for a generator; ``key`` stands for it, ``_j`` and history."""
     del key
+    if args.demo:
+        return demo_results.simulation(value, days, drift)
     daily = pf_generated(_gen, _j, base, days, _history)
-    return portfolio.simulation(portfolio.path_growth(daily), value, *standing)
+    return portfolio.simulation(portfolio.path_growth(daily), value, *standing, drift)
 
 
 def pf_paths(  # noqa: PLR0913 - the section's inputs
@@ -4245,15 +4475,18 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
     gen: generative.Generator | None,
     adjusted: pd.DataFrame,
     warns: list[str],
+    drift: PfDrift | None = None,
 ) -> None:
     """Monte Carlo of today's weights; the draws are shared across weights.
 
     ``key`` stands for ``j`` and ``s.rets``; ``vol`` is the filter under FHS,
     None for plain resampling; ``gen`` the generator drawing the paths
     instead, its recent returns from ``adjusted``; ``warns`` the "!" lines
-    for the first heading.
+    for the first heading; ``drift`` the expected returns, None for zero.
     """
     base, held = s.base, s.rets
+    today = 0.0 if drift is None else float(drift.daily[-1])
+    assumed = PF_ZERO_DRIFT if drift is None else drift.note
     label = state.get("pf_horizon") or "1M"  # 전망 기간, in the top row
     days = portfolio.HORIZONS[label]
     standing = portfolio.standing(held)
@@ -4272,8 +4505,9 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
             gen,
             j,
             history if len(history) else None,
+            today,
         )
-        method = pf_gen_note(gen, base, j, len(history) > 0)
+        method = pf_gen_note(gen, base, j, len(history) > 0, assumed)
     else:
         f = None if vol is None else vol.f
         block = 1 if vol else portfolio.mean_block(j)  # residuals: independent days
@@ -4281,7 +4515,14 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
         picks = cached_draws(state.get("pf_prices_stamp", ()), n, days, block)
         chosen = () if vol is None else vol.key
         sim = cached_paths(
-            (*key, days, block, *chosen), f is not None, value, standing, j, picks, _f=f
+            (*key, days, block, *chosen),
+            f is not None,
+            value,
+            standing,
+            j,
+            picks,
+            _f=f,
+            drift=today,
         )
         first = cast("pd.Timestamp", j.window.index[0]).date()
         last = cast("pd.Timestamp", j.window.index[-1]).date()
@@ -4291,12 +4532,16 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
             else "같은 날 잔차의 하루 단위"
         )
         method = (
-            f"평균 수익 0 가정 · 과거 {n}거래일({first}–{last}) {drawn} 재표본"
+            f"{assumed} · 과거 {n}거래일({first}–{last}) {drawn} 재표본"
             f"(경로 {portfolio.PATHS:,}개) · 지금 비중 매일 재조정"
             + (f" · {pf_fhs_note(vol)}" if vol else "")
         )
     with st.container(border=True):
-        headed(f"**하락·상승 경로 비율** · {label}", pf_reach_help(sim.paths), warns)
+        headed(
+            f"**하락·상승 경로 비율** · {label}",
+            pf_reach_help(sim.paths, assumed),
+            warns,
+        )
         st.altair_chart(pf_reach_chart(sim.paths), alt="하락·상승")
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
@@ -4538,6 +4783,34 @@ def pf_tail(
     pf_tails(t, j, value, s.base)
 
 
+PF_DRIFTS = {"zero": "0", "capm": "시장 기대"}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PfDrift:
+    """CAPM daily expected returns on the joint's days, their note and key."""
+
+    daily: NDArray[np.float64]
+    note: str
+    key: tuple[int, str]  # the risk-free rates' (``pf_rates_key``)
+
+
+def pf_drift(
+    j: portfolio.Joint, base: portfolio.Currency, prices: portfolio.Prices
+) -> PfDrift:
+    rates, source, quote = pf_rates(base, prices.close)
+    rf = portfolio.risk_free(rates, pd.DatetimeIndex(j.full.index), quote)
+    daily = portfolio.expected_returns(j, rf)
+    annual = (1 + daily[-1]) ** portfolio.per_year(j.full.index) - 1
+    rate = f"무위험수익률 {source}" if not rates.empty else "무위험수익률 0"
+    return PfDrift(
+        daily,
+        f"기대수익 연 {annual:.1%}(CAPM: {rate} + 베타 × 위험프리미엄 연"
+        f" {portfolio.ERP:.0%})",
+        pf_rates_key(rates),
+    )
+
+
 def pf_outlook(s: Subject, prices: portfolio.Prices, months: int) -> None:
     found = pf_risk_inputs(s, prices, months)
     if found is None:
@@ -4557,14 +4830,34 @@ def pf_outlook(s: Subject, prices: portfolio.Prices, months: int) -> None:
         )
         # the filter only for FHS, its controls next to the toggle
         vol = pf_vol(key, s, prices, j, inline=True) if fhs else None
+        expected = st.segmented_control(
+            "기대수익",
+            list(PF_DRIFTS),
+            format_func=PF_DRIFTS.__getitem__,
+            default="zero",
+            required=True,
+            key="pf_drift",
+            help="**정의** 경로에 더하는 기대수익 · 0: 평균 수익 0 · 시장 기대:"
+            " 무위험수익률 + 포트폴리오 베타(S&P 500, 추정 기간) × 위험프리미엄"
+            f" 연 {portfolio.ERP:.0%}(CAPM)",
+        )
         pf_blocked_generators(gens)
-    pf_paths(key, j, value, s, vol, gen, gens.adjusted, warns)
+    drift = pf_drift(j, s.base, prices) if expected == "capm" else None
+    pf_paths(key, j, value, s, vol, gen, gens.adjusted, warns, drift)
     if gen is not None:  # a generator drew the paths: no density check
         return
     f = None if vol is None else vol.f
     chosen = ("resample",) if vol is None else ("fhs", *vol.key)
+    if drift is not None:
+        chosen = (*chosen, "capm", *drift.key)
     with st.container(border=True):
-        pf_density(cached_density((*key, "density", *chosen), j, f), fhs=fhs)
+        pf_density(
+            cached_density(
+                (*key, "density", *chosen), j, f, None if drift is None else drift.daily
+            ),
+            fhs=fhs,
+            capm=drift is not None,
+        )
 
 
 # ---- stress
@@ -6455,7 +6748,6 @@ def schedule() -> None:
 
 def screen_help(name: str, c: screen.Criteria) -> str:
     """The data line's tooltip, as the criteria in force set it."""
-    years = screen.SEC_YEARS
     liquidity = c.kept(
         {
             "min_bars": f"일봉 {c.min_bars}개 미만",
@@ -6466,21 +6758,25 @@ def screen_help(name: str, c: screen.Criteria) -> str:
     checks = c.kept(screen.DQ_NAMES)
     hold = c.kept(
         {
-            "peak": "정점 이익",
-            "tailwind": f"업황 순풍(TTM 영업이익률 ≥ {years}년 중앙값 ×"
-            f" {c.tailwind_ratio:g} 그리고 ≥ 중앙값 + {c.tailwind_gap * 100:g}%p)",
+            "peak": f"정점 이익(TTM 영업이익률 ≥ 10년 중앙값 × {c.peak_ratio:g} 그리고"
+            f" 선행 EPS ≤ 후행 × {c.peak_eps_ratio:g})",
+            "tailwind": f"업황 순풍(z ≥ {c.tailwind_z:g} 그리고 TTM − 10년 중앙값 ≥"
+            f" {c.tailwind_gap * 100:g}%p)",
         }
     )
     rules = [
         f"유동성 제외: {' · '.join(liquidity.values())}" if liquidity else "",
+        f"비교 업종 {c.peer_min}종목 이상",
         *screen.chart_rules(c),
         f"퀄리티·밸류에이션 경계: 업종 백분위 {c.split:.0%}",
         f"결격 {len(checks)}개: {'·'.join(checks.values())}" if checks else "",
-        f"은행 TCE/TA {screen.percent(c.bank_tce_floor)}" if c.on("dq_fcf") else "",
+        f"은행 TCE/TA {screen.percent(c.bank_tce_floor)}" if c.on("dq_cash") else "",
         f"보류: {' · '.join(hold.values())}" if hold else "",
-        f"{years}년 중앙값: SEC 10-K, {years}년 미만이거나 SEC_USER_AGENT 없음이면"
-        f" 야후(약 4년, {screen.MARGIN_YEARS}년 이상)",
+        f"10년 영업이익률·누적 FCF·이자비용 교차 확인: SEC 10-K, 없거나"
+        f" SEC_USER_AGENT 없음이면 야후(약 4년) · 5년 중앙값: SEC {screen.SEC_YEARS}년,"
+        f" 없으면 야후 {screen.MARGIN_YEARS}년 이상",
         "SEC 중앙값 종목의 TTM: SEC 분기 4개, 없으면 야후",
+        f"정의 기준일 {screen.DEFINITIONS}",
     ]
     return (
         f"**정의** {name} 구성 종목의 유동성·결격·기술 점수·퀄리티·밸류에이션"
@@ -6492,7 +6788,7 @@ def screen_help(name: str, c: screen.Criteria) -> str:
 def screening() -> None:
     key = state.setdefault("screen_universe", "sp500") or "sp500"
     universe = screen.UNIVERSES[key]
-    criteria = crit_state()
+    criteria = saved_criteria()
     st.segmented_control(
         "유니버스",
         list(screen.UNIVERSES),
@@ -6505,18 +6801,27 @@ def screening() -> None:
         resolve_settings(args.settings).parent / screen.SNAPSHOT_DIR / universe.folder
     )
     screen_bar(
-        screen_updater(str(root), key), root, screen_help(universe.name, criteria)
+        screen_updater(str(root), key),
+        root,
+        screen_help(universe.name, criteria),
+        criteria,
     )
-    criteria_panel(criteria)
+    if changed := screen.changed(criteria):
+        st.caption(
+            f"스크리닝 기준 {len(changed)}개를 기본값에서 바꿔 적용 중입니다"
+            " · 상단 설정에서 바꿀 수 있습니다"
+        )
     try:
-        table = screen_table(str(root), screen.stamp(root), criteria)
+        stamp = screen.stamp(root)
+        table = screen_table(str(root), stamp, criteria)
+        crash = screen_crash(str(root), stamp)
     except (OSError, ValueError, KeyError) as error:
         st.error(f"`{screen.SNAPSHOT_DIR}/`의 파일을 읽지 못했습니다: {error}")
         return
     if table is None:
         st.info("아직 받은 데이터가 없습니다.")
         return
-    screen_results(root, table, criteria)
+    screen_results(root, table, criteria, crash)
 
 
 def portfolio_page() -> None:
@@ -6595,6 +6900,7 @@ if not args.demo:
 if open_settings:
     for v in data.views:
         state[f"view_{v.id}"] = v.id in data.deep
+    seed_criteria()
     settings_dialog(data)
 
 page = st.navigation(

@@ -132,7 +132,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     url = f"http://{HOST}:{args.port}/"
     print(f"FinAgent {__version__}: {url}  (종료: Ctrl+C)")  # noqa: T201
-    print(f"보기 설정: {settings_path}")  # noqa: T201
+    if not args.demo or args.settings is not None:
+        print(f"보기 설정: {settings_path}")  # noqa: T201
     command = streamlit_args(args, settings_path)
     streamlit_cli.main(command, prog_name="streamlit", standalone_mode=False)
     return 0
@@ -140,7 +141,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def streamlit_args(args: Options, settings_path: Path) -> list[str]:
     """``streamlit run`` arguments: local only, no telemetry, no prompts."""
-    script = [f"--settings={settings_path}"]
+    # The demo makes its own settings and data unless given a file.
+    own = args.demo and args.settings is None
+    script = [] if own else [f"--settings={settings_path}"]
     if args.demo:
         script.append("--demo")
     if args.env_file is not None:
