@@ -69,7 +69,7 @@ def test_unreadable_file_falls_back_to_the_default(tmp_path: Path) -> None:
 
 def test_screening_criteria_are_saved_and_kept_by_other_saves(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
-    choice = ScreenChoice({"split": 0.6, "min_bars": 300}, ("q_roe", "o_rsi"))
+    choice = ScreenChoice(("q_roe", "dq_altman"))
 
     save_screen(path, choice)
     assert load_screen(path) == choice

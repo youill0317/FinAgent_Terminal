@@ -44,13 +44,11 @@ class TrainingChoice:
 
 @dataclass(frozen=True, slots=True)
 class ScreenChoice:
-    """The 스크리닝 기준 that differ from the defaults.
+    """The 스크리닝 기준 switches flipped from their defaults.
 
-    ``values`` are numbers by ``screen.Criteria`` field and ``off`` the ids
-    turned off; ``screen.criteria`` checks names and ranges.
+    ``off`` holds the ids; ``screen.criteria`` drops unknown ones.
     """
 
-    values: dict[str, float] = field(default_factory=dict)
     off: tuple[str, ...] = ()
 
 
@@ -115,28 +113,16 @@ def load_training(path: Path) -> TrainingChoice | None:
 
 
 def load_screen(path: Path) -> ScreenChoice:
-    """The saved screening criteria; numbers and ids of other types are dropped."""
+    """The saved screening switches; ids of other types are dropped."""
     raw = _read(path).get("screen")
     if not isinstance(raw, dict):
         return ScreenChoice()
-    section = cast("dict[str, object]", raw)
-    values = section.get("values")
-    off = section.get("off")
-    numbers: dict[str, float] = {}
-    if isinstance(values, dict):
-        numbers = {
-            key: value
-            for key, value in cast("dict[object, object]", values).items()
-            if isinstance(key, str)
-            and isinstance(value, int | float)
-            and not isinstance(value, bool)
-        }
-    ids = (
+    off = cast("dict[str, object]", raw).get("off")
+    if not isinstance(off, list):
+        return ScreenChoice()
+    return ScreenChoice(
         tuple(v for v in cast("list[object]", off) if isinstance(v, str))
-        if isinstance(off, list)
-        else ()
     )
-    return ScreenChoice(numbers, ids)
 
 
 def save_view(path: Path, deep: frozenset[str]) -> None:
@@ -187,8 +173,8 @@ def save_screen(path: Path, choice: ScreenChoice) -> None:
     ordered = [item.id for item in catalog.VIEWS if item.id in view]
     body: dict[str, object] = {"version": SETTINGS_VERSION, "deep": ordered}
     body = _kept(body, path, "analysis", "training")
-    if choice.values or choice.off:
-        body["screen"] = {"values": dict(choice.values), "off": list(choice.off)}
+    if choice.off:
+        body["screen"] = {"off": list(choice.off)}
     _write(path, body)
 
 

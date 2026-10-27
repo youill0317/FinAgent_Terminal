@@ -206,43 +206,37 @@ class DemoSource:
             screen.FUNDAMENTAL_COLUMNS[1:-1], math.nan
         )
         row |= {
-            "fcf": fcf,
-            "ocf": fcf + 1e9,
-            "roe": roe,
-            "book_value": 20.0,
-            "trailing_eps": 2 + 10 * roe,
-            "total_debt": 2e9,
-            "total_cash": 1e9,
-            "ebitda": 3e9,
-            "nd_ebitda": 1 / 3,
-            "ev": 6.1e10,
             "mcap": 6e10,
-            "ev_ebitda": 20.3,
-            "short_pct": 0.02,
-            "revenue": 110.0,
-            "revenue_prior": 100.0,
-            "rev_growth": 0.10,
-            "rev_year": "2025-12-31",
             "margin_avg": 0.15,
             "margin_years": 5,
             "op_margin": 0.15,
-            "revenue_ttm": 1e10,
-            "gross_profit": roe * 2e10,
-            "op_income_ttm": roe * 1e10,
-            "ebit": roe * 1e10,
-            "interest": 1e8,
-            "net_income": roe * 5e9,
-            "wc_change": 0.0,
-            "total_assets": 5e10,
-            **{f"fcf_y{year}": fcf for year in range(3)},
-            **{f"gpa_y{year}": roe / 5 - 0.002 * year for year in range(4)},
+            "fy_end": "2025-12-31",
             "last_fy_end": "2025-12-31",
             "next_fy_end": "2026-12-31",
             "currency": "USD",
         }
+        for year, grown in ((0, 1.0), (1, 0.95)):
+            row |= {
+                f"ni_{year}": roe * 5e9 * grown,
+                f"sales_{year}": 1e10 * grown,
+                f"ocf_{year}": (fcf + 1e9) * grown,
+                f"ta_{year}": 5e10 * grown,
+                f"ca_{year}": 1.5e10 * grown,
+                f"cl_{year}": 1e10 * grown,
+                f"cash_sti_{year}": 4e9 * grown,
+                f"sti_{year}": 1e9 * grown,
+                f"std_{year}": 5e8,
+                f"ltd_{year}": 1.5e9,
+                f"tl_{year}": 4.5e10 * grown,
+                f"pref_{year}": 0.0,
+                f"inv_adv_{year}": 2e9,
+            }
         if sector == "Financials":
-            row |= {"eq_ratio": 0.08, "tce_ratio": 0.06, "tbv": 4e10, "shares": 1e9}
-            row |= {"ocf": math.nan, "ebitda": math.nan, "nd_ebitda": math.nan}
+            row |= {
+                f"{stem}_{year}": math.nan
+                for stem in ("ca", "cl", "ocf")
+                for year in (0, 1)
+            }
         return row
 
     def estimates(self, ticker: str) -> Mapping[str, object]:

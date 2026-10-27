@@ -1175,40 +1175,11 @@ def screen_updater(root: str, universe: str) -> screen.Updater:
 
 @st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=2)
 def screen_prepared(
-    root: str, stamp: tuple[tuple[str, int], ...], windows: screen.Criteria
+    root: str, stamp: tuple[tuple[str, int], ...]
 ) -> pd.DataFrame | None:
-    """The stored files with indicators; ``stamp`` changes whenever one does.
-
-    ``windows`` (``screen.windows``) keeps the other rules from recomputing it.
-    """
+    """The stored files with indicators; ``stamp`` changes whenever one does."""
     inputs = screen.load(Path(root)) if stamp else None
-    return None if inputs is None else screen.prepare(inputs, windows)
-
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def screen_crash(
-    root: str, stamp: tuple[tuple[str, int], ...], windows: screen.Criteria
-) -> screen.Crash:
-    """The momentum crash notice from the stored prices."""
-    inputs = screen.load(Path(root)) if stamp else None
-    if inputs is None:
-        return screen.Crash()
-    prices = inputs.prices
-    listed = cast("pd.Series", prices["ticker"]).isin(inputs.universe["ticker"])
-    return screen.momentum_crash(
-        cast("pd.DataFrame", prices[listed]), inputs.fundamentals, windows
-    )
-
-
-@st.cache_data(show_spinner=False, max_entries=2)
-def screen_check(
-    root: str, stamp: tuple[tuple[str, int], ...], snapshots: tuple[str, ...]
-) -> pd.DataFrame:
-    """The snapshots' forward returns by cell; ``stamp`` and ``snapshots`` key it."""
-    path = Path(root)
-    if not stamp or not snapshots:
-        return pd.DataFrame(columns=[column for column, _, _ in screen.CHECK_TABLE])
-    return screen.check_summary(screen.snapshot_check(path, screen.read_prices(path)))
+    return None if inputs is None else screen.prepare(inputs)
 
 
 @st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=8)
@@ -1216,25 +1187,18 @@ def screen_table(
     root: str, stamp: tuple[tuple[str, int], ...], criteria: screen.Criteria
 ) -> pd.DataFrame | None:
     """The table screened by ``criteria``; only a changed rule recomputes it."""
-    prepared = screen_prepared(root, stamp, screen.windows(criteria))
+    prepared = screen_prepared(root, stamp)
     return None if prepared is None else screen.judge(prepared, criteria)
 
 
-def crit_values(c: screen.Criteria) -> dict[str, bool | float]:
-    """The 기준 widgets' values for ``c``: a switch per rule, a number per limit."""
-    out: dict[str, bool | float] = {}
-    for rule in screen.RULES:
-        if rule.toggle:
-            out[f"crit_on_{rule.key}"] = c.on(rule.key)
-        for limit in rule.limits:
-            out[f"crit_{limit.field}"] = limit.shown(getattr(c, limit.field))
-    return out
+def crit_values(c: screen.Criteria) -> dict[str, bool]:
+    """The 기준 widgets' values for ``c``: a switch per rule."""
+    return {f"crit_on_{rule.key}": c.on(rule.key) for rule in screen.RULES}
 
 
 def saved_criteria() -> screen.Criteria:
     """The criteria in the settings file: the ones the screening page uses."""
-    saved = load_screen(resolve_settings(args.settings))
-    return screen.criteria(saved.values, saved.off)
+    return screen.criteria(load_screen(resolve_settings(args.settings)).off)
 
 
 def seed_criteria() -> None:
@@ -1245,18 +1209,15 @@ def seed_criteria() -> None:
 
 def crit_draft() -> screen.Criteria:
     """The criteria the 스크리닝 기준 widgets hold, applied by 적용."""
-    values = {
-        limit.field: limit.stored(state[f"crit_{limit.field}"])
-        for rule in screen.RULES
-        for limit in rule.limits
-    }
-    off = [r.key for r in screen.RULES if r.toggle and not state[f"crit_on_{r.key}"]]
-    return screen.criteria(values, off)
+    return screen.criteria(
+        r.key
+        for r in screen.RULES
+        if state[f"crit_on_{r.key}"] != screen.DEFAULT.on(r.key)
+    )
 
 
 def save_criteria() -> None:
-    values, off = screen.saved(crit_draft())
-    choice = ScreenChoice(values, off)
+    choice = ScreenChoice(tuple(screen.changed(crit_draft())))
     path = resolve_settings(args.settings)
     if load_screen(path) == choice:
         return
@@ -1271,39 +1232,6 @@ def reset_criteria() -> None:
         state[key] = value
 
 
-def crit_number(limit: screen.Limit, *, disabled: bool) -> None:
-    """A limit's number with its label beside it; the fixed width lines them up."""
-    with st.container(
-        horizontal=True, vertical_alignment="center", gap="xsmall", width="content"
-    ):
-        st.caption(limit.label, width=170)
-        if limit.whole:
-            st.number_input(
-                limit.label,
-                min_value=int(limit.low),
-                max_value=int(limit.high),
-                step=int(limit.step),
-                format="%d",
-                key=f"crit_{limit.field}",
-                disabled=disabled,
-                label_visibility="collapsed",
-                width=110,
-            )
-            return
-        digits = len(f"{limit.step:g}".partition(".")[2])
-        st.number_input(
-            limit.label,
-            min_value=float(limit.low),
-            max_value=float(limit.high),
-            step=float(limit.step),
-            format=f"%.{digits}f",
-            key=f"crit_{limit.field}",
-            disabled=disabled,
-            label_visibility="collapsed",
-            width=110,
-        )
-
-
 def crit_switch(rule: screen.Rule, *, changed: bool) -> None:
     with st.container(horizontal=True, vertical_alignment="center", width="content"):
         st.checkbox(
@@ -1315,41 +1243,8 @@ def crit_switch(rule: screen.Rule, *, changed: bool) -> None:
             st.badge("변경", color="blue")
 
 
-def crit_row(rule: screen.Rule, *, changed: bool) -> None:
-    """A rule with numbers: its switch (or name), the numbers and a 변경 mark.
-
-    The numbers stack beside the name rather than wrap under it.
-    """
-    with st.container(horizontal=True, vertical_alignment="top"):
-        if rule.toggle:
-            st.checkbox(
-                rule.name,
-                key=f"crit_on_{rule.key}",
-                help=rule.help,
-                width=180,
-            )
-        else:
-            st.markdown(f":small[{rule.name}]", help=rule.help, width=180)
-        off = rule.toggle and not state[f"crit_on_{rule.key}"]
-        with st.container(gap="xsmall", width="content"):
-            for limit in rule.limits:
-                crit_number(limit, disabled=off)
-        if changed:
-            st.badge("변경", color="blue")
-
-
-def crit_lines(parts: dict[str, list[screen.Rule]]) -> int:
-    """About how many lines a section of the panel takes, to balance the columns."""
-    return 1 + sum(
-        bool(part)
-        + any(not r.limits for r in rules)
-        + sum(len(r.limits) for r in rules)
-        for part, rules in parts.items()
-    )
-
-
 def criteria_panel() -> None:
-    """The 스크리닝 기준 tab of 설정: every rule by section, with a reset."""
+    """The 스크리닝 기준 tab of 설정: every switch by section, with a reset."""
     changed = set(screen.changed(crit_draft()))
     with st.container(horizontal=True, vertical_alignment="center"):
         st.button(
@@ -1361,30 +1256,21 @@ def criteria_panel() -> None:
         )
         if changed:
             st.caption(f"기본값에서 {len(changed)}개 변경 · 적용을 눌러야 반영")
-    sections: dict[str, dict[str, list[screen.Rule]]] = {}
+    sections: dict[str, list[screen.Rule]] = {}
     for rule in screen.RULES:
-        sections.setdefault(rule.section, {}).setdefault(rule.part, []).append(rule)
+        sections.setdefault(rule.section, []).append(rule)
     # Sections in order down two columns, split where the heights come closest.
-    lines = [crit_lines(parts) for parts in sections.values()]
+    lines = [1 + len(rules) for rules in sections.values()]
     split = min(
         range(len(lines) + 1),
         key=lambda k: abs(sum(lines[:k]) - sum(lines[k:])),
     )
     columns = st.columns(2)
-    for n, (title, parts) in enumerate(sections.items()):
+    for n, (title, rules) in enumerate(sections.items()):
         with columns[n >= split], st.container(border=True):
             st.markdown(f"**{title}**")
-            for part, rules in parts.items():
-                if part:
-                    st.caption(part)
-                switches = [rule for rule in rules if not rule.limits]
-                if switches:
-                    with st.container(horizontal=True):
-                        for rule in switches:
-                            crit_switch(rule, changed=rule.key in changed)
-                for rule in rules:
-                    if rule.limits:
-                        crit_row(rule, changed=rule.key in changed)
+            for rule in rules:
+                crit_switch(rule, changed=rule.key in changed)
 
 
 def parts_line(parts: screen.Parts) -> str:
@@ -1472,13 +1358,6 @@ def stock_chart(points: list[dict[str, str | float]]) -> alt.Chart:
     )
 
 
-def check_lines(lines: list[tuple[bool, str, str]]) -> str:
-    return "  \n".join(
-        display.md(f"{'✓' if ok else '✗'} {label} · :gray[{detail}]")
-        for ok, label, detail in lines
-    )
-
-
 def status_lines(lines: list[tuple[str, str, str]]) -> str:
     return "  \n".join(
         display.md(f"**{result or '—'}** {test} · :gray[{detail}]")
@@ -1489,64 +1368,38 @@ def status_lines(lines: list[tuple[str, str, str]]) -> str:
 def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
     fmt = screen.fmt
     st.caption(
-        f"{row['sector']} · {row['industry']} · 비교 업종"
-        f" {row['peer']} ({screen.peer_level(row)}, {fmt('int', row['peer_n'])}종목)"
-        " · 재무 통화"
-        f" {row['currency'] or '—'}"
+        f"{row['sector']} · {row['industry']} · 재무 통화 {row['currency'] or '—'}"
     )
     with st.container(horizontal=True, key="screen_stock_cards"):
         st.metric("주가", fmt("usd", row["price"]), border=True, height="stretch")
         st.metric("시가총액", fmt("big", row["mcap"]), border=True, height="stretch")
         st.metric(
-            "기술 점수",
-            f"{fmt('int', row['score'])}/100 {row['chart']}",
-            help=screen.score_help(c),
-            border=True,
-            height="stretch",
-        )
-        st.metric(
-            "52주 고점 대비",
-            fmt("signed", row["from_high"]),
-            help=screen.FROM_HIGH_HELP,
-            border=True,
-            height="stretch",
-        )
-        st.metric(
-            "칸",
-            screen.GROUP_NAMES.get(str(row.get("group")), "—"),
-            help=screen.group_help(c),
-            border=True,
-            height="stretch",
-        )
-        st.metric(
             "퀄리티",
-            fmt("rank", row.get("quality")),
+            fmt("z", row.get("quality")),
             help=screen.quality_help(c),
             border=True,
             height="stretch",
         )
         st.metric(
-            "밸류에이션",
-            fmt("rank", row.get("valuation")),
-            help=screen.valuation_help(c),
+            "밸류",
+            fmt("z", row.get("value")),
+            help=screen.value_help(c),
             border=True,
             height="stretch",
         )
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
-        headed("**기술 점수**", display.md(screen.tech_basis(c)))
-        st.markdown(status_lines(screen.tech_lines(row, c)))
-        headed("**단기 급등**", screen.surge_help(c))
-        st.markdown(check_lines(screen.surge_lines(row, c)))
+        headed("**가격 지표**", "퀄리티·밸류 계산에 쓰지 않음")
+        st.markdown(status_lines(screen.tech_lines(row)))
+        headed("**영업이익률**", "퀄리티·밸류 계산에 쓰지 않음")
+        st.caption(display.md(screen.margin_line(row)))
     with right, st.container(border=True, height="stretch"):
-        headed("**결격 점검**", screen.dq_help(c))
-        st.markdown(status_lines(screen.dq_lines(row, c)))
         universe = screen.UNIVERSES[state.get("screen_universe") or "sp500"]
         headed(
-            "**퀄리티·밸류에이션**",
-            f"{screen.labels_help(c)} · 비교 범위 {universe.name} 구성 종목",
+            "**퀄리티·밸류**",
+            f"{screen.basis_note()} · 유니버스 {universe.name} 구성 종목",
         )
-        st.markdown(status_lines(screen.label_lines(row, c)))
+        st.markdown(status_lines(screen.measure_lines(row, c)))
         headed(
             f"**EPS 추정치** :gray[{row['est_currency'] or '—'}]",
             screen.ESTIMATE_HELP,
@@ -1573,126 +1426,42 @@ def open_stock(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
     st.dialog(title, width="large", on_dismiss="rerun")(stock_body)(root, row, c)
 
 
-MAP_COLORS = {"기술 점수": "band", "추정치 방향": "est", "없음": ""}
-MAP_LEGENDS = {
-    "band": (
-        "기술 점수",
-        list(screen.CHART_ORDER),
-        [display.UP_COLOR, "gray", display.DOWN_COLOR, "lightgray"],
-    ),
-    "est": (
-        "FY1 추정치",
-        list(screen.EST_ORDER),
-        [display.UP_COLOR, "gray", display.DOWN_COLOR, "lightgray"],
-    ),
-}
-MAP_NO_LABEL = "없음"
-MAP_LABELS = [
-    MAP_NO_LABEL,
-    screen.TAGS["weak_trend"],
-    *(name for key, name in screen.TAGS.items() if key != "weak_trend"),
-]
-JITTER = 0.006  # of the axis: where points sit, not their values
+JITTER = 0.02  # in Z-score units: where points sit, not their values
 
 
-def map_points(
-    points: list[dict[str, object]], current: str, label: str, *, held: bool
-) -> list[dict[str, object]]:
-    """The map's points: held ones only when ``held``, each lit or dimmed.
+def map_points(points: list[dict[str, object]]) -> list[dict[str, object]]:
+    """The map's points, a fixed hash-driven nudge off their values.
 
-    A point is lit when it is in the chosen cell (any, for 전체) and carries
-    ``label`` (any, for 없음). ``x`` and ``y`` sit a fixed hash-driven nudge
-    off the values, so overlapping points part without changing them.
+    Overlapping points part without changing them.
     """
     shown: list[dict[str, object]] = []
     for point in points:
-        if point["held"] and not held:
-            continue
-        in_cell = current == "all" or point["group"] == current
-        tagged = label == MAP_NO_LABEL or label in cast("list[str]", point["labels"])
         seed = sum(ord(ch) for ch in str(point["ticker"]))
         nudge = ((seed % 7) - 3) / 3 * JITTER, ((seed % 5) - 2) / 2 * JITTER
         shown.append(
             point
             | {
-                "lit": in_cell and tagged,
-                "x": float(cast("float", point["valuation"])) + nudge[0],
+                "x": float(cast("float", point["value"])) + nudge[0],
                 "y": float(cast("float", point["quality"])) + nudge[1],
             }
         )
     return shown
 
 
-def map_guides(split: float, band: float) -> list[alt.Chart]:
-    """The split crosshair, the 경계 근처 band and lines of equal 통합 점수."""
-    rule = alt.Chart(alt.Data(values=[{"v": split}])).mark_rule(
-        strokeDash=[2, 3], color="gray"
-    )
-    strip = alt.Chart(
-        alt.Data(values=[{"low": max(split - band, 0), "high": min(split + band, 1)}])
-    ).mark_rect(color="gray", opacity=0.08)
-    diagonals = [
-        {"k": k, "x": x, "y": x + k}
-        for k in (-0.5, 0.0, 0.5)
-        for x in (max(0.0, -k), min(1.0, 1 - k))
-    ]
-    iso = (
-        alt.Chart(alt.Data(values=diagonals))
-        .mark_line(color="gray", opacity=0.25, strokeDash=[1, 3])
-        .encode(x="x:Q", y="y:Q", detail="k:N")
-    )
-    guides: list[alt.Chart] = [
-        strip.encode(x="low:Q", x2="high:Q"),
-        strip.encode(y="low:Q", y2="high:Q"),
-        iso,
-        rule.encode(x="v:Q"),
-        rule.encode(y="v:Q"),
-    ]
-    return guides
-
-
-def map_chart(  # noqa: PLR0913 - the map's four toggles
-    points: list[dict[str, object]],
-    current: str,
-    c: screen.Criteria,
-    color: str,
-    label: str,
-    *,
-    held: bool,
-    guides: bool,
-) -> alt.LayerChart:
-    """밸류에이션 against 퀄리티, colored as ``color`` picks; held stocks hollow.
-
-    Points outside the chosen cell or without ``label`` are dimmed; the chart
-    takes no clicks.
-    """
-    field = MAP_COLORS[color]
-    if field:
-        title, domain, colors = MAP_LEGENDS[field]
-        paint = alt.Color(
-            f"{field}:N",
-            title=title,
-            scale=alt.Scale(domain=domain, range=colors),
-            # One line above the plot at its right end, to leave the plot room.
-            legend=alt.Legend(orient="top", direction="horizontal", titleOrient="left"),
-        )
-    else:
-        paint = alt.Color("held:N", legend=None, scale=alt.Scale(range=["steelblue"]))
-    share = alt.Axis(format=".0%")
-    base = alt.Chart(alt.Data(values=map_points(points, current, label, held=held)))
-
-    def dots(chart: alt.Chart) -> alt.Chart:
-        return chart.encode(
-            x=alt.X(
-                "x:Q", title="밸류에이션", scale=alt.Scale(domain=[0, 1]), axis=share
-            ),
+def map_chart(points: list[dict[str, object]], *, guides: bool) -> alt.LayerChart:
+    """밸류 against 퀄리티, both Z-scores; the chart takes no clicks."""
+    limit = [-screen.Z_LIMIT, screen.Z_LIMIT]
+    dots = (
+        alt.Chart(alt.Data(values=map_points(points)))
+        .mark_circle(size=40, opacity=0.6)
+        .encode(
+            x=alt.X("x:Q", title="밸류 (높을수록 쌈)", scale=alt.Scale(domain=limit)),
             y=alt.Y(
                 "y:Q",
                 title="퀄리티",
-                scale=alt.Scale(domain=[0, 1]),
+                scale=alt.Scale(domain=limit),
                 # Level, above the axis at its top left, not turned on its side.
                 axis=alt.Axis(
-                    format=".0%",
                     titleAngle=0,
                     titleAlign="left",
                     titleAnchor="end",
@@ -1701,93 +1470,45 @@ def map_chart(  # noqa: PLR0913 - the map's four toggles
                     titleY=-8,
                 ),
             ),
-            color=paint,
-            opacity=alt.condition(alt.datum.lit, alt.value(0.75), alt.value(0.12)),
             tooltip=[
                 alt.Tooltip("ticker:N", title="티커"),
                 alt.Tooltip("name:N", title="종목"),
-                alt.Tooltip("cell:N", title="칸"),
-                alt.Tooltip("quality:Q", title="퀄리티", format=".0%"),
-                alt.Tooltip("valuation:Q", title="밸류에이션", format=".0%"),
+                alt.Tooltip("sector:N", title="섹터"),
+                alt.Tooltip("quality:Q", title="퀄리티", format="+.2f"),
+                alt.Tooltip("value:Q", title="밸류", format="+.2f"),
                 alt.Tooltip("counted:N", title="산출 항목 수"),
-                alt.Tooltip("peer:N", title="비교 업종"),
-                alt.Tooltip("score:Q", title="기술 점수", format=".0f"),
-                alt.Tooltip("est:N", title="추정치"),
-                alt.Tooltip("revision:Q", title="수정 강도", format="+.2%"),
-                alt.Tooltip("tags:N", title="라벨"),
             ],
         )
-
-    placed = dots(base.transform_filter(~alt.datum.held).mark_circle(size=40))
-    hollow = dots(
-        base.transform_filter(alt.datum.held).mark_point(size=40, filled=False)
+    )
+    zero = alt.Chart(alt.Data(values=[{"v": 0.0}])).mark_rule(
+        strokeDash=[2, 3], color="gray"
     )
     layers: list[alt.Chart] = [
-        *(map_guides(c.split, c.near_band) if guides else []),
-        placed,
-        hollow,
+        *([zero.encode(x="v:Q"), zero.encode(y="v:Q")] if guides else []),
+        dots,
     ]
-    return (
-        alt.LayerChart(layer=layers)
-        .properties(height=2 * CHART_HEIGHT)
-        .configure_legend(layout=alt.ExprRef("{top: {anchor: 'end'}}"))
-    )
+    return alt.LayerChart(layer=layers).properties(height=2 * CHART_HEIGHT)
 
 
-def group_map(
-    rows: pd.DataFrame, current: str, c: screen.Criteria, crash: screen.Crash
-) -> None:
-    """The stocks as 퀄리티 by 밸류에이션 points with their toggles, boxed."""
+def value_map(rows: pd.DataFrame, c: screen.Criteria) -> None:
+    """The stocks as 퀄리티 by 밸류 points with the guide toggle, boxed."""
     with st.container(border=True):
-        headed("**퀄리티·밸류에이션 분포** · 업종 백분위", screen.group_help(c))
-        with st.container(horizontal=True, vertical_alignment="bottom"):
-            color = st.segmented_control(
-                "색 기준", list(MAP_COLORS), key="map_color", default="기술 점수"
+        with st.container(horizontal=True, vertical_alignment="center"):
+            headed(
+                "**퀄리티·밸류 분포** · z 점수",
+                f"{screen.quality_help(c)}\n\n{screen.value_help(c)}",
             )
-            label = st.selectbox("강조 라벨", MAP_LABELS, key="map_label", width=200)
-            held = st.toggle("보류 종목", value=True, key="map_held")
-            guides = st.toggle("안내선", value=True, key="map_guides")
-        if c.on("crash") and crash.state == screen.CRASH_WATCH:
-            st.warning(
-                "시장이 큰 폭으로 하락한 뒤 변동성이 높은 반등기입니다. 모멘텀 급락"
-                " 위험이 커서 기술 점수(12-1 모멘텀)를 조심해서 보세요 · 시장"
-                f" {c.bear_bars}거래일 {screen.fmt('signed', crash.market_return)}",
-                icon=":material/warning:",
-            )
+            st.space("stretch")
+            guides = st.toggle("평균선", value=True, key="map_guides")
         st.altair_chart(
-            map_chart(
-                screen.map_rows(rows),
-                current,
-                c,
-                color or "없음",
-                label or MAP_NO_LABEL,
-                held=held,
-                guides=guides,
-            ),
-            alt="퀄리티와 밸류에이션 분포",
+            map_chart(screen.map_rows(rows), guides=guides),
+            alt="퀄리티와 밸류 분포",
         )
 
 
-def screen_results(
-    root: Path, table: pd.DataFrame, c: screen.Criteria, crash: screen.Crash
-) -> None:
+def screen_results(root: Path, table: pd.DataFrame, c: screen.Criteria) -> None:
     liquid = screen.liquid(table)
-    chosen: list[str] = state.get("screen_sectors") or []
-    filtered = screen.pick(table, "all", chosen)
-    counts = screen.counts(filtered)
-    state.setdefault("screen_group", "all")
     with st.container(horizontal=True, vertical_alignment="bottom"):
-        picked = st.segmented_control(
-            "칸",
-            ["all", *screen.GROUPS],
-            format_func=lambda key: (
-                f"전체 · {len(filtered)}"
-                if key == "all"
-                else f"{screen.GROUP_NAMES[key]} · {counts[key]}"
-            ),
-            key="screen_group",
-            label_visibility="collapsed",
-        )
         st.space("stretch")
         sectors = st.multiselect(
             "섹터",
@@ -1796,10 +1517,9 @@ def screen_results(
             placeholder="전체 섹터",
             width=320,
         )
-    key = picked or "all"
-    group_map(filtered, key, c, crash)
-    rows = screen.pick(table, key, sectors)
-    shown = screen.view(rows, c)
+    rows = screen.pick(table, sectors)
+    value_map(rows, c)
+    shown = screen.view(rows)
     columns = [c for c, _, _ in screen.TABLE if c in shown.columns]
     formats = {c: partial(screen.fmt, kind) for c, _, kind in screen.TABLE if kind}
     signed = [c for c, _, kind in screen.TABLE if kind == "signed"]
@@ -1835,38 +1555,6 @@ def screen_results(
     for index, column in event.selection.cells:
         if column in {"ticker", "name"}:
             open_stock(root, records[index], c)
-
-
-def snapshot_section(root: Path, stamp: tuple[tuple[str, int], ...]) -> None:
-    """The saved snapshots' cells against the stocks they screened, later."""
-    files = tuple(path.name for path in screen.snapshot_files(root))
-    with st.expander(f"스냅샷 검증 · 스냅샷 {len(files)}개"):
-        try:
-            summary = screen_check(str(root), stamp, files)
-        except (OSError, ValueError, KeyError) as error:
-            st.error(f"스냅샷을 읽지 못했습니다: {error}")
-            return
-        if summary.empty:
-            st.caption(
-                "아직 21거래일이 지난 스냅샷이 없습니다 · 갱신할 때마다 그날의"
-                " 칸 배정이 스냅샷으로 쌓입니다"
-            )
-            return
-        shown = cast("pd.DataFrame", summary[[c for c, _, _ in screen.CHECK_TABLE]])
-        signed = [c for c, _, kind in screen.CHECK_TABLE if kind == "signed"]
-        styled = shown.style.map(return_style, subset=signed).format(
-            {c: partial(screen.fmt, kind) for c, _, kind in screen.CHECK_TABLE if kind}
-        )
-        st.dataframe(
-            styled,
-            hide_index=True,
-            column_config={
-                column: st.column_config.Column(label)
-                for column, label, _ in screen.CHECK_TABLE
-            },
-            alt="스냅샷 검증",
-        )
-        st.caption(screen.CHECK_NOTE)
 
 
 # ---------------------------------------------------------------- portfolio
@@ -6800,41 +6488,19 @@ def schedule() -> None:
 
 def screen_help(name: str, c: screen.Criteria) -> str:
     """The data line's tooltip, as the criteria in force set it."""
-    liquidity = c.kept(
-        {
-            "min_bars": f"일봉 {c.min_bars}개 미만",
-            "min_price": f"주가 ${c.min_price:g} 미만",
-            "illiquid": f"20일 평균 거래대금 하위 {c.illiquid_share:.0%}",
-        }
-    )
-    if c.illiquid_share == 0:
-        _ = liquidity.pop("illiquid", None)
-    checks = c.kept(screen.DQ_NAMES)
-    hold = c.kept(
-        {
-            "peak": f"정점 이익(영업이익률 z ≥ {c.tailwind_z:g} 그리고 TTM − 10년"
-            f" 중앙값 ≥ {c.tailwind_gap * 100:g}%p 그리고 선행 EPS ≤ 후행 ×"
-            f" {c.peak_eps_ratio:g})",
-        }
+    gate = (
+        f"관문: 주가 ${screen.MIN_PRICE:g} 미만 제외"
+        if c.on("min_price")
+        else "관문 없음"
     )
     rules = [
-        f"유동성 제외: {' · '.join(liquidity.values())}" if liquidity else "",
-        f"비교 업종 {c.peer_min}종목 이상",
-        *screen.chart_rules(c),
-        f"퀄리티·밸류에이션 경계: 업종 백분위 {c.split:.0%}",
-        f"결격 {len(checks)}개: {'·'.join(checks.values())}" if checks else "",
-        f"은행 TCE/TA {screen.percent(c.bank_tce_floor)}" if c.on("dq_cash") else "",
-        f"보류: {' · '.join(hold.values())}" if hold else "",
-        f"10년 영업이익률·누적 FCF·이자비용 교차 확인: SEC 10-K, 없거나"
-        f" SEC_USER_AGENT 없음이면 야후(약 4년) · 5년 중앙값: SEC {screen.SEC_YEARS}년,"
-        f" 없으면 야후 {screen.MARGIN_YEARS}년 이상",
-        "SEC 중앙값 종목의 TTM: SEC 분기 4개, 없으면 야후",
-        f"정의 기준일 {screen.DEFINITIONS}",
+        gate,
+        screen.basis_note(),
+        f"정의 기준일 {screen.DEFINITIONS} · 자세한 근거는 docs/screening.md",
     ]
     return (
-        f"**정의** {name} 구성 종목의 유동성·결격·기술 점수·퀄리티·밸류에이션"
-        " 기준 분류\n\n"
-        "**기준** " + " · ".join(rule for rule in rules if rule)
+        f"**정의** {name} 구성 종목의 퀄리티·밸류 z 점수({screen.FTSE})\n\n"
+        "**기준** " + " · ".join(rules)
     )
 
 
@@ -6867,15 +6533,13 @@ def screening() -> None:
     try:
         stamp = screen.stamp(root)
         table = screen_table(str(root), stamp, criteria)
-        crash = screen_crash(str(root), stamp, screen.windows(criteria))
     except (OSError, ValueError, KeyError) as error:
         st.error(f"`{screen.SNAPSHOT_DIR}/`의 파일을 읽지 못했습니다: {error}")
         return
     if table is None:
         st.info("아직 받은 데이터가 없습니다.")
         return
-    screen_results(root, table, criteria, crash)
-    snapshot_section(root, stamp)
+    screen_results(root, table, criteria)
 
 
 def portfolio_page() -> None:
