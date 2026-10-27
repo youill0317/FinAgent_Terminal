@@ -1455,7 +1455,7 @@ def map_chart(points: list[dict[str, object]], *, guides: bool) -> alt.LayerChar
         alt.Chart(alt.Data(values=map_points(points)))
         .mark_circle(size=40, opacity=0.6)
         .encode(
-            x=alt.X("x:Q", title="밸류 (높을수록 쌈)", scale=alt.Scale(domain=limit)),
+            x=alt.X("x:Q", title="밸류", scale=alt.Scale(domain=limit)),
             y=alt.Y(
                 "y:Q",
                 title="퀄리티",
