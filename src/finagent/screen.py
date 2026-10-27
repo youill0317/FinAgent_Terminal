@@ -47,6 +47,7 @@ import math
 import statistics
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -60,6 +61,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import numpy as np
 import pandas as pd
+
+from finagent import sec_pace
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
@@ -116,11 +119,10 @@ ADJUST_TOLERANCE: Final = 0.001  # overlap Adj Close drift that means a refetch
 MARKET_ZONE: Final = ZoneInfo("America/New_York")
 SESSION_SETTLED: Final = clock(17, 0)  # a day's bar is final after this NY time
 CHUNK: Final = 100  # tickers per price download
-PAUSE_SECONDS: Final = 0.2  # between per-ticker calls
+PAUSE_SECONDS: Final = 0.2  # between one worker's per-ticker calls
+YAHOO_WORKERS: Final = 4  # tickers fetched from Yahoo at once
+SEC_WORKERS: Final = 8  # companyfacts downloads at once, started at sec_pace's rate
 RETRY_WAITS: Final = (10.0, 30.0, 60.0)  # after Yahoo answers "too many requests"
-# Seconds after each SEC request, one at a time across updates: with the 13F
-# page's own pace, under SEC's 10 requests a second.
-SEC_PAUSE: Final = 0.3
 SEC_TIMEOUT_SECONDS: Final = 60.0  # companyfacts runs to megabytes
 NOT_FOUND: Final = 404
 REFUSED: Final = frozenset({403, 429})  # SEC's answers to a missing or fast agent
@@ -1900,9 +1902,6 @@ class Yahoo:
             )
 
 
-_SEC_GATE: Final = threading.Lock()  # one SEC request at a time in this process
-
-
 @final
 class Sec:
     """SEC EDGAR with the user's User-Agent; never built without one."""
@@ -1920,13 +1919,11 @@ class Sec:
 
     def _get(self, url: str) -> httpx.Response:
         """One request; ``SecUnavailableError`` when SEC is unreachable or refuses."""
-        with _SEC_GATE:
-            try:
-                response = self._client.get(url)
-            except httpx.TransportError as error:
-                raise SecUnavailableError(f"{type(error).__name__}: {error}") from error
-            finally:
-                self._sleep(SEC_PAUSE)
+        sec_pace.wait(self._sleep)
+        try:
+            response = self._client.get(url)
+        except httpx.TransportError as error:
+            raise SecUnavailableError(f"{type(error).__name__}: {error}") from error
         if response.status_code in REFUSED:
             raise SecUnavailableError(f"HTTP {response.status_code}")
         return response
@@ -2040,13 +2037,17 @@ def update_rows(  # noqa: PLR0913 - one stage's inputs
     stage: str,
     report: Report,
     sleep: Callable[[float], None],
+    *,
+    workers: int = YAHOO_WORKERS,
+    pause: float = PAUSE_SECONDS,
 ) -> int:
     """Fetch the pending tickers into ``path``; returns the failures recorded.
 
     ``fetch`` gives a ticker's rows; none still leaves one, so it counts as
-    fetched. The file is written even when Yahoo or SEC stops the run, so the
-    next update picks up where this one ended. A file without some of
-    ``columns`` is from an older version: its rows are marked failed, so all
+    fetched. ``workers`` tickers are fetched at once, each worker resting
+    ``pause`` after each. The file is written even when Yahoo or SEC stops the
+    run, so the next update picks up where this one ended. A file without some
+    of ``columns`` is from an older version: its rows are marked failed, so all
     are fetched again.
     """
     existing = _read_csv(path, columns)
@@ -2054,23 +2055,36 @@ def update_rows(  # noqa: PLR0913 - one stage's inputs
     if missing:
         existing["error"] = f"옛 형식 ({', '.join(missing)} 없음)"
     todo = pending(existing, tickers)
-    rows: list[dict[str, object]] = []
+
+    def one(ticker: str) -> list[dict[str, object]]:
+        found: list[dict[str, object]]
+        try:
+            parts = _retry(partial(fetch, ticker), sleep) or [{}]
+            found = [{"ticker": ticker, **part, "error": ""} for part in parts]
+        except (RateLimitedError, SecUnavailableError):
+            raise
+        except Exception as error:  # noqa: BLE001 - recorded per ticker
+            found = [{"ticker": ticker, "error": f"{type(error).__name__}: {error}"}]
+        if pause:
+            sleep(pause)
+        return found
+
+    fetched: dict[str, list[dict[str, object]]] = {}
+    pool = ThreadPoolExecutor(workers, thread_name_prefix="finagent-screen")
+    futures: dict[Future[list[dict[str, object]]], str] = {}
     try:
-        for i, ticker in enumerate(todo):
+        report(stage, 0, len(todo))
+        futures = {pool.submit(one, ticker): ticker for ticker in todo}
+        for i, future in enumerate(as_completed(futures), start=1):
+            fetched[futures[future]] = future.result()
             report(stage, i, len(todo))
-            found: list[dict[str, object]]
-            try:
-                parts = _retry(partial(fetch, ticker), sleep) or [{}]
-                found = [{"ticker": ticker, **part, "error": ""} for part in parts]
-            except (RateLimitedError, SecUnavailableError):
-                raise
-            except Exception as error:  # noqa: BLE001 - recorded per ticker
-                found = [
-                    {"ticker": ticker, "error": f"{type(error).__name__}: {error}"}
-                ]
-            rows.extend(found)
-            sleep(PAUSE_SECONDS)
     finally:
+        # A stop lets the running fetches end but starts no more.
+        pool.shutdown(cancel_futures=True)
+        for future, ticker in futures.items():  # those that ended meanwhile
+            if not future.cancelled() and future.exception() is None:
+                fetched[ticker] = future.result()
+        rows = [row for ticker in todo if ticker in fetched for row in fetched[ticker]]
         if rows or not path.exists():
             done = pd.DataFrame(rows, columns=list(columns))
             kept = cast(
@@ -2124,7 +2138,56 @@ def update_margins(  # noqa: PLR0913 - one stage's inputs
         "SEC",
         report,
         sleep,
+        workers=SEC_WORKERS,
+        pause=0.0,  # sec_pace spaces the requests
     )
+
+
+def _margins(  # noqa: PLR0913 - update_margins' inputs
+    edgar: Filings,
+    root: Path,
+    today: date,
+    tickers: Sequence[str],
+    lanes: Lanes,
+    sleep: Callable[[float], None],
+) -> int:
+    """``update_margins`` on its own progress lane."""
+    try:
+        return update_margins(edgar, root, today, tickers, lanes.lane("SEC"), sleep)
+    finally:
+        lanes.end("SEC")
+
+
+@final
+class Lanes:
+    """Stages running at once (Yahoo's and SEC's) as one progress line."""
+
+    def __init__(self, report: Report) -> None:
+        """Send the combined line to ``report``."""
+        self._report = report
+        self._lock = threading.Lock()
+        self._lanes: dict[str, tuple[str, int, int]] = {}
+
+    def lane(self, name: str) -> Report:
+        def report(stage: str, done: int, total: int) -> None:
+            with self._lock:
+                self._lanes[name] = (stage, done, total)
+                self._send()
+
+        return report
+
+    def end(self, name: str) -> None:
+        with self._lock:
+            if self._lanes.pop(name, None) is not None and self._lanes:
+                self._send()
+
+    def _send(self) -> None:
+        lanes = list(self._lanes.values())
+        self._report(
+            " · ".join(stage for stage, _, _ in lanes),
+            sum(done for _, done, _ in lanes),
+            sum(total for _, _, total in lanes),
+        )
 
 
 def update(  # noqa: PLR0913 - the SEC source is optional
@@ -2137,7 +2200,7 @@ def update(  # noqa: PLR0913 - the SEC source is optional
 ) -> str:
     """Bring every stored part up to date; returns a one-line summary.
 
-    SEC figures are fetched only with ``edgar``. Raises
+    SEC figures are fetched only with ``edgar``, alongside Yahoo's. Raises
     ``RateLimitedError`` when Yahoo keeps refusing after the retries. Only an
     update that gets to the end ``prune``s the superseded dated files.
     """
@@ -2150,29 +2213,39 @@ def update(  # noqa: PLR0913 - the SEC source is optional
     universe = read_universe(universe_path)
     tickers = [str(ticker) for ticker in universe["ticker"]]
     listed = set(tickers)
-    prices = update_prices(source, root, tickers, last_session(now), report, sleep)
-    failed = update_rows(
-        lambda t: [source.fundamentals(t)],
-        root / f"fundamentals-{quarter(today)}.csv",
-        FUNDAMENTAL_COLUMNS,
-        tickers,
-        "재무",
-        report,
-        sleep,
-    )
-    failed += update_rows(
-        lambda t: [source.estimates(t)],
-        root / f"estimates-{today.isoformat()}.csv",
-        ESTIMATE_COLUMNS,
-        tickers,
-        "추정치",
-        report,
-        sleep,
-    )
+    lanes = Lanes(report)
+    yahoo = lanes.lane("yahoo")
+    side = ThreadPoolExecutor(1, thread_name_prefix="finagent-sec")
+    margins = None
+    try:
+        if edgar is not None:
+            margins = side.submit(_margins, edgar, root, today, tickers, lanes, sleep)
+        prices = update_prices(source, root, tickers, last_session(now), yahoo, sleep)
+        failed = update_rows(
+            lambda t: [source.fundamentals(t)],
+            root / f"fundamentals-{quarter(today)}.csv",
+            FUNDAMENTAL_COLUMNS,
+            tickers,
+            "재무",
+            yahoo,
+            sleep,
+        )
+        failed += update_rows(
+            lambda t: [source.estimates(t)],
+            root / f"estimates-{today.isoformat()}.csv",
+            ESTIMATE_COLUMNS,
+            tickers,
+            "추정치",
+            yahoo,
+            sleep,
+        )
+    finally:
+        lanes.end("yahoo")
+        side.shutdown()  # even when Yahoo stops: SEC's file is done before return
     note = f" · 받지 못한 값 {failed}" if failed else ""
-    if edgar is not None:
+    if margins is not None:
         try:
-            missed = update_margins(edgar, root, today, tickers, report, sleep)
+            missed = margins.result()
         except (httpx.HTTPError, SecUnavailableError) as error:
             note += f" · SEC 받지 못함 ({type(error).__name__}: {error})"
         else:

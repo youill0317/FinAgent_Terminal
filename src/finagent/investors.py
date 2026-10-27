@@ -5,7 +5,8 @@ dashboard's data rules (``tests/test_guardrails.py``): it contacts SEC EDGAR
 (``data.sec.gov``, ``www.sec.gov``) and OpenFIGI (``api.openfigi.com``),
 imports ``yfinance`` for sectors, and writes files, all under
 ``data/investors/`` in the folder the app runs from. Of the other finagent
-modules it imports only the pure math in ``perf``; prices come from the
+modules it imports only the pure math in ``perf`` and the shared SEC pace
+``sec_pace``; prices come from the
 portfolio page's store (``app.py`` glues the two). Nothing is fetched until
 a ``Fetcher`` thread is started.
 
@@ -53,6 +54,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 # The guardrail test reads this dotted form as the math module.
 import finagent.perf as perf  # noqa: PLR0402
+from finagent import sec_pace
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -76,7 +78,6 @@ STALE_QUARTERS: Final = 2  # periods behind the expected one: 보고 중단
 COVER_SHARE: Final = 0.90  # prices and sectors for the largest holdings up to this
 COVER_MAX: Final = 100  # ... or this many positions per quarter, whichever first
 DOLLARS_FROM: Final = date(2023, 1, 3)
-SEC_PAUSE: Final = 0.15  # seconds after each SEC request: under 10 a second
 FIGI_JOBS: Final = 10  # OpenFIGI without a key: 10 jobs a request
 FIGI_PAUSE: Final = 2.5  # and 25 requests a minute
 FIGI_RETRIES: Final = 3
@@ -904,14 +905,10 @@ def submissions(source: Source, cik: str) -> dict[str, Any]:
 
 
 def filer_filings(
-    source: Source,
-    cik: str,
-    sleep: Callable[[float], None],
-    quarters: int = QUARTERS,
+    source: Source, cik: str, quarters: int = QUARTERS
 ) -> tuple[str, list[Filing], Filing | None]:
     """The name, 13F-HR(/A) filings (older pages if needed), newest 13F-NT."""
     body = submissions(source, cik)
-    sleep(SEC_PAUSE)
     name = str(body.get("name") or cik)
     history = cast("dict[str, Any]", body.get("filings") or {})
     recent = cast("dict[str, Any]", history.get("recent") or {})
@@ -923,15 +920,14 @@ def filer_filings(
         if len(recent_periods(found, quarters + 1)) > quarters:
             break  # one more period than kept: no later amendment is missed
         raw = json.loads(source.sec(SUBMISSIONS_URL.format(name=page["name"])))
-        sleep(SEC_PAUSE)
         found += filings_from(cast("dict[str, Any]", raw))
     return name, found, newest
 
 
-def check(source: Source, cik: str, sleep: Callable[[float], None]) -> str:
+def check(source: Source, cik: str) -> str:
     """The filer's name; raises ``InvestorError`` if it has filed no 13F-HR."""
     try:
-        name, found, _ = filer_filings(source, cik, sleep, quarters=1)
+        name, found, _ = filer_filings(source, cik, quarters=1)
     except httpx.HTTPStatusError as error:
         if error.response.status_code == NOT_FOUND:
             raise InvestorError("EDGAR에 없는 CIK입니다.") from error
@@ -941,18 +937,14 @@ def check(source: Source, cik: str, sleep: Callable[[float], None]) -> str:
     return name
 
 
-def fetch_table(
-    source: Source, cik: str, filing: Filing, sleep: Callable[[float], None]
-) -> Table:
+def fetch_table(source: Source, cik: str, filing: Filing) -> Table:
     """One filing's information table (and amendment type) from the archive."""
     folder_name = filing.accession.replace("-", "")
     url = partial_url(cik, folder_name)
     index = json.loads(source.sec(url("index.json")))
-    sleep(SEC_PAUSE)
     amendment: Amendment = ""
     if filing.form != "13F-HR":
         amendment = parse_amendment(source.sec(url("primary_doc.xml")))
-        sleep(SEC_PAUSE)
     head = Table(
         accession=filing.accession,
         form=filing.form,
@@ -963,7 +955,6 @@ def fetch_table(
     )
     for name in table_files(cast("dict[str, Any]", index)):
         text = source.sec(url(name))
-        sleep(SEC_PAUSE)
         if not is_table(text):
             continue
         parsed = parse_table(text, filing.filed)
@@ -1070,7 +1061,7 @@ def update(  # noqa: PLR0913 - one investor's inputs
 ) -> str:
     """Fetch the investor's new filings, their tickers and sectors; one-line summary."""
     report("제출 목록", 0, 0)
-    name, found, newest = filer_filings(source, cik, sleep)
+    name, found, newest = filer_filings(source, cik)
     keep = kept(found)
     save_model(
         folder(root, cik) / FILINGS_FILE,
@@ -1079,7 +1070,7 @@ def update(  # noqa: PLR0913 - one investor's inputs
     new = [f for f in keep if not (folder(root, cik) / f"{f.accession}.json").is_file()]
     for i, filing in enumerate(new):
         report("13F 문서", i, len(new))
-        table = fetch_table(source, cik, filing, sleep)
+        table = fetch_table(source, cik, filing)
         save_model(folder(root, cik) / f"{filing.accession}.json", table)
     filer = load_filer(root, cik)
     tables = load_tables(root, filer) if filer is not None else []
@@ -1115,6 +1106,7 @@ class Web:
         self._yahoo = False
 
     def sec(self, url: str) -> str:
+        sec_pace.wait(self._sleep)
         response = self._sec.get(url)
         _ = response.raise_for_status()
         return response.text
@@ -1219,7 +1211,7 @@ class Fetcher:
             raise InvestorError(f"`.env`에 {AGENT_KEY}를 넣으세요.")
         source = self._build(agent.strip(), self.root)
         try:
-            return check(source, cik, self._sleep)
+            return check(source, cik)
         except httpx.HTTPError as error:
             raise InvestorError(f"EDGAR에 묻지 못했습니다: {error}") from error
         finally:

@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from finagent import screen
+from finagent import screen, sec_pace
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -641,3 +641,23 @@ def test_without_a_user_agent_sec_is_never_asked(
     assert list(tmp_path.glob("margins-*"))
     with pytest.raises(ValueError, match="SEC_USER_AGENT"):
         _ = screen.Sec(" ")
+
+
+def test_sec_requests_start_a_pace_apart() -> None:
+    waits: list[float] = []
+    sec_pace.wait(waits.append)
+    sec_pace.wait(waits.append)
+    assert waits[-1] == pytest.approx(sec_pace.INTERVAL, abs=0.05)
+
+
+def test_stages_running_at_once_share_one_progress_line() -> None:
+    sent: list[tuple[str, int, int]] = []
+
+    def report(stage: str, done: int, total: int) -> None:
+        sent.append((stage, done, total))
+
+    lanes = screen.Lanes(report)
+    lanes.lane("yahoo")("재무", 10, 100)
+    lanes.lane("SEC")("SEC", 5, 50)
+    lanes.end("yahoo")
+    assert sent == [("재무", 10, 100), ("재무 · SEC", 15, 150), ("SEC", 5, 50)]
