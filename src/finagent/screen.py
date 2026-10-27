@@ -280,7 +280,7 @@ PROFITABILITY: Final = {
     "q_accruals": "발생액",
 }
 QUALITY: Final = {**PROFITABILITY, "q_leverage": "레버리지"}
-# FTSE rule 5.6 밸류: three yields on the full market capitalisation, higher
+# FTSE rule 5.6 밸류에이션: three yields on the full market capitalisation, higher
 # is cheaper.
 VALUE: Final = {
     "v_cash": "현금흐름 수익률",
@@ -307,7 +307,7 @@ TABLE: Final = (
     ("price", "주가", "usd"),
     ("mcap", "시가총액", "big"),
     ("quality", "퀄리티", "z"),
-    ("value", "밸류", "z"),
+    ("value", "밸류에이션", "z"),
     ("counted", "산출 항목 수", ""),
     ("roa", "ROA", "pct"),
     ("leverage", "영업현금흐름 ÷ 총부채", "num"),
@@ -325,7 +325,7 @@ ESTIMATE_HELP: Final = (
     " 애널리스트 수 · 추정 애널리스트 수\n\n"
     "**해석** 수정 강도 = (현재 − 90일 전) ÷ 주가, 같은 회계연도끼리 비교해 FY1·FY2"
     " 평균(결산 대기면 FY2만) · 순수정 비율 = (30일 상향 − 하향) ÷ 애널리스트 수 ·"
-    " 퀄리티·밸류 계산에는 쓰지 않음"
+    " 퀄리티·밸류에이션 계산에는 쓰지 않음"
 )
 # The detail dialog's price indicators: column → (name, definition).
 TECH_LINES: Final = {
@@ -413,7 +413,7 @@ RULES: Final = (
     *(
         Rule(
             key,
-            "밸류",
+            "밸류에이션",
             name,
             f"**정의** {VALUE_HELP[key]}\n\n**근거** {FTSE} 5.6",
         )
@@ -475,7 +475,7 @@ def column_help(c: Criteria) -> dict[str, str]:
     return {
         "quality": quality_help(c),
         "value": value_help(c),
-        "counted": "**정의** 값이 있는 퀄리티 / 밸류 지표 수",
+        "counted": "**정의** 값이 있는 퀄리티 / 밸류에이션 지표 수",
         "roa": f"**정의** {QUALITY_HELP['q_roa']}",
         "leverage": "**정의** 영업현금흐름 ÷ 총부채, 부채가 없거나 영업현금흐름이"
         " 총부채보다 크면 1 · 연간",
@@ -1140,7 +1140,7 @@ def leverage_ratio(table: pd.DataFrame) -> pd.Series:
 
 
 def measure_values(table: pd.DataFrame) -> dict[str, pd.Series]:
-    """Each 퀄리티 and 밸류 measure's value, higher better and cheaper.
+    """Each 퀄리티 and 밸류에이션 measure's value, higher better and cheaper.
 
     FTSE rules 5.4 and 5.6 on the newest fiscal year ("_0") and the one before
     ("_1"). Financials and real estate (``ROA_ONLY``) have ROA alone for
@@ -1211,11 +1211,11 @@ def composite(scores: pd.DataFrame) -> pd.Series:
 
 
 def axes(table: pd.DataFrame, c: Criteria = DEFAULT) -> pd.DataFrame:
-    """퀄리티 and 밸류 Z-scores across ``table`` (FTSE rules 5.2, 5.4, 5.6).
+    """퀄리티 and 밸류에이션 Z-scores across ``table`` (FTSE rules 5.2, 5.4, 5.6).
 
     Each measure in force is normalised; profitability is the composite of its
-    measures, 퀄리티 that of profitability and leverage, 밸류 that of its
-    three yields. A stock without any 퀄리티 (밸류) value scores zero (rule
+    measures, 퀄리티 that of profitability and leverage, 밸류에이션 that of its
+    three yields. A stock without any 퀄리티 (밸류에이션) value scores zero (rule
     5.2.3). The measure columns keep each measure's Z-score, for the dialog.
     """
     values = c.kept(measure_values(table))
@@ -1425,7 +1425,7 @@ def fmt(kind: str, value: object) -> str:
 
 
 def counted(row: Mapping[str, object]) -> str:
-    """산출 항목 수: 퀄리티 / 밸류 measures with a value."""
+    """산출 항목 수: 퀄리티 / 밸류에이션 measures with a value."""
     q, v = _number(row.get("q_count")), _number(row.get("v_count"))
     return "" if math.isnan(q) or math.isnan(v) else f"{q:.0f}/{v:.0f}"
 
@@ -1461,7 +1461,7 @@ def _items(row: Mapping[str, object], year: int, *stems: str) -> str:
 
 
 def measure_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str, str]]:
-    """Each 퀄리티 and 밸류 measure, then both axes.
+    """Each 퀄리티 and 밸류에이션 measure, then both axes.
 
     Each line is the measure's Z-score, the test and the values it used; a
     measure turned off is 미적용, one FTSE does not use for the stock 해당 없음.
@@ -1522,7 +1522,7 @@ def measure_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str
         ),
         (
             _score(row.get("value")),
-            "밸류 = 세 수익률 z의 평균을 다시 표준화 (높을수록 쌈)",
+            "밸류에이션 = 세 수익률 z의 평균을 다시 표준화 (높을수록 쌈)",
             f"{fmt('int', row.get('v_count'))}개 지표 · {year}",
         ),
     ]

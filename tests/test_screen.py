@@ -330,7 +330,7 @@ def table_of(*rows: dict[str, object]) -> pd.DataFrame:
 INSURER = {"sector": "Financials", "industry": "Property & Casualty Insurance"}
 
 
-# ---------------------------------------------------------------- 퀄리티 and 밸류
+# ---------------------------------------------------------------- 퀄리티 and 밸류에이션
 
 
 def test_measures_follow_the_ftse_rules() -> None:
@@ -354,7 +354,7 @@ def test_measures_follow_the_ftse_rules() -> None:
     fin = (2 + 6) - (15 + 5), (1 + 5) - (12 + 4)  # no preferred row: zero
     change = (wc[0] - wc[1]) + (nco[0] - nco[1]) + (fin[0] - fin[1])
     assert values["q_accruals"][0] == pytest.approx(-change / average)
-    # Financials and real estate: ROA alone for 퀄리티, every 밸류 yield.
+    # Financials and real estate: ROA alone for 퀄리티, every 밸류에이션 yield.
     for key in ("q_turnover", "q_accruals", "q_leverage"):
         assert values[key].iloc[1:3].isna().all()
     assert values["q_roa"].iloc[1:3].notna().all()
@@ -401,7 +401,7 @@ def test_axes_combine_what_each_stock_has() -> None:
 
     assert found["q_count"].tolist() == [4, 4, 4, 1, 0]
     assert found["v_count"].tolist() == [3, 3, 3, 3, 0]
-    # No 퀄리티 or 밸류 value: a neutral zero (FTSE rule 5.2.3).
+    # No 퀄리티 or 밸류에이션 value: a neutral zero (FTSE rule 5.2.3).
     assert (found.loc[4, "quality"], found.loc[4, "value"]) == (0.0, 0.0)
     assert found["quality"].iloc[2] > found["quality"].iloc[0]
     roa = screen.normalise(screen.measure_values(table)["q_roa"])

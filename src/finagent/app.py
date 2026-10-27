@@ -1381,7 +1381,7 @@ def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
             height="stretch",
         )
         st.metric(
-            "밸류",
+            "밸류에이션",
             fmt("z", row.get("value")),
             help=screen.value_help(c),
             border=True,
@@ -1389,14 +1389,14 @@ def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
         )
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
-        headed("**가격 지표**", "퀄리티·밸류 계산에 쓰지 않음")
+        headed("**가격 지표**", "퀄리티·밸류에이션 계산에 쓰지 않음")
         st.markdown(status_lines(screen.tech_lines(row)))
-        headed("**영업이익률**", "퀄리티·밸류 계산에 쓰지 않음")
+        headed("**영업이익률**", "퀄리티·밸류에이션 계산에 쓰지 않음")
         st.caption(display.md(screen.margin_line(row)))
     with right, st.container(border=True, height="stretch"):
         universe = screen.UNIVERSES[state.get("screen_universe") or "sp500"]
         headed(
-            "**퀄리티·밸류**",
+            "**퀄리티·밸류에이션**",
             f"{screen.basis_note()} · 유니버스 {universe.name} 구성 종목",
         )
         st.markdown(status_lines(screen.measure_lines(row, c)))
@@ -1449,13 +1449,13 @@ def map_points(points: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 def map_chart(points: list[dict[str, object]], *, guides: bool) -> alt.LayerChart:
-    """밸류 against 퀄리티, both Z-scores; the chart takes no clicks."""
+    """밸류에이션 against 퀄리티, both Z-scores; the chart takes no clicks."""
     limit = [-screen.Z_LIMIT, screen.Z_LIMIT]
     dots = (
         alt.Chart(alt.Data(values=map_points(points)))
         .mark_circle(size=40, opacity=0.6)
         .encode(
-            x=alt.X("x:Q", title="밸류", scale=alt.Scale(domain=limit)),
+            x=alt.X("x:Q", title="밸류에이션", scale=alt.Scale(domain=limit)),
             y=alt.Y(
                 "y:Q",
                 title="퀄리티",
@@ -1475,7 +1475,7 @@ def map_chart(points: list[dict[str, object]], *, guides: bool) -> alt.LayerChar
                 alt.Tooltip("name:N", title="종목"),
                 alt.Tooltip("sector:N", title="섹터"),
                 alt.Tooltip("quality:Q", title="퀄리티", format="+.2f"),
-                alt.Tooltip("value:Q", title="밸류", format="+.2f"),
+                alt.Tooltip("value:Q", title="밸류에이션", format="+.2f"),
                 alt.Tooltip("counted:N", title="산출 항목 수"),
             ],
         )
@@ -1491,18 +1491,18 @@ def map_chart(points: list[dict[str, object]], *, guides: bool) -> alt.LayerChar
 
 
 def value_map(rows: pd.DataFrame, c: screen.Criteria) -> None:
-    """The stocks as 퀄리티 by 밸류 points with the guide toggle, boxed."""
+    """The stocks as 퀄리티 by 밸류에이션 points with the guide toggle, boxed."""
     with st.container(border=True):
         with st.container(horizontal=True, vertical_alignment="center"):
             headed(
-                "**퀄리티·밸류 분포** · z 점수",
+                "**퀄리티·밸류에이션 분포** · z 점수",
                 f"{screen.quality_help(c)}\n\n{screen.value_help(c)}",
             )
             st.space("stretch")
             guides = st.toggle("평균선", value=True, key="map_guides")
         st.altair_chart(
             map_chart(screen.map_rows(rows), guides=guides),
-            alt="퀄리티와 밸류 분포",
+            alt="퀄리티와 밸류에이션 분포",
         )
 
 
@@ -6499,7 +6499,7 @@ def screen_help(name: str, c: screen.Criteria) -> str:
         f"정의 기준일 {screen.DEFINITIONS} · 자세한 근거는 docs/screening.md",
     ]
     return (
-        f"**정의** {name} 구성 종목의 퀄리티·밸류 z 점수({screen.FTSE})\n\n"
+        f"**정의** {name} 구성 종목의 퀄리티·밸류에이션 z 점수({screen.FTSE})\n\n"
         "**기준** " + " · ".join(rules)
     )
 
