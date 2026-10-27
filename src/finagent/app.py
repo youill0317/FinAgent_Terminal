@@ -173,6 +173,7 @@ def refresh() -> None:
     ok = sum(source.ok for source in d.sources)
     total = sum(source.total for source in d.sources)
     state.toast = f"{ok}/{total}개 시리즈 갱신 · {d.elapsed_seconds:.1f}s"
+    state.refresh_page = True  # the page's bar starts its own fetch too
     log = conversation()
     if log.conversation:
         log.stale = True
@@ -1284,31 +1285,22 @@ def parts_line(parts: screen.Parts) -> str:
 def screen_bar(
     updater: screen.Updater, root: Path, help_: str, criteria: screen.Criteria
 ) -> None:
-    """Data dates with the page's ``help_``, the 갱신 button and any progress.
+    """Data dates with the page's ``help_`` and any progress.
 
-    A finished update saves a snapshot screened by ``criteria``.
+    The header's 갱신 starts an update; a finished one saves a snapshot
+    screened by ``criteria``.
     """
-    polling = updater.progress.running
     missing = screen.missing_packages()
+    if state.pop("refresh_page", False) and not missing and not args.demo:
+        _ = updater.start(sec_agent(), criteria)
+    polling = updater.progress.running
 
     @st.fragment(run_every=1.0 if polling else None)
     def body() -> None:
         progress = updater.progress
         if polling and not progress.running:
             st.rerun()
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption(parts_line(screen.parts(root)), help=help_)
-            st.space("stretch")
-            if st.button(
-                "갱신",
-                icon=":material/refresh:",
-                type="primary",
-                key="screen_refresh",
-                disabled=progress.running or bool(missing) or args.demo,
-            ):
-                # Rerun the page even if another tab started first, so it polls.
-                updater.start(sec_agent(), criteria)
-                st.rerun()
+        st.caption(parts_line(screen.parts(root)), help=help_)
         if progress.running:
             done = progress.done / progress.total if progress.total else 0.0
             count = f" {progress.done}/{progress.total}" if progress.total else ""
@@ -2249,13 +2241,15 @@ def pf_bar(  # noqa: PLR0913 - the bar's inputs
     extra: Sequence[str] = (),
     have: Collection[str] = (),
 ) -> None:
-    """When prices were saved, the 갱신 button and a running fetch.
+    """When prices were saved and a running fetch; the header's 갱신 starts one.
 
     ``extra``: tickers outside the book that 갱신 also fetches;
     ``have``: the saved tickers (``portfolio.wanted``).
     """
-    polling = fetcher.progress.running
     tickers = [*portfolio.book_tickers(book), *extra]
+    if state.pop("refresh_page", False) and not missing and not args.demo and tickers:
+        _ = fetcher.start(list(dict.fromkeys([*portfolio.wanted(book, have), *extra])))
+    polling = fetcher.progress.running
 
     @st.fragment(run_every=1.0 if polling else None)
     def body() -> None:
@@ -2263,24 +2257,9 @@ def pf_bar(  # noqa: PLR0913 - the bar's inputs
         if polling and not progress.running:
             st.rerun()
         saved = portfolio.prices_saved_at(root)
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption(
-                f"가격 {saved:%Y-%m-%d %H:%M} 저장"
-                if saved
-                else "저장된 가격이 없습니다."
-            )
-            st.space("stretch")
-            if st.button(
-                "갱신",
-                icon=":material/refresh:",
-                type="primary",
-                key="pf_refresh",
-                disabled=progress.running or bool(missing) or args.demo or not tickers,
-            ):
-                fetcher.start(
-                    list(dict.fromkeys([*portfolio.wanted(book, have), *extra]))
-                )
-                st.rerun()
+        st.caption(
+            f"가격 {saved:%Y-%m-%d %H:%M} 저장" if saved else "저장된 가격이 없습니다."
+        )
         if progress.running:
             st.caption(
                 f":material/progress_activity: 가격 받는 중 · {progress.message}"
@@ -5479,7 +5458,10 @@ def inv_bar(  # noqa: PLR0913 - the bar shows both fetchers
     agent: str,
     blocked: str,
 ) -> None:
-    """When the 13F were checked, the 갱신 button and running fetches."""
+    """When the 13F were checked and running fetches; the header's 갱신 starts one."""
+    if state.pop("refresh_page", False) and not blocked:
+        _ = fetcher.start(cik, agent)
+        state.inv_reprice = cik
     polling = fetcher.progress.running or pfetch.progress.running
 
     @st.fragment(run_every=1.0 if polling else None)
@@ -5489,23 +5471,11 @@ def inv_bar(  # noqa: PLR0913 - the bar shows both fetchers
         if polling and not progress.running and not pricing:
             st.rerun()
         filer = investors.load_filer(root, cik)
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption(
-                f"13F {filer.fetched:%Y-%m-%d %H:%M} 확인"
-                if filer
-                else "저장된 13F가 없습니다."
-            )
-            st.space("stretch")
-            if st.button(
-                "갱신",
-                icon=":material/refresh:",
-                type="primary",
-                key="inv_refresh",
-                disabled=progress.running or bool(blocked),
-            ):
-                fetcher.start(cik, agent)
-                state.inv_reprice = cik
-                st.rerun()
+        st.caption(
+            f"13F {filer.fetched:%Y-%m-%d %H:%M} 확인"
+            if filer
+            else "저장된 13F가 없습니다."
+        )
         if progress.running:
             done = progress.done / progress.total if progress.total else 0.0
             count = f" {progress.done}/{progress.total}" if progress.total else ""
@@ -6644,6 +6614,7 @@ page_panels = next(
 )
 notices(data)
 page.run()
+state.pop("refresh_page", None)  # a page without a bar leaves it unused
 
 st.html(CARDS_CSS)
 st.html(AI_CSS.format(bg="#0e1117" if st.context.theme.type == "dark" else "#fff"))

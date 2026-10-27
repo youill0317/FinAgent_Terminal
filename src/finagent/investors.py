@@ -1169,7 +1169,7 @@ def _web(agent: str, root: Path) -> Source:
 class Fetcher:
     """Fetches one investor at a time in a background thread; pages poll ``progress``.
 
-    A CIK started once is not started again on its own; the page's 갱신
+    A CIK started once is not started again on its own; the header's 갱신
     button fetches it again.
     """
 

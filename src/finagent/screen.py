@@ -6,7 +6,7 @@ Finance data), reads the constituents lists from Wikipedia, asks SEC EDGAR
 for 10-K operating margins when the user set ``SEC_USER_AGENT``, and writes
 files, all under ``data/screen/`` in the folder the app runs from: S&P 500's
 at its top, S&P 400's in ``sp400/``. yfinance's own caches go there too.
-Nothing here runs until the page's 갱신 button starts an ``Updater``; the page
+Nothing here runs until the header's 갱신 button starts an ``Updater``; the page
 only reads the stored files.
 
 Stored parts per universe and how often they are fetched:

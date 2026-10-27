@@ -2956,7 +2956,7 @@ class Fetcher:
     """Fetches price history in a background thread; pages poll ``progress``.
 
     Tickers a fetch has tried are not fetched again on their own, so a ticker
-    Yahoo does not know is not requested on every rerun; the page's 가격 갱신
+    Yahoo does not know is not requested on every rerun; the header's 갱신
     button fetches everything again.
     """
 
