@@ -29,6 +29,7 @@ class AnalysisChoice:
     provider: str
     models: dict[str, str] = field(default_factory=dict)
     scope: str = DEFAULT_SCOPE
+    instructions: str = ""  # the user's system prompt
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +88,10 @@ def load_analysis(path: Path) -> AnalysisChoice | None:
     scope = section.get("scope")
     if not isinstance(scope, str) or scope not in SCOPES:
         scope = DEFAULT_SCOPE
-    return AnalysisChoice(provider, clean, scope)
+    instructions = section.get("instructions")
+    if not isinstance(instructions, str):
+        instructions = ""
+    return AnalysisChoice(provider, clean, scope, instructions)
 
 
 def load_training(path: Path) -> TrainingChoice | None:
@@ -146,6 +150,7 @@ def save_analysis(path: Path, choice: AnalysisChoice) -> None:
             "provider": choice.provider,
             "models": dict(choice.models),
             "scope": choice.scope,
+            "instructions": choice.instructions,
         },
     }
     _write(path, _kept(body, path, "training", "screen"))

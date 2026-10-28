@@ -103,7 +103,9 @@ class AnalysisService:
         fallback = first or next(iter(self._providers))
         if saved is not None and saved.provider not in self._providers:
             # e.g. "demo" saved under --demo, then a run with the real providers
-            saved = AnalysisChoice(fallback, saved.models, saved.scope)
+            saved = AnalysisChoice(
+                fallback, saved.models, saved.scope, saved.instructions
+            )
         self._choice = saved or AnalysisChoice(fallback)
 
     # ------------------------------------------------------------ choice and meta
@@ -125,8 +127,13 @@ class AnalysisService:
         return self._choice.models.get(provider_id) or provider.default_model
 
     def choose(
-        self, provider_id: str, model: str = "", scope: str = ""
+        self,
+        provider_id: str,
+        model: str = "",
+        scope: str = "",
+        instructions: str | None = None,
     ) -> AnalysisChoice:
+        """Save the choice; ``instructions`` ``None`` keeps the saved ones."""
         if provider_id not in self._providers:
             msg = f"알 수 없는 공급자: {provider_id}"
             raise ProviderError(msg)
@@ -134,7 +141,10 @@ class AnalysisService:
         if model.strip():
             models[provider_id] = model.strip()
         kept = scope if scope in SCOPES else self._choice.scope
-        self._choice = AnalysisChoice(provider_id, models, kept)
+        text = (
+            self._choice.instructions if instructions is None else instructions.strip()
+        )
+        self._choice = AnalysisChoice(provider_id, models, kept, text)
         if self._settings_path is not None:
             save_analysis(self._settings_path, self._choice)
         return self._choice
@@ -209,7 +219,7 @@ class AnalysisService:
 
             request = RunRequest(
                 conversation=Conversation(
-                    system=system_prompt(thread.document.snapshot),
+                    system=system_prompt(self._choice.instructions),
                     document=thread.document.text,
                     turns=tuple(thread.turns),
                     request=given.request.strip(),

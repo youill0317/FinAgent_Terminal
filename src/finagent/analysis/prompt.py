@@ -10,19 +10,15 @@ from dataclasses import dataclass, field
 from importlib.resources import files
 from typing import Final
 
-from finagent.analysis.tools import MAX_TOOL_CALLS
-
 TEXT: Final = files("finagent.analysis") / "text"
 
 FIRST_REQUEST: Final = "위 지표 문서를 바탕으로 다음 요청에 답해 줘."
 
 
-def system_prompt(snapshot: str) -> str:
-    """The shared system prompt (``text/system.txt``) for one snapshot."""
-    text = (TEXT / "system.txt").read_text(encoding="utf-8").strip()
-    return text.replace("{snapshot}", snapshot).replace(
-        "{max_tools}", str(MAX_TOOL_CALLS)
-    )
+def system_prompt(instructions: str = "") -> str:
+    """How to cite (``text/system.txt``), then the user's ``instructions``."""
+    cite = (TEXT / "system.txt").read_text(encoding="utf-8").strip()
+    return f"{cite}\n\n{instructions.strip()}" if instructions.strip() else cite
 
 
 @dataclass(frozen=True, slots=True)

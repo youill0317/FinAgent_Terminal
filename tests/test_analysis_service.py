@@ -154,8 +154,25 @@ def test_settings_keep_each_others_keys(tmp_path: Path) -> None:
             "provider": "gemini_api",
             "models": {"gemini_api": "m"},
             "scope": "view",
+            "instructions": "",
         },
     }
     assert load_analysis(tmp_path / "missing.json") is None
     _ = path.write_text('{"analysis": {"provider": 3}}', "utf-8")
     assert load_analysis(path) is None
+
+
+def test_the_users_system_prompt_follows_the_citation_rule(tmp_path: Path) -> None:
+    path = tmp_path / "finagent.settings.json"
+    provider = Recorder()
+    service = analysis(provider, settings_path=path)
+    _ = service.choose("demo", instructions="  짧게 답해.  ")
+
+    _ = asyncio.run(collect(service, RunInput("요약해 줘")))
+    system = provider.seen[-1].conversation.system
+    assert system.startswith("문서나 도구 결과의 값을 쓴 문장 끝에는 [[지표id]]")
+    assert system.endswith("\n\n짧게 답해.")
+    assert load_analysis(path) == AnalysisChoice("demo", {}, "view", "짧게 답해.")
+
+    _ = service.choose("demo")  # the 공급자 alone keeps the prompt
+    assert service.choice.instructions == "짧게 답해."

@@ -204,7 +204,7 @@ def check_all(d: Dashboard, *, on: bool) -> None:
 
 
 def ai_settings() -> None:
-    """Provider, model and scope for the AI analysis; saved by 적용."""
+    """Provider, model, scope and system prompt for the AI analysis; saved by 적용."""
     providers = rt.analysis.providers
     found = rt.call(rt.analysis.statuses())
     provider_col, model_col, scope_col = st.columns(3)
@@ -237,6 +237,15 @@ def ai_settings() -> None:
         " 지표 · 전체 매크로: 모든 지표\n\n**기준** 진행 중인 대화는 시작 시점의"
         " 범위 유지",
     )
+    _ = st.text_area(
+        "시스템 프롬프트",
+        value=rt.analysis.choice.instructions,
+        placeholder="모든 AI 분석에 앞서 모델에 줄 지시 · 비우면 없음",
+        height=160,
+        key="set_instructions",
+        help="**정의** 모델에 시스템 프롬프트로 보내는 글\n\n**기준** 다음 실행부터"
+        " 적용 · 숫자 대조용 [[지표id]] 인용 규칙은 늘 앞에 붙음",
+    )
 
 
 def apply_ai() -> None:
@@ -247,6 +256,7 @@ def apply_ai() -> None:
             provider_id,
             model or rt.analysis.model_for(provider_id),
             state.get("set_scope") or "",
+            state.get("set_instructions"),
         )
     except (ProviderError, OSError) as error:
         state.ai_error = f"선택을 저장하지 못했습니다: {error}"
