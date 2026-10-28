@@ -10,8 +10,8 @@ from finagent.cli import (
     resolve_env,
     run_check,
 )
-from finagent.demo import DEMO_KEYS, demo_transport
 from finagent.service import DashboardService, local_now
+from tests.fake_sources import DEMO_KEYS, demo_transport
 
 if TYPE_CHECKING:
     from pathlib import Path

@@ -2684,12 +2684,19 @@ def style(adjusted: pd.DataFrame, w: pd.Series, base: Currency) -> Style | None:
 
 # ---------------------------------------------------------------- text
 
+# ``--demo``: the number every amount, return and quantity below shows instead.
+demo_value: float | None = None
+
 
 def shares(quantity: float) -> str:
+    if demo_value is not None:
+        quantity = demo_value
     return f"{quantity:,.4f}".rstrip("0").rstrip(".")
 
 
 def money(value: float, unit: Currency, *, signed: bool = False) -> str:
+    if demo_value is not None:
+        value = demo_value
     if not math.isfinite(value):
         return UNKNOWN
     sign = "−" if value < 0 else ("+" if signed and value > 0 else "")
@@ -2697,6 +2704,8 @@ def money(value: float, unit: Currency, *, signed: bool = False) -> str:
 
 
 def percent(value: float, *, signed: bool = False, dec: int = 1) -> str:
+    if demo_value is not None:
+        value = demo_value / 100
     if not math.isfinite(value):
         return UNKNOWN
     if round(value * 100, dec) == 0:  # no signed zero
@@ -2707,6 +2716,8 @@ def percent(value: float, *, signed: bool = False, dec: int = 1) -> str:
 
 def points(value: float) -> str:
     """A difference of two returns in percentage points."""
+    if demo_value is not None:
+        value = demo_value / 100
     if not math.isfinite(value):
         return UNKNOWN
     if round(value * 100, 1) == 0:  # no signed zero

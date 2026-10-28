@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 
 from finagent import catalog
 from finagent.analysis.evidence import Evidence
+from finagent.demo import dashboard as demo_dashboard
 from finagent.fetch import SourceError
 from finagent.sources import (
     EcosSeries,
@@ -155,6 +156,7 @@ class Toolbox:
     cache: MutableMapping[Fetch, Series]
     today: date
     in_document: frozenset[str] = frozenset()
+    demo: bool = False  # ``--demo``: series from ``demo_dashboard``, no searches
     calls: int = 0
     evidence: dict[str, Evidence] = field(default_factory=dict)
     received: dict[str, str] = field(default_factory=dict)
@@ -190,6 +192,8 @@ class Toolbox:
             raise ValueError(f"source는 {', '.join(SEARCHABLE)} 중 하나")
         if source == "catalog":
             hits = self._catalog_hits(query)
+        elif self.demo:  # no outside sources
+            hits = []
         elif source == "FRED":
             hits = [_info_json(hit) for hit in await fred_search(self.ctx, query, 15)]
         elif source == "ECOS":
@@ -290,10 +294,14 @@ class Toolbox:
         indicator_id = _text(args, "id")
         if indicator_id:
             indicator = catalog_indicator(indicator_id)
-            raw = await self._fetch(indicator.fetch, years)
             transform = cast("Transform", requested or indicator.transform)
+            if self.demo:  # fixed values, nothing fetched
+                series = demo_dashboard.series(indicator.freq, self.today, years)
+            else:
+                raw = await self._fetch(indicator.fetch, years)
+                series = apply(raw, transform, indicator.freq, indicator.scale)
             return _Resolved(
-                series=apply(raw, transform, indicator.freq, indicator.scale),
+                series=series,
                 freq=indicator.freq,
                 transform=transform,
                 cite=indicator.id,
@@ -307,11 +315,15 @@ class Toolbox:
         code = _text(args, "code")
         if not source_id or not code:
             raise ValueError("id 또는 source와 code를 주세요")
-        raw = await self._fetch(build_fetch(source_id, code, years), years)
-        freq = infer_freq(raw)
         transform = cast("Transform", requested or "level")
+        if self.demo:  # fixed values, nothing fetched
+            series, freq = demo_dashboard.series("M", self.today, years), "M"
+        else:
+            raw = await self._fetch(build_fetch(source_id, code, years), years)
+            freq = infer_freq(raw)
+            series = apply(raw, transform, freq)
         return _Resolved(
-            series=apply(raw, transform, freq),
+            series=series,
             freq=freq,
             transform=transform,
             cite=f"{source_id}:{code}",

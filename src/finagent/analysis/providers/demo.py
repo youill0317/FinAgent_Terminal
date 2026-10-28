@@ -70,8 +70,8 @@ class DemoProvider:
             *rows,
             "",
             long_run,
-            "연내 2회 인하 여부는 이 문서만으로 판단할 수 없다.",
-            "(검증 예시) 일부러 틀린 값: 실업률 9.9%. [[us_unrate]]",
+            "연내 999회 인하 여부는 이 문서만으로 판단할 수 없다.",
+            "(검증 예시) 일부러 틀린 값: 실업률 998%. [[us_unrate]]",
         ]
         text = "\n".join(lines)
         for start in range(0, len(text), CHUNK):

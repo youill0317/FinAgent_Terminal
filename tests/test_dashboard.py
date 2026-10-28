@@ -9,8 +9,8 @@ import httpx
 
 from finagent import catalog
 from finagent.cli import check_report
-from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService
+from tests.fake_sources import DEMO_KEYS, demo_closes, demo_transport
 
 if TYPE_CHECKING:
     from collections.abc import Callable

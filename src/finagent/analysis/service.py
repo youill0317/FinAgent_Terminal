@@ -198,6 +198,7 @@ class AnalysisService:
                 self._dashboard.series_cache,
                 self._dashboard.today(),
                 in_document=frozenset(thread.document.evidence),
+                demo=self._dashboard.demo,
             )
 
             async def run_tool(

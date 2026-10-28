@@ -1,7 +1,7 @@
 """Synthetic responses in each source's real wire format.
 
-Used by ``finagent --demo`` (to see the dashboard without API keys) and by
-the tests. Values are made up and plausible; they are not real observations.
+Used by the tests only: values are made up and plausible, not real
+observations, so the app (``--demo`` included) never imports them.
 Yahoo is read through yfinance, not HTTP, so ``demo_closes`` stands in for
 ``sources.YahooCloses`` instead.
 """
@@ -408,7 +408,7 @@ def _dates(freq: Freq, start: date, today: date) -> list[date]:
         return [
             day
             for offset in range(days + 1)
-            if (day := start + timedelta(days=offset)).weekday() < 5  # noqa: PLR2004
+            if (day := start + timedelta(days=offset)).weekday() < 5
         ]
     if freq == "W":
         last = today - timedelta(days=4)
@@ -507,7 +507,7 @@ def _start(request: httpx.Request, param: str, default_years: int, today: date) 
     raw = _param(request, param)
     if raw:
         parts = [int(part) for part in raw.split("-")]
-        return date(parts[0], parts[1], parts[2] if len(parts) > 2 else 1)  # noqa: PLR2004
+        return date(parts[0], parts[1], parts[2] if len(parts) > 2 else 1)
     return today - timedelta(days=365 * default_years)
 
 
@@ -737,7 +737,7 @@ def _structure(flows: list[str], keys: list[str]) -> httpx.Response:
 def _sdmx_structure(path: str) -> httpx.Response:
     tail = path.split("/dataflow/", 1)[-1].split("/")
     flows = sorted({key.split("/")[0] for key in SDMX})
-    if len(tail) < 2:  # noqa: PLR2004 - "{agency}" only: list every flow
+    if len(tail) < 2:
         return _structure(flows, [])
     keys = [key.split("/")[1] for key in SDMX if key.split("/")[0] == tail[1]]
     return _structure([tail[1]], keys)
@@ -764,7 +764,7 @@ def _sdmx(request: httpx.Request, today: date) -> httpx.Response:
 def _oecd(request: httpx.Request, today: date) -> httpx.Response:
     if "/dataflow" in request.url.path:
         tail = unquote(request.url.path).split("/dataflow/", 1)[-1].split("/")
-        if len(tail) < 2:  # noqa: PLR2004 - agency only: list every flow
+        if len(tail) < 2:
             return _structure(["DSD_STES@DF_CLI"], [])
         return _structure([tail[1]], ["USA.M.LI", "KOR.M.BCICP"])
     start = _start(request, "startPeriod", 4, today)

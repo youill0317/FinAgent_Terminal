@@ -15,7 +15,6 @@ from finagent.analysis.providers.base import (
 )
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import AnalysisService, RunInput
-from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService
 from finagent.settings import (
     AnalysisChoice,
@@ -23,6 +22,7 @@ from finagent.settings import (
     save_analysis,
     save_view,
 )
+from tests.fake_sources import DEMO_KEYS, demo_closes, demo_transport
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

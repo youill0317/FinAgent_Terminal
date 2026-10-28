@@ -12,7 +12,7 @@ uv sync --no-dev --extra claude  # 필요한 것만: claude·openai·gemini·llm
 source .venv/bin/activate
 
 macro                # http://127.0.0.1:8765
-macro --demo         # 키·네트워크 없이 예시 데이터
+macro --demo         # 화면 확인용: 받기·계산 없이 모든 값 999
 macro --check        # 서버 없이 출처별 상태 출력
 # 옵션: --port --no-browser --env-file PATH --settings PATH --version
 ```
@@ -415,5 +415,5 @@ uv run pytest -q
 uv run streamlit run src/finagent/app.py -- --demo   # 파일 수정 즉시 재실행
 ```
 
-- 지표 추가: `src/finagent/catalog.py` 패널 튜플 한 줄 + `src/finagent/demo.py` 가짜 시계열 한 줄, 상단 줄은 `TAPE`, 기본 화면은 `CORE`
-- 테스트: 실제 API 미호출, `demo.py`의 가짜 응답 사용
+- 지표 추가: `src/finagent/catalog.py` 패널 튜플 한 줄 + `tests/fake_sources.py` 가짜 시계열 한 줄, 상단 줄은 `TAPE`, 기본 화면은 `CORE`
+- 테스트: 실제 API 미호출, `tests/fake_sources.py`의 가짜 응답 사용

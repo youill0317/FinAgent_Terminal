@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import httpx
 
 from finagent import catalog
-from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService, local_now
 from finagent.settings import (
     AnalysisChoice,
@@ -22,6 +21,7 @@ from finagent.settings import (
     save_training,
     save_view,
 )
+from tests.fake_sources import DEMO_KEYS, demo_closes, demo_transport
 
 if TYPE_CHECKING:
     from pathlib import Path

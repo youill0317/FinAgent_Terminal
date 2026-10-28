@@ -11,8 +11,8 @@ from finagent.analysis.context import build_document
 from finagent.analysis.evidence import Evidence
 from finagent.analysis.tools import Toolbox
 from finagent.analysis.verify import verify
-from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.service import DashboardService
+from tests.fake_sources import DEMO_KEYS, demo_closes, demo_transport
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

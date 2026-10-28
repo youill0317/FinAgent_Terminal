@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, final
 
 from finagent import catalog
 from finagent.dashboard import build_dashboard
+from finagent.demo import dashboard as demo_dashboard
 from finagent.fetch import RETRY_DELAY_SECONDS, FetchContext, new_client
 from finagent.settings import load_view, save_view
 from finagent.sources import Ratio, combine_ratio
@@ -207,6 +208,9 @@ class DashboardService:
     async def _build(
         self, deep: frozenset[str], previous: Dashboard | None
     ) -> Dashboard:
+        if self._demo:  # fixed values, nothing fetched
+            self._snapshot = demo_dashboard.dashboard(self._clock(), deep)
+            return self._snapshot
         async with self._client_factory() as client:
             ctx = FetchContext(
                 client, self._env, retry_delay=self._retry_delay, yahoo=self._yahoo

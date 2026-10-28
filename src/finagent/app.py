@@ -32,8 +32,7 @@ import streamlit as st
 from finagent import (
     catalog,
     colab_jobs,
-    demo_results,
-    demo_workspace,
+    demo,
     display,
     generative,
     investors,
@@ -47,6 +46,10 @@ from finagent.analysis.providers.base import ProviderError
 from finagent.analysis.service import AnalysisService, RunInput
 from finagent.cli import build_service, parse_args, resolve_env, resolve_settings
 from finagent.dashboard import REGIME_HELP
+from finagent.demo import portfolio as demo_portfolio
+from finagent.demo import screen as demo_screen
+from finagent.demo import training as demo_training
+from finagent.demo import workspace as demo_workspace
 from finagent.fetch import SourceError
 from finagent.guides import GUIDES
 from finagent.runtime import Run, Runtime
@@ -152,6 +155,9 @@ args = parse_args(sys.argv[1:])
 if args.demo and args.settings is None:
     args.settings = demo_settings()
 rt = runtime(args.demo, str(args.env_file or ""), str(args.settings or ""))
+portfolio.demo_value = demo.VALUE if args.demo else None
+# The portfolio's price readers and calculations: canned in the demo.
+calc = demo_portfolio if args.demo else portfolio
 state = st.session_state
 state.setdefault("toast", "")
 state.setdefault("ai_open", False)
@@ -282,14 +288,14 @@ def trainer(root: str) -> colab_jobs.Trainer:
     return jobs
 
 
-type Jobs = colab_jobs.Trainer | colab_jobs.DemoTrainer
+type Jobs = colab_jobs.Trainer | demo_training.Trainer
 
 
-def demo_trainer() -> colab_jobs.DemoTrainer:
+def demo_trainer() -> demo_training.Trainer:
     """The demo's canned stand-in, one per session so the dialog keeps it."""
     return cast(
-        "colab_jobs.DemoTrainer",
-        state.setdefault("train_demo", colab_jobs.DemoTrainer()),
+        "demo_training.Trainer",
+        state.setdefault("train_demo", demo_training.Trainer()),
     )
 
 
@@ -411,7 +417,7 @@ def training_status(jobs: Jobs) -> None:
             f"**마지막 학습** {when:%Y-%m-%d %H:%M} · {', '.join(r.tickers)}"
             f" · {r.start}–{r.end}"
         )
-    canned = colab_jobs.DEMO_REQUEST
+    canned = demo_training.REQUEST
     current = (
         [
             (m, f"{canned.start}–{canned.end} 학습", canned.tickers)
@@ -443,8 +449,8 @@ def training_settings() -> None:
     jobs: Jobs
     typed = not args.demo and not portfolio.missing_packages()
     if args.demo:
-        adjusted, jobs = colab_jobs.demo_prices(), demo_trainer()
-        r = colab_jobs.DEMO_REQUEST
+        adjusted, jobs = demo_training.prices(), demo_trainer()
+        r = demo_training.REQUEST
         saved = TrainingChoice(r.tickers, r.start, r.end, r.gpu, r.models)
     else:
         if typed and state.pop("train_fetch", False):
@@ -717,7 +723,7 @@ def notices(d: Dashboard) -> None:
     if d.settings_error:
         st.error(d.settings_error)
     if d.demo:
-        st.info("데모 모드: 예시 값입니다.")
+        st.info("데모 모드: 화면 확인용으로 모든 값을 999로 고정했습니다.")
     for source in d.sources:
         help_ = display.KEY_HELP.get(source.id)
         if source.state == "missing_key" and help_:
@@ -1310,7 +1316,10 @@ def screen_bar(
         progress = updater.progress
         if polling and not progress.running:
             st.rerun()
-        st.caption(parts_line(screen.parts(root)), help=help_)
+        parts = (
+            demo_screen.parts(rt.dashboard.today()) if args.demo else screen.parts(root)
+        )
+        st.caption(parts_line(parts), help=help_)
         if progress.running:
             done = progress.done / progress.total if progress.total else 0.0
             count = f" {progress.done}/{progress.total}" if progress.total else ""
@@ -1408,7 +1417,11 @@ def stock_body(root: Path, row: dict[str, object], c: screen.Criteria) -> None:
         )
         st.caption(display.md(screen.estimate_note(row)))
         st.dataframe(screen.estimate_table(row), hide_index=True, alt="EPS 추정치")
-    points = screen.chart_rows(screen.history(root, str(row["ticker"])))
+    points = (
+        demo_screen.stock_chart(rt.dashboard.today())
+        if args.demo
+        else screen.chart_rows(screen.history(root, str(row["ticker"])))
+    )
     if len(points) > 1:
         with st.container(border=True):
             headed("**1년 주가** · 종가·이동평균, USD")
@@ -1434,10 +1447,15 @@ JITTER = 0.02  # in Z-score units: where points sit, not their values
 def map_points(points: list[dict[str, object]]) -> list[dict[str, object]]:
     """The map's points, a fixed hash-driven nudge off their values.
 
-    Overlapping points part without changing them.
+    Overlapping points part without changing them; the demo's sit at
+    ``MAP_SPOTS``.
     """
     shown: list[dict[str, object]] = []
     for point in points:
+        if args.demo:
+            x, y = demo_screen.MAP_SPOTS[str(point["ticker"])]
+            shown.append(point | {"x": x, "y": y})
+            continue
         seed = sum(ord(ch) for ch in str(point["ticker"]))
         nudge = ((seed % 7) - 3) / 3 * JITTER, ((seed % 5) - 2) / 2 * JITTER
         shown.append(
@@ -1639,9 +1657,16 @@ def pf_table(data: dict[str, list[str]], alt_text: str) -> None:
 
 
 def pf_ratio(value: float) -> str:
+    if args.demo:
+        value = demo.VALUE
     if not math.isfinite(value):
         return portfolio.UNKNOWN
     return f"{'−' if value < 0 else ''}{abs(value):.2f}"
+
+
+def pf_num(value: float, spec: str) -> str:
+    """``value`` in ``spec``; the demo's 999 in its place."""
+    return format(demo.VALUE if args.demo else value, spec)
 
 
 def pf_axis(base: portfolio.Currency) -> str:
@@ -1700,7 +1725,7 @@ def pf_prices(root: str, stamp: tuple[tuple[str, int, int], ...]) -> portfolio.P
     keeps every derived frame separate).
     """
     del stamp
-    return portfolio.load_prices(Path(root))
+    return calc.load_prices(Path(root))
 
 
 def pf_key(*parts: object) -> Key:
@@ -1711,7 +1736,7 @@ def pf_key(*parts: object) -> Key:
 @st.cache_data(show_spinner=False, max_entries=16)
 def cached_twr(key: Key, _p: portfolio.Portfolio, _close: pd.DataFrame) -> pd.Series:
     del key
-    return portfolio.twr(_p, _close)
+    return calc.twr(_p, _close)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1719,7 +1744,7 @@ def cached_history(
     key: Key, _p: portfolio.Portfolio, _close: pd.DataFrame
 ) -> pd.DataFrame:
     del key
-    return portfolio.history(_p, _close)
+    return calc.history(_p, _close)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1727,7 +1752,7 @@ def cached_held(
     key: Key, _p: portfolio.Portfolio, _close: pd.DataFrame, _adjusted: pd.DataFrame
 ) -> pd.Series:
     del key
-    return portfolio.held_returns(_p, _close, _adjusted)
+    return calc.held_returns(_p, _close, _adjusted)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1739,7 +1764,7 @@ def cached_lineup(
     _prices: portfolio.Prices,
 ) -> tuple[pd.DataFrame, list[bool]]:
     del key
-    return portfolio.lineup(_book, _prices, base, months)
+    return calc.lineup(_book, _prices, base, months)
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -1747,7 +1772,7 @@ def cached_lagged(
     key: Key, korean: tuple[bool, ...], _frame: pd.DataFrame
 ) -> portfolio.Correlation | None:
     del key
-    return portfolio.lagged_correlation(_frame, korean)
+    return calc.lagged_correlation(_frame, korean)
 
 
 # ---- new analytics: memory only, keyed like the caches above
@@ -1758,7 +1783,7 @@ def cached_benchmarks(
     key: Key, _p: portfolio.Portfolio, _close: pd.DataFrame, _days: pd.DatetimeIndex
 ) -> dict[str, pd.Series]:
     del key
-    return portfolio.benchmark_lines(_p, _close, _days)
+    return calc.benchmark_lines(_p, _close, _days)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1767,7 +1792,7 @@ def cached_flows(
 ) -> tuple[perf.FxSplit | None, portfolio.Trading | None]:
     """The currency split and the do-nothing comparison."""
     del key
-    return portfolio.currency_split(_p, _close), portfolio.trading(_p, _close)
+    return calc.currency_split(_p, _close), calc.trading(_p, _close)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1782,7 +1807,7 @@ def cached_ratios(
     ``_bench`` gives the daily benchmark returns, built only on a miss.
     """
     del key
-    return portfolio.ratios(_rets, _rf, _bench())
+    return calc.ratios(_rets, _rf, _bench())
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1794,7 +1819,7 @@ def cached_joint(
     _w: pd.Series,
 ) -> portfolio.Joint:
     del key
-    return portfolio.joint(_adjusted, _w, base, months)
+    return calc.joint(_adjusted, _w, base, months)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1802,7 +1827,7 @@ def cached_covariance(
     key: Key, _j: portfolio.Joint
 ) -> tuple[NDArray[np.float64], float, float]:
     del key
-    return portfolio.covariance(_j)
+    return calc.covariance(_j)
 
 
 @st.cache_resource(show_spinner=False, max_entries=8)
@@ -1827,10 +1852,7 @@ def cached_filter(
 ) -> quant.Devolatilised:
     """``key`` stands for ``_j`` and the filter's options ``_v``."""
     del key
-    if args.demo:
-        days = min(len(_j.full), quant.FILTER_DAYS)
-        return demo_results.volatility(len(_j.names), days)
-    return portfolio.volatility(_j, _v)
+    return calc.volatility(_j, _v)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1852,10 +1874,8 @@ def cached_paths(
     expected return (``portfolio.simulation``).
     """
     del key
-    if args.demo:
-        return demo_results.simulation(value, _picks.shape[1], drift)
-    growth = portfolio.growth(_j, _picks, _f if fhs else None, _w)
-    return portfolio.simulation(growth, value, *standing, drift)
+    growth = calc.growth(_j, _picks, _f if fhs else None, _w)
+    return calc.simulation(growth, value, *standing, drift)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1866,9 +1886,7 @@ def cached_tails(
     _v: portfolio.Vol | None = None,
 ) -> portfolio.Tails:
     del key
-    if args.demo:
-        return demo_results.tails(len(_j.names), len(_j.window))
-    return portfolio.tails(_j, _f, _v)
+    return calc.tails(_j, _f, _v)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -1880,9 +1898,7 @@ def cached_density(
 ) -> portfolio.Density:
     """``key`` stands for ``_j``, whether ``_f`` is given and which, and ``_drift``."""
     del key
-    if args.demo:
-        return demo_results.density()
-    return portfolio.density(_j, _f, drift=_drift)
+    return calc.density(_j, _f, drift=_drift)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1894,7 +1910,7 @@ def cached_replays(
     _fx: pd.Series,
 ) -> list[portfolio.Replayed]:
     del key
-    return portfolio.scenario_replays(_values, _adjusted, base, _fx)
+    return calc.scenario_replays(_values, _adjusted, base, _fx)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1902,7 +1918,7 @@ def cached_betas(
     key: Key, months: int, names: tuple[str, ...], _adjusted: pd.DataFrame
 ) -> NDArray[np.float64]:
     del key
-    return portfolio.local_betas(_adjusted, names, months)
+    return calc.local_betas(_adjusted, names, months)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1910,7 +1926,7 @@ def cached_bad_prints(
     key: Key, names: tuple[str, ...], _adjusted: pd.DataFrame
 ) -> dict[str, list[date]]:
     del key
-    return portfolio.bad_print_days(_adjusted, names)
+    return calc.bad_print_days(_adjusted, names)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1918,7 +1934,7 @@ def cached_turbulence(
     key: Key, base: portfolio.Currency, names: tuple[str, ...], _adjusted: pd.DataFrame
 ) -> portfolio.Turbulence | None:
     del key
-    return portfolio.turbulence(_adjusted, names, base)
+    return calc.turbulence(_adjusted, names, base)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1926,7 +1942,7 @@ def cached_style(
     key: Key, base: portfolio.Currency, _adjusted: pd.DataFrame, _w: pd.Series
 ) -> portfolio.Style | None:
     del key
-    return portfolio.style(_adjusted, _w, base)
+    return calc.style(_adjusted, _w, base)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1940,8 +1956,8 @@ def cached_trimmed(
     """``portfolio.covered`` over the window; ``key`` stands for ``_w``."""
     del key
     names = portfolio.labels(_w)
-    rets = portfolio.window(portfolio.asset_returns(_adjusted, names, base), months)
-    return portfolio.covered(rets, _w)
+    rets = portfolio.window(calc.asset_returns(_adjusted, names, base), months)
+    return calc.covered(rets, _w)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -1962,7 +1978,7 @@ def cached_added(
 ) -> portfolio.Added:
     """``key`` stands for ``_j`` and ``_cov``."""
     del key
-    return portfolio.added(_j, _cov, ticker, fraction)
+    return calc.added(_j, _cov, ticker, fraction)
 
 
 # ---- what the shared sections analyse
@@ -1994,7 +2010,7 @@ class Subject:
 
 def pf_subject(p: portfolio.Portfolio, prices: portfolio.Prices) -> Subject:
     pid = p.model_dump_json()
-    items = portfolio.holdings(p, prices.close)
+    items = calc.holdings(p, prices.close)
     w = portfolio.weights(items)
     unknown = portfolio.unpriced(items)
     return Subject(
@@ -2004,7 +2020,7 @@ def pf_subject(p: portfolio.Portfolio, prices: portfolio.Prices) -> Subject:
         rets=cached_held(pf_key(pid), p, prices.close, prices.adjusted),
         w=w,
         value=sum(h.value for h in items if h.ticker in w.index),
-        bench=partial(portfolio.blended, p, prices.close),
+        bench=partial(calc.blended, p, prices.close),
         bench_label="혼합 벤치마크",
         notes=(f"제외 (평가액 미확인): {', '.join(unknown)}",) if unknown else (),
     )
@@ -2266,7 +2282,7 @@ def pf_bar(  # noqa: PLR0913 - the bar's inputs
         progress = fetcher.progress
         if polling and not progress.running:
             st.rerun()
-        saved = portfolio.prices_saved_at(root)
+        saved = calc.prices_saved_at(root)
         st.caption(
             f"가격 {saved:%Y-%m-%d %H:%M} 저장" if saved else "저장된 가격이 없습니다."
         )
@@ -2366,7 +2382,7 @@ def pf_prefill() -> None:
                 prices = portfolio_fetcher(str(root)).fetch_now([ticker])
         except Exception:  # noqa: BLE001 - the field just stays empty
             prices = portfolio.no_prices()
-    price, day = portfolio.close_on(prices.close, ticker, state.pf_day)
+    price, day = calc.close_on(prices.close, ticker, state.pf_day)
     if day is None:
         state.pf_price = None
         state.pf_price_note = "가격을 찾지 못했습니다"
@@ -2485,6 +2501,8 @@ def pf_donut(
     amount: str = "평가액",
 ) -> alt.Chart:
     """Weights as a donut, from (name, weight, ``amount``) rows; ``text`` shows it."""
+    if args.demo:  # every slice at 999%
+        rows = [(name, demo.SHARE, value) for name, _, value in rows]
     merged: dict[str, tuple[float, float]] = {}
     for name, weight, value in rows:
         w, v = merged.get(name, (0.0, 0.0))
@@ -2522,7 +2540,7 @@ def pf_donut(
 
 def pf_holdings(p: portfolio.Portfolio, prices: portfolio.Prices) -> None:
     """현황: always shown above the analysis sections."""
-    items = portfolio.holdings(p, prices.close)
+    items = calc.holdings(p, prices.close)
     held = [h for h in items if h.is_open]
     with st.container(horizontal=True, vertical_alignment="center"):
         headed(
@@ -2622,6 +2640,9 @@ def pf_holdings(p: portfolio.Portfolio, prices: portfolio.Prices) -> None:
 def pf_line_chart(
     points: list[dict[str, str | float]], number: str, height: int = CHART_HEIGHT
 ) -> alt.Chart:
+    if args.demo:  # every point at 999, or 999% on a percent axis
+        shown = demo.SHARE if "%" in number else demo.VALUE
+        points = [point | {"value": shown} for point in points]
     return (
         alt.Chart(pf_rows(points))
         .mark_line()
@@ -2650,6 +2671,8 @@ def pf_rows(points: list[dict[str, str | float]]) -> pd.DataFrame:
 def pf_contribution_chart(
     points: list[dict[str, str | float]], base: portfolio.Currency
 ) -> alt.Chart:
+    if args.demo:
+        points = [point | {"pnl": demo.VALUE} for point in points]
     up = alt.datum.pnl > 0
     return (
         alt.Chart(alt.Data(values=points))
@@ -2693,7 +2716,7 @@ def pf_benchmark_table(
     time: perf.Annualised | None, lines: dict[str, pd.Series]
 ) -> None:
     rows: list[tuple[str, perf.Annualised | None]] = [
-        (name, portfolio.time_weighted(line)) for name, line in lines.items()
+        (name, calc.time_weighted(line)) for name, line in lines.items()
     ]
     pf_table(
         {
@@ -2711,7 +2734,7 @@ def pf_benchmark_table(
             "TWR − 지수": [
                 PF_DASH,
                 *(
-                    pf_gap(portfolio.gap(time, a)) if time and a else PF_DASH
+                    pf_gap(calc.gap(time, a)) if time and a else PF_DASH
                     for _, a in rows
                 ),
             ],
@@ -2874,11 +2897,11 @@ def pf_realized(
             f"**연도별 실현손익** · {base}",
             "**정의** 매도일 기준 연도별 실현손익 합계 · 월별은 매도 월 기준",
         )
-        sales = portfolio.ledger(p, prices.close).sales
+        sales = calc.ledger(p, prices.close).sales
         pf_period_table(sales, base, "연도", monthly=False)
         with st.expander("월별"):
             pf_period_table(sales, base, "월", monthly=True)
-    sales = portfolio.ledger(p, prices.close).sales
+    sales = calc.ledger(p, prices.close).sales
     if sales:
         with st.container(border=True):
             headed(
@@ -2902,11 +2925,11 @@ def pf_realized(
 def pf_returns(p: portfolio.Portfolio, prices: portfolio.Prices) -> None:
     base = p.base
     pid = p.model_dump_json()
-    items = portfolio.holdings(p, prices.close)
+    items = calc.holdings(p, prices.close)
     totals = portfolio.totals(items)
     curve = cached_twr(pf_key(pid), p, prices.close)
-    time = portfolio.time_weighted(curve)
-    money = portfolio.money_weighted(p, prices.close, totals.value)
+    time = calc.time_weighted(curve)
+    money = calc.money_weighted(p, prices.close, totals.value)
     pf_return_metrics(totals, time, money, base)
     days = pd.DatetimeIndex(curve.index)
     lines = cached_benchmarks(pf_key(pid, "bench"), p, prices.close, days)
@@ -2983,7 +3006,10 @@ def pf_period_table(
 
 
 def pf_weight_chart(w: pd.Series, label: str = "종목") -> alt.Chart:
-    points = [{"ticker": str(t), "weight": float(v)} for t, v in w.items()]
+    points = [
+        {"ticker": str(t), "weight": demo.SHARE if args.demo else float(v)}
+        for t, v in w.items()
+    ]
     return (
         alt.Chart(alt.Data(values=points))
         .mark_bar()
@@ -3028,7 +3054,7 @@ def pf_drawdown(stats: portfolio.Ratios) -> None:
     )
     st.metric(
         "고점 아래 기간",
-        f"{under.current_days:,}일" if under else PF_DASH,
+        f"{pf_num(under.current_days, ',.0f')}일" if under else PF_DASH,
         help=(
             "**정의** 마지막 고점 이후 달력일 · 지금 고점이면 0\n\n**기준** 기간 중"
             f" 최장 수중 기간(고점 → 회복 또는 오늘) {under.longest_days:,}일"
@@ -3073,7 +3099,7 @@ def pf_sharpe(stats: portfolio.Ratios) -> None:
     trl = stats.min_trl
     st.metric(
         "MinTRL",
-        f"{trl:,.0f}" if enough and trl else PF_DASH,
+        pf_num(trl, ",.0f") if enough and trl else PF_DASH,
         None if enough else PF_SHORT,
         delta_color="off",
         delta_arrow="off",
@@ -3179,7 +3205,7 @@ def pf_stats(s: Subject, prices: portfolio.Prices, months: int) -> None:
     """Risk-adjusted statistics of ``s.rets`` over the window."""
     rets = portfolio.window(s.rets, months)
     rates, source, quote = pf_rates(s.base, prices.close)
-    rf = portfolio.risk_free(rates, pd.DatetimeIndex(rets.index), quote)
+    rf = calc.risk_free(rates, pd.DatetimeIndex(rets.index), quote)
     key = (*s.key, months, source, pf_rates_key(rates))
     bench = partial(s.bench, pd.DatetimeIndex(s.rets.index))
     stats = cached_ratios(key, rets, rf, bench)
@@ -3199,7 +3225,7 @@ def pf_stats(s: Subject, prices: portfolio.Prices, months: int) -> None:
         pf_drawdown(stats)
         pf_sharpe(stats)
         if not portfolio.korean_weight(s.w):  # Seoul closes: see the Dimson beta
-            beta = portfolio.market_beta(rets, prices.adjusted, s.base)
+            beta = calc.market_beta(rets, prices.adjusted, s.base)
             st.metric(
                 "베타",
                 pf_ratio(beta),
@@ -3262,7 +3288,7 @@ def pf_style_fit(s: Subject, prices: portfolio.Prices) -> None:
         return
     shown = pd.Series(fit.weights, index=list(fit.names), dtype="float64")
     shown = cast("pd.Series", shown[shown > 0.0005])  # noqa: PLR2004 - rounding dust
-    r2 = f"{fit.r2:.0%}" if fit.r2 is not None else PF_DASH
+    r2 = portfolio.percent(fit.r2, dec=0) if fit.r2 is not None else PF_DASH
     notes = [f"최근 {fit.weeks}주 {s.base} 주간 수익률 · 설명력 R² {r2}"]
     if fit.selection is not None:
         notes.append(
@@ -3279,6 +3305,8 @@ def pf_style_fit(s: Subject, prices: portfolio.Prices) -> None:
 
 
 def pf_heatmap(matrix: pd.DataFrame) -> alt.LayerChart:
+    if args.demo:  # known pairs at 999
+        matrix = matrix.mask(matrix.notna(), demo.VALUE)
     order = portfolio.labels(matrix)
     base = alt.Chart(alt.Data(values=portfolio.matrix_points(matrix))).encode(
         x=alt.X("a:N", sort=order, title=None),
@@ -3357,13 +3385,13 @@ def pf_correlation(
         else:
             cov, f, shrink = cached_covariance((*s.key, months, "cov"), j)
             shown = pf_largest(j)
-            full = portfolio.correlation_frame(cov, j.names)
+            full = calc.correlation_frame(cov, j.names)
             matrix = cast("pd.DataFrame", full.loc[shown, shown])
             notes = [f"{len(j.window)}일"]
             if j.mixed:
-                notes.append(f"시차 보정 f {f:.2f}")
+                notes.append(f"시차 보정 f {pf_num(f, '.2f')}")
             if len(j.names) > 2:  # noqa: PLR2004 - two names: the target is the sample
-                notes.append(f"Ledoit–Wolf 축소 {shrink:.0%}")
+                notes.append(f"Ledoit–Wolf 축소 {portfolio.percent(shrink, dec=0)}")
             headed(title, about + " · " + " · ".join(notes), pf_gaps(dropped, j.late))
             st.altair_chart(pf_heatmap(matrix), alt="종목 상관")
     with right, st.container(border=True, height="stretch"):
@@ -3374,13 +3402,13 @@ def pf_correlation(
     with left, st.container(border=True, height="stretch"):
         headed(f"**베타** · {s.base} 일간 수익률", PF_BETA_HELP)
         shown = set(pf_largest(j))
-        rows = portfolio.betas(j)
+        rows = calc.betas(j)
         pf_betas(
             [b for b in rows if b.name in shown or b.name == portfolio.PORTFOLIO_LABEL]
         )
     with right:
         cov, _, _ = cached_covariance((*s.key, months, "cov"), j)
-        pf_spread(j, portfolio.diversification(j, cov))
+        pf_spread(j, calc.diversification(j, cov))
 
 
 def pf_largest(j: portfolio.Joint) -> list[str]:
@@ -3470,7 +3498,7 @@ def pf_spread(j: portfolio.Joint, spread: portfolio.Spread) -> None:
         )
         st.metric(
             "유효 종목 수",
-            f"{spread.effective:.1f}",
+            pf_num(spread.effective, ".1f"),
             help="**정의** 1 ÷ Σ 비중²(허핀달 지수의 역수)\n\n**해석** 같은 비중"
             " N종목이면 N · 낮을수록 소수 종목 집중",
             border=True,
@@ -3517,10 +3545,10 @@ def pf_compare_heatmap(
     if any(korean):
         notes.append(
             "한국 비중 절반 초과 포트폴리오: 한국 종가 기준 시차 보정 f"
-            f" {found.lag:.2f}"
+            f" {pf_num(found.lag, '.2f')}"
         )
     if len(found.matrix) > 2:  # noqa: PLR2004 - two series: the target is the sample
-        notes.append(f"Ledoit–Wolf 축소 {found.shrink:.0%}")
+        notes.append(f"Ledoit–Wolf 축소 {portfolio.percent(found.shrink, dec=0)}")
     headed(title, about + " · " + " · ".join(notes))
     st.altair_chart(pf_heatmap(found.matrix), alt="포트폴리오 상관")
 
@@ -3948,7 +3976,7 @@ def pf_vol(
             fetcher.start(absent, ranges=True)
             st.rerun()
         index = cast("pd.Index", j.full.index[-portfolio.FIT_ROWS :])  # fits read
-        x = portfolio.vix_regressor(prices.adjusted, j.names, index) if vix else None
+        x = calc.vix_regressor(prices.adjusted, j.names, index) if vix else None
         if (
             can
             and vix
@@ -3963,7 +3991,7 @@ def pf_vol(
         ):
             fetcher.start([portfolio.VIX])
             st.rerun()
-    proxy = portfolio.range_proxy(prices, j.names, s.base, index) if ranges else None
+    proxy = calc.range_proxy(prices, j.names, s.base, index) if ranges else None
     v = portfolio.Vol(model, proxy, x)
     chosen = (model, proxy is not None, x is not None)
     f = cached_filter((*key, "filter", *chosen), j, v)
@@ -4003,11 +4031,11 @@ def pf_density(d: portfolio.Density, *, fhs: bool, capm: bool = False) -> None:
     pf_table(
         {
             "구간": [f"{d.blocks}개"],
-            "LR": [f"{d.test.lr:.2f}"],
-            "p": [f"{d.test.p:.2f}"],
-            "평균": [f"{d.test.mean:+.2f}"],
-            "표준편차": [f"{d.test.sd:.2f}"],
-            "자기상관": [f"{d.test.rho:+.2f}"],
+            "LR": [pf_num(d.test.lr, ".2f")],
+            "p": [pf_num(d.test.p, ".2f")],
+            "평균": [pf_num(d.test.mean, "+.2f")],
+            "표준편차": [pf_num(d.test.sd, ".2f")],
+            "자기상관": [pf_num(d.test.rho, "+.2f")],
         },
         "분포 검증",
     )
@@ -4049,7 +4077,7 @@ def pf_gens(
     """Ready generators whose tickers hold every name, and USD/KRW if needed."""
     if args.demo:  # every model to choose, none loaded
         tickers = (*j.names, portfolio.FX)
-        usable = {m: demo_results.generator(m, tickers) for m in generative.METHODS}
+        usable = {m: demo_portfolio.generator(m, tickers) for m in generative.METHODS}
         return PfGens(usable, {"Kronos": generative.IN_PROGRESS}, base, adjusted)
     root = gen_root()
     usable: dict[str, generative.Generator] = {}
@@ -4190,9 +4218,9 @@ def cached_generated(  # noqa: PLR0913 - every input of the cached result
     """``cached_paths`` for a generator; ``key`` stands for it, ``_j`` and history."""
     del key
     if args.demo:
-        return demo_results.simulation(value, days, drift)
+        return demo_portfolio.simulated(days)
     daily = pf_generated(_gen, _j, base, days, _history)
-    return portfolio.simulation(portfolio.path_growth(daily), value, *standing, drift)
+    return calc.simulation(portfolio.path_growth(daily), value, *standing, drift)
 
 
 def pf_paths(  # noqa: PLR0913 - the section's inputs
@@ -4218,7 +4246,7 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
     assumed = PF_ZERO_DRIFT if drift is None else drift.note
     label = state.get("pf_horizon") or "1M"  # 전망 기간, in the top row
     days = portfolio.HORIZONS[label]
-    standing = portfolio.standing(held)
+    standing = calc.standing(held)
     if gen is not None:
         history = pf_history(adjusted, gen)
         sim = cached_generated(
@@ -4239,7 +4267,7 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
         method = pf_gen_note(gen, base, j, len(history) > 0, assumed)
     else:
         f = None if vol is None else vol.f
-        block = 1 if vol else portfolio.mean_block(j)  # residuals: independent days
+        block = 1 if vol else calc.mean_block(j)  # residuals: independent days
         n = len(j.window)
         picks = cached_draws(state.get("pf_prices_stamp", ()), n, days, block)
         chosen = () if vol is None else vol.key
@@ -4256,7 +4284,7 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
         first = cast("pd.Timestamp", j.window.index[0]).date()
         last = cast("pd.Timestamp", j.window.index[-1]).date()
         drawn = (
-            f"같은 날 수익률의 평균 {block:.1f}일 묶음(Politis–White 2004)"
+            f"같은 날 수익률의 평균 {pf_num(block, '.1f')}일 묶음(Politis–White 2004)"
             if f is None
             else "같은 날 잔차의 하루 단위"
         )
@@ -4438,13 +4466,13 @@ def pf_backtest(t: portfolio.Tails) -> None:
         {
             "방법": [method for method, _ in rows],
             "초과 횟수": cells(lambda bt: f"{bt.exceptions}회"),
-            "기대": cells(lambda bt: f"{bt.expected:.1f}회"),
-            "Kupiec p": cells(lambda bt: f"{bt.kupiec:.2f}"),
-            "Christoffersen p": cells(lambda bt: f"{bt.christoffersen:.2f}"),
+            "기대": cells(lambda bt: f"{pf_num(bt.expected, '.1f')}회"),
+            "Kupiec p": cells(lambda bt: pf_num(bt.kupiec, ".2f")),
+            "Christoffersen p": cells(lambda bt: pf_num(bt.christoffersen, ".2f")),
             "ES Z2": cells(lambda bt: pf_ratio(bt.z2)),
-            "Z2 p": cells(lambda bt: f"{bt.es:.2f}"),
-            "U p": cells(lambda bt: f"{bt.de_u:.2f}"),
-            "C p": cells(lambda bt: f"{bt.de_c:.2f}"),
+            "Z2 p": cells(lambda bt: pf_num(bt.es, ".2f")),
+            "U p": cells(lambda bt: pf_num(bt.de_u, ".2f")),
+            "C p": cells(lambda bt: pf_num(bt.de_c, ".2f")),
             "신호등": cells(lambda bt: PF_LIGHTS[bt.light]),
         },
         "사후검정",
@@ -4528,13 +4556,13 @@ def pf_drift(
     j: portfolio.Joint, base: portfolio.Currency, prices: portfolio.Prices
 ) -> PfDrift:
     rates, source, quote = pf_rates(base, prices.close)
-    rf = portfolio.risk_free(rates, pd.DatetimeIndex(j.full.index), quote)
-    daily = portfolio.expected_returns(j, rf)
-    annual = (1 + daily[-1]) ** portfolio.per_year(j.full.index) - 1
+    rf = calc.risk_free(rates, pd.DatetimeIndex(j.full.index), quote)
+    daily = calc.expected_returns(j, rf)
+    annual = (1 + daily[-1]) ** calc.per_year(j.full.index) - 1
     rate = f"무위험수익률 {source}" if not rates.empty else "무위험수익률 0"
     return PfDrift(
         daily,
-        f"기대수익 연 {annual:.1%}(CAPM: {rate} + 베타 × 위험프리미엄 연"
+        f"기대수익 연 {portfolio.percent(annual)}(CAPM: {rate} + 베타 × 위험프리미엄 연"
         f" {portfolio.ERP:.0%})",
         pf_rates_key(rates),
     )
@@ -4645,11 +4673,11 @@ def pf_shocks(
     holding: str,
 ) -> None:
     total = float(cast("float", values.sum()))
-    rows = portfolio.shocked(values, betas, base)
+    rows = calc.shocked(values, betas, base)
 
     def moves(s: portfolio.Shock) -> str:
         parts = [
-            f"{name} {portfolio.percent(move, signed=True, dec=0)}"
+            f"{name} {'−' if move < 0 else '+'}{abs(move):.0%}"  # a label, not data
             for name, move in (
                 ("KOSPI", s.kospi),
                 (portfolio.BENCHMARK_LABEL, s.sp500),
@@ -4682,7 +4710,7 @@ def pf_shocks(
             },
             "가상 충격",
         )
-    fall = portfolio.reverse(values, betas)
+    fall = calc.reverse(values, betas)
     with st.container(horizontal=True, key="pf_reverse_cards"):  # outside the box
         st.metric(
             f"−{portfolio.REVERSE_LOSS:.0%} 손실에 필요한 지수 하락폭",
@@ -4712,7 +4740,7 @@ def pf_turbulence(s: Subject, prices: portfolio.Prices, names: tuple[str, ...]) 
     with st.container(horizontal=True, key="pf_turbulence_cards"):
         st.metric(
             "이번 주 이례 정도",
-            f"{now.level:.2f}",
+            pf_num(now.level, ".2f"),
             f"과거 {now.weeks:,}주 중 {portfolio.percent(now.rank, dec=0)} 수준 이하",
             delta_color="off",
             delta_arrow="off",
@@ -4727,7 +4755,7 @@ def pf_turbulence(s: Subject, prices: portfolio.Prices, names: tuple[str, ...]) 
         )
         st.metric(
             "상관 이례도",
-            f"{now.surprise:.2f}",
+            pf_num(now.surprise, ".2f"),
             f"백분위 {portfolio.percent(now.surprise_rank, dec=0)}"
             if math.isfinite(now.surprise_rank)
             else None,
@@ -4747,7 +4775,7 @@ def pf_stress_section(s: Subject, prices: portfolio.Prices, months: int) -> None
         st.info("가격이 확인된 보유 종목이 없습니다.")
         return
     older = pf_dashboard_series(PF_DEXKOUS)
-    fx = portfolio.long_fx(prices.adjusted, older)
+    fx = calc.long_fx(prices.adjusted, older)
     key = (*s.key, "replay", len(older))
     rows = cached_replays(key, s.base, values, prices.adjusted, fx)
     notes = [
@@ -4849,7 +4877,7 @@ def stock_owned(book: portfolio.Book, prices: portfolio.Prices) -> list[str]:
         {
             h.ticker
             for p in book.portfolios
-            for h in portfolio.holdings(p, prices.close)
+            for h in calc.holdings(p, prices.close)
             if h.is_open
         }
     )
@@ -4886,16 +4914,16 @@ def stock_share(
     ticker: str, base: portfolio.Currency, prices: portfolio.Prices
 ) -> float:
     """One share at the last close, in ``base`` at the last USD/KRW."""
-    price, _ = portfolio.last_close(prices.close, ticker)
-    rate, _ = portfolio.last_close(prices.close, portfolio.FX)
-    return portfolio.convert(price, portfolio.currency(ticker), base, rate)
+    price, _ = calc.last_close(prices.close, ticker)
+    rate, _ = calc.last_close(prices.close, portfolio.FX)
+    return calc.convert(price, portfolio.currency(ticker), base, rate)
 
 
 def stock_subject(
     ticker: str, base: portfolio.Currency, prices: portfolio.Prices
 ) -> Subject:
     """The stock alone: weight 1, amounts for one share."""
-    rets = portfolio.asset_returns(prices.adjusted, [ticker], base)
+    rets = calc.asset_returns(prices.adjusted, [ticker], base)
     value = stock_share(ticker, base, prices)
     index = portfolio.benchmark_of(ticker)
     return Subject(
@@ -4905,7 +4933,7 @@ def stock_subject(
         rets=cast("pd.Series", rets[ticker]).dropna(),
         w=pd.Series({ticker: 1.0}, dtype="float64"),
         value=value,
-        bench=partial(portfolio.market_returns, prices.adjusted, base, index=index),
+        bench=partial(calc.market_returns, prices.adjusted, base, index=index),
         bench_label="KOSPI" if index == portfolio.KOSPI else portfolio.BENCHMARK_LABEL,
         notes=(f"금액은 1주 기준 (최근 종가 {portfolio.money(value, base)})",),
         holding="이 종목 1주",
@@ -4917,7 +4945,7 @@ def stock_betas(s: Subject, prices: portfolio.Prices, months: int) -> None:
     j, _, _ = pf_joint(s, prices, months)
     if j is None or len(j.window) < portfolio.MIN_DAYS:
         return
-    b = portfolio.betas(j)[0]
+    b = calc.betas(j)[0]
     left, _ = st.columns(2)
     with left, st.container(border=True):
         headed(f"**베타** · {s.base} 일간 수익률", PF_BETA_HELP)
@@ -5038,7 +5066,7 @@ def whatif_paths(
 ) -> None:
     """Monte Carlo before and after on the same cached draws."""
     days = portfolio.HORIZONS[label]
-    block = portfolio.mean_block(j)
+    block = calc.mean_block(j)
     picks = cached_draws(state.get("pf_prices_stamp", ()), len(j.window), days, block)
     flat = (1.0, 1.0)  # only the horizon's own drawdowns are shown
     before = cached_paths(
@@ -5067,8 +5095,8 @@ def whatif_paths(
         f"**몬테카를로** · {label}",
         "**정의** 추가 전 → 후 모의 경로 지표 · 손실 경로 비율 · 기간 중 낙폭"
         " 경로 비율 · 기간 끝 중앙값 수익률\n\n**기준** 평균 수익 0 가정 · 추가 전후"
-        f" 같은 재표본 경로 {portfolio.PATHS:,}개, 평균 {block:.1f}일 묶음 · 매일 같은"
-        " 비중 재조정",
+        f" 같은 재표본 경로 {portfolio.PATHS:,}개, 평균 {pf_num(block, '.1f')}일 묶음"
+        " · 매일 같은 비중 재조정",
     )
     with st.container(horizontal=True, key="pf_whatif_path_cards"):
         for name, old, new in pairs:
@@ -5091,7 +5119,7 @@ def whatif_stress(
     fraction: float,
 ) -> None:
     older = pf_dashboard_series(PF_DEXKOUS)
-    fx = portfolio.long_fx(prices.adjusted, older)
+    fx = calc.long_fx(prices.adjusted, older)
     now = {str(t): float(v) * s.value for t, v in s.w.items()}
     mix = portfolio.mixed_in(j, ticker, fraction)
     later = {t: float(v) * s.value for t, v in zip(j.names, mix, strict=True)}
@@ -5179,7 +5207,7 @@ def stock_whatif(
     amount = fraction * s.value
     notes = [
         f"{ticker}에 평가액의 {fraction:.0%} ({portfolio.money(amount, p.base)}, 약"
-        f" {amount / stock_share(ticker, p.base, prices):,.1f}주) 추가"
+        f" {pf_num(amount / stock_share(ticker, p.base, prices), ',.1f')}주) 추가"
     ]
     if ticker in s.w.index:
         held = float(cast("float", s.w[ticker]))
@@ -5833,7 +5861,7 @@ def inv_controls(section: str) -> tuple[int, DeltaGenerator]:
 
 
 def inv_sp500(adjusted: pd.DataFrame, days: pd.DatetimeIndex) -> pd.Series:
-    return portfolio.market_returns(adjusted, "USD", days)
+    return calc.market_returns(adjusted, "USD", days)
 
 
 def inv_subject(
@@ -5926,7 +5954,7 @@ def inv_returns(  # noqa: PLR0913 - the view's inputs
     today = datetime.now().astimezone().date()
     turns = [s.turnover for s in made.steps if s.turnover is not None]
     start = cast("pd.Timestamp", filed.index[0])
-    time = portfolio.time_weighted(filed)
+    time = calc.time_weighted(filed)
     with st.container(horizontal=True, key="inv_return_cards"):
         st.metric(
             f"누적 · {label}",
@@ -6037,10 +6065,10 @@ def inv_fixed(
     del key
     priced = inv_priced(_q, _cusips, _prices)
     rets = portfolio.window(
-        portfolio.asset_returns(_prices.adjusted, portfolio.labels(priced), "USD"),
+        calc.asset_returns(_prices.adjusted, portfolio.labels(priced), "USD"),
         months,
     )
-    w, dropped = portfolio.covered(rets, priced)
+    w, dropped = calc.covered(rets, priced)
     return rets, w, dropped
 
 
@@ -6120,7 +6148,7 @@ def inv_league(
         pd.DatetimeIndex(pd.concat(list(series.values())).index).unique().sort_values()
     )
     rates, source, quote = pf_rates("USD", prices.close)
-    rf = portfolio.risk_free(rates, days, quote)
+    rf = calc.risk_free(rates, days, quote)
     key = (*keys, top, equal, months, source, pf_rates_key(rates))
     found = cached_peers(key, series, rf)
     pooled = found.count > 1
@@ -6170,7 +6198,7 @@ def inv_ratios(
     """``key`` stands for ``rets``; over the S&P 500 in dollars."""
     window = portfolio.window(rets, months)
     rates, source, quote = pf_rates("USD", prices.close)
-    rf = portfolio.risk_free(rates, pd.DatetimeIndex(window.index), quote)
+    rf = calc.risk_free(rates, pd.DatetimeIndex(window.index), quote)
     bench = partial(inv_sp500, prices.adjusted, pd.DatetimeIndex(window.index))
     tag = (*key, months, "sp500", source, pf_rates_key(rates))  # not the blended one
     return cached_ratios(tag, window, rf, bench)
@@ -6247,7 +6275,7 @@ def inv_compare(
         f" {found[0].period} 보고 · 티커 확인 종목",
     )
     theirs = investors.weights(found[0].rows, cusips)
-    own = portfolio.weights(portfolio.holdings(p, prices.close))
+    own = portfolio.weights(calc.holdings(p, prices.close))
     inv_overlap(theirs, own)
     korean: set[str] = {p.name} if portfolio.korean_weight(own) else set()
     with st.container(border=True):
@@ -6283,7 +6311,7 @@ def inv_compare(
             for name, (_, rets) in rows.items()
         }
         betas = {
-            name: portfolio.market_beta(
+            name: calc.market_beta(
                 portfolio.window(rets, months), prices.adjusted, "USD"
             )
             if name not in korean
@@ -6510,6 +6538,9 @@ def screening() -> None:
             f"스크리닝 기준 {len(changed)}개를 기본값에서 바꿔 적용 중입니다"
             " · 상단 설정에서 바꿀 수 있습니다"
         )
+    if args.demo:  # fixed values, nothing screened
+        screen_results(root, demo_screen.table(rt.dashboard.today()), criteria)
+        return
     try:
         stamp = screen.stamp(root)
         table = screen_table(str(root), stamp, criteria)

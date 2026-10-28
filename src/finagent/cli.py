@@ -6,12 +6,10 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import httpx
-
 from finagent import __version__, catalog
 from finagent.analysis.service import AnalysisService
-from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
-from finagent.service import DashboardService, local_now
+from finagent.demo import offline
+from finagent.service import DashboardService
 from finagent.sources import YAHOO_CACHE, YahooCloses
 
 if TYPE_CHECKING:
@@ -77,14 +75,9 @@ def build_service(
         return DashboardService(
             env, settings_path=settings_path, yahoo=YahooCloses(cache)
         )
-    today = local_now().date()
-    transport = demo_transport(today)
+    # No keys, no Yahoo and a client that fails: the demo fetches nothing.
     return DashboardService(
-        DEMO_KEYS,
-        client_factory=lambda: httpx.AsyncClient(transport=transport),
-        demo=True,
-        settings_path=settings_path,
-        yahoo=demo_closes(today),
+        {}, client_factory=offline, demo=True, settings_path=settings_path
     )
 
 

@@ -7,9 +7,9 @@ import httpx
 
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import AnalysisService, Event, RunInput
-from finagent.demo import DEMO_KEYS, demo_closes, demo_transport
 from finagent.runtime import Run, Runtime
 from finagent.service import DashboardService
+from tests.fake_sources import DEMO_KEYS, demo_closes, demo_transport
 
 NOW = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
 
