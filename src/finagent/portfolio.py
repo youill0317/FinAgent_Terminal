@@ -2,7 +2,8 @@
 
 Like the screener, this module is an exception to the dashboard's data rules
 (``tests/test_guardrails.py``): it imports ``yfinance`` (unofficial Yahoo
-Finance data) and writes files, all under ``data/portfolio/`` in the folder
+Finance data), downloads Ken French's daily factors from his Data Library
+when asked, and writes files, all under ``data/portfolio/`` in the folder
 the app runs from. yfinance's own caches go there too. Of the other finagent
 modules it imports only the pure math in ``quant`` and ``perf``; rates from
 the dashboard's sources (CD 91-day, FRED DEXKOUS) are passed in by app.py.
@@ -26,15 +27,18 @@ buys only at a close at most ``GAP_DAYS`` old.
 from __future__ import annotations
 
 import importlib.util
+import io
 import math
 import re
 import threading
 import uuid
+import zipfile
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Final, Literal, Protocol, cast, final
 
+import httpx
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -81,7 +85,25 @@ PERCENTILES: Final = (5, 25, 50, 75, 95)
 BINS: Final = 40
 WINDOWS: Final = {"6M": 6, "1Y": 12, "3Y": 36}
 HORIZONS: Final = {"1M": 21, "3M": 63, "6M": 126, "1Y": 252}
-ERP: Final = 0.05  # annual equity premium over the risk-free rate at S&P 500 beta 1
+FACTS_FILE: Final = "facts.json"  # on request: each holding's Yahoo market cap
+FACTORS_FILE: Final = "factors.parquet"  # on request: Ken French's monthly US factors
+FRENCH_URL: Final = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+FRENCH_FILES: Final = ("F-F_Research_Data_Factors_CSV.zip",)  # Mkt-RF, SMB, HML, RF
+FRENCH_START: Final = "1963-07-01"  # Fama-French (1997) factor history start
+FACTORS: Final = ("Mkt-RF", "SMB", "HML")
+FACTOR_MIN_MONTHS: Final = 36  # Fama-French (1997) Table 5: shortest window they fit
+MONTHS_PER_YEAR: Final = 12
+MOP_COM: Final = 60  # Moskowitz-Ooi-Pedersen (2012) eq. 1 EWMA center of mass (days)
+MOP_COVERAGE: Final = 0.99  # eq. 1's weights summed before a volatility is used
+# Days until the weights (1 - delta) delta^i, delta = 60/61, sum to MOP_COVERAGE: 279
+MOP_BURN: Final = math.ceil(
+    math.log(1 - MOP_COVERAGE) / math.log(MOP_COM / (MOP_COM + 1))
+)
+MOP_DAYS: Final = 261  # Moskowitz-Ooi-Pedersen (2012) eq. 1 annualisation factor
+MOP_LAGS: Final = {"1M": 1, "3M": 3, "6M": 6, "12M": 12}  # eq. 3 lags h, user-chosen
+BL_TAU: Final = 0.025  # Idzorek (2005) prior covariance scalar tau
+BL_PREMIUM: Final = 0.03  # Idzorek (2005): his example's specified market premium
+FRENCH_TIMEOUT: Final = 60.0
 KRW_SUFFIXES: Final = (".KS", ".KQ")
 VAR_LEVELS: Final = (0.95, 0.975, 0.99)
 REVERSE_LOSS: Final = 0.30
@@ -227,11 +249,21 @@ class Trade(_Frozen):
     memo: str = Field(default="", max_length=MEMO_LENGTH)  # absent in older files
 
 
+class View(_Frozen):
+    """The user's Black-Litterman view: one holding's annual return, in base."""
+
+    ticker: str
+    annual: float
+    confidence: float = Field(gt=0, le=1)  # Idzorek's, 1 = the view itself
+
+
 class Portfolio(_Frozen):
     id: str
     name: str
     base: Currency = "KRW"
     trades: tuple[Trade, ...] = ()
+    views: tuple[View, ...] = ()  # absent in older files
+    premium: float = BL_PREMIUM  # BL's annual market premium; absent in older files
 
 
 class Book(_Frozen):
@@ -460,6 +492,13 @@ def remove_trades(book: Book, pid: str, ids: Collection[str]) -> Book:
     return _replace(book, old.model_copy(update={"trades": trades}))
 
 
+def set_views(
+    book: Book, pid: str, views: tuple[View, ...], premium: float = BL_PREMIUM
+) -> Book:
+    old = _portfolio(book, pid)
+    return _replace(book, old.model_copy(update={"views": views, "premium": premium}))
+
+
 def book_tickers(book: Book) -> list[str]:
     return sorted({t.ticker for p in book.portfolios for t in p.trades})
 
@@ -498,6 +537,86 @@ def save_book(root: Path, book: Book) -> None:
     temp = path.with_name(f"{path.name}.tmp")
     _ = temp.write_text(book.model_dump_json(indent=2) + "\n", encoding="utf-8")
     _ = temp.replace(path)
+
+
+class Facts(_Frozen):
+    """One stock's Yahoo quote figures (``Ticker.info``) on the day fetched.
+
+    ``market_cap`` is in ``currency``, the quote's; NaN where Yahoo has none.
+    """
+
+    # NaN is written as NaN, which reads back, not as null, which does not.
+    model_config: ClassVar[ConfigDict] = ConfigDict(
+        frozen=True, ser_json_inf_nan="constants"
+    )
+
+    day: date
+    currency: str
+    market_cap: float
+
+
+def parse_french(text: str) -> pd.DataFrame:
+    """The monthly table of a Ken French CSV from ``FRENCH_START``: fractions."""
+    lines = text.splitlines()
+    head = next(i for i, line in enumerate(lines) if line.startswith(","))
+    columns = [name.strip() for name in lines[head].split(",")[1:]]
+    months: list[str] = []
+    values: list[list[float]] = []
+    for line in lines[head + 1 :]:
+        cells = line.split(",")
+        stamp = cells[0].strip()
+        if not re.fullmatch(r"\d{6}", stamp):
+            break
+        months.append(stamp)
+        values.append([float(cell) / 100 for cell in cells[1:]])
+    index = pd.to_datetime(months, format="%Y%m")
+    frame = pd.DataFrame(values, index=index, columns=columns)
+    return cast("pd.DataFrame", frame.loc[FRENCH_START:])
+
+
+def load_factors(root: Path) -> pd.DataFrame:
+    """The saved monthly factors, empty when there are none or columns differ."""
+    path = root / FACTORS_FILE
+    if not path.is_file():
+        return _empty()
+    frame = _read(path)
+    return frame if list(frame.columns) == [*FACTORS, "RF"] else _empty()
+
+
+class _FactsFile(_Frozen):
+    stocks: dict[str, Facts] = Field(default_factory=dict)
+
+
+def load_facts(root: Path) -> dict[str, Facts]:
+    """The saved quote figures by ticker; none when the file is missing or bad."""
+    path = root / FACTS_FILE
+    if not path.is_file():
+        return {}
+    try:
+        return dict(_FactsFile.model_validate_json(path.read_bytes()).stocks)
+    except (OSError, ValidationError):
+        return {}
+
+
+def save_facts(root: Path, fresh: Mapping[str, Facts]) -> None:
+    """Merge ``fresh`` into the saved figures, atomically."""
+    root.mkdir(parents=True, exist_ok=True)
+    body = _FactsFile(stocks={**load_facts(root), **fresh})
+    path = root / FACTS_FILE
+    temp = path.with_name(f"{path.name}.tmp")
+    _ = temp.write_text(body.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    _ = temp.replace(path)
+
+
+def facts_of(info: Mapping[str, object], day: date) -> Facts:
+    """``Facts`` from a ``Ticker.info`` mapping."""
+    cap = info.get("marketCap")
+    currency = info.get("currency")
+    return Facts(
+        day=day,
+        currency=currency if isinstance(currency, str) else "",
+        market_cap=float(cap) if isinstance(cap, int | float) else math.nan,
+    )
 
 
 def _empty() -> pd.DataFrame:
@@ -1844,19 +1963,331 @@ def asset_betas(j: Joint) -> NDArray[np.float64]:
     )
 
 
-def expected_returns(j: Joint, rf: pd.Series) -> NDArray[np.float64]:
-    """CAPM daily expected returns on ``j.full``'s days: rf + beta x ``ERP``.
+def market_weights(
+    facts: Mapping[str, Facts], names: Sequence[str], close: pd.DataFrame
+) -> NDArray[np.float64] | None:
+    """Market-capitalisation weights of ``names`` in a common currency.
 
-    ``rf``: daily risk-free returns (``risk_free``), 0 where missing; beta
-    the portfolio's to the S&P 500 over the window (``asset_betas``), 1 when
-    it cannot be estimated.
+    Converts USD figures by the latest USD/KRW close when ``names`` mix
+    currencies. None unless every holding has a positive market cap.
     """
-    beta = float(j.w @ asset_betas(j))
-    if not math.isfinite(beta):
-        beta = 1.0
-    premium = (1 + ERP) ** (1 / per_year(j.full.index)) - 1
+    held: list[Facts] = []
+    for name in names:
+        f = facts.get(name)
+        if f is None or not f.market_cap > 0 or f.currency not in {"USD", "KRW"}:
+            return None
+        held.append(f)
+    currencies = {f.currency for f in held}
+    rate = 1.0
+    if len(currencies) > 1:
+        fx = fx_series(close)
+        if fx.empty:
+            return None
+        rate = float(fx.iloc[-1])
+    caps = np.array(
+        [f.market_cap * (rate if f.currency == "USD" else 1.0) for f in held],
+        dtype="float64",
+    )
+    return caps / float(caps.sum())
+
+
+def black_litterman(
+    j: Joint,
+    rf: pd.Series,
+    mkt_w: NDArray[np.float64] | None,
+    views: Sequence[View],
+    premium: float = BL_PREMIUM,
+) -> NDArray[np.float64] | None:
+    """Each holding's daily combined expected return, Idzorek's formula 19.
+
+    Black-Litterman (1992) and Idzorek (2005): reverse-optimised prior
+    ``rf + lambda Sigma w_mkt`` (formula 1) with ``lambda`` the specified
+    annual market ``premium``, a day at the views' rate, over the market-cap
+    portfolio's variance in ``j.window``, Sigma the window's excess-return
+    covariance and ``tau`` = ``BL_TAU`` (0.025). Each view on a
+    holding is P = its unit row, Q its ``annual`` return a day; Omega
+    diagonal, (1 - c) / c times the view's own prior variance (Idzorek's
+    confidence c, in Walters' closed form), so c = 1 takes the view as is
+    and tau cancels. The paper gives no standard error. None without
+    ``mkt_w`` or a view on a holding.
+    """
+    on = [v for v in views if v.ticker in j.names]
+    if not on or mkt_w is None:
+        return None
+    known = rf.reindex(j.window.index).fillna(0.0).to_numpy(dtype="float64")
+    rf_today = float(known[-1]) if len(known) else 0.0
+    excess = j.window.to_numpy(dtype="float64") - known[:, None]
+    sigma = np.cov(excess, rowvar=False).reshape(len(j.names), -1)
+    mkt_var = float(mkt_w @ sigma @ mkt_w)
+    if not mkt_var > 0:
+        return None
+    year = per_year(j.full.index)
+    lam = ((1 + premium) ** (1 / year) - 1) / mkt_var
+    prior = rf_today + lam * (sigma @ mkt_w)
+    prior_cov = BL_TAU * sigma
+    p = np.zeros((len(on), len(j.names)))
+    for row, v in enumerate(on):
+        p[row, j.names.index(v.ticker)] = 1.0
+    q = (1 + np.array([v.annual for v in on])) ** (1 / year) - 1
+    c = np.array([v.confidence for v in on])
+    seen = p @ prior_cov
+    spread = seen @ p.T
+    omega = np.diag((1 - c) / c * np.diag(spread))
+    gain = np.linalg.solve(spread + omega, seen).T
+    return prior + gain @ (q - p @ prior)
+
+
+def trailing_means(j: Joint) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Each holding's mean daily return over the window's length, and its variance.
+
+    Row t of ``len(j.full) + 1`` averages the ``len(j.window)`` rows of
+    ``j.full`` before it, so it forecasts day t from earlier days only (as
+    ``quant.blocks`` needs) and the last row, the window's mean, is today's.
+    The variance is the mean's sampling variance, s^2 / n. NaN where fewer
+    rows precede.
+    """
+    x = j.full.to_numpy(dtype="float64")
+    n = len(j.window)
+    zero = np.zeros((1, x.shape[1]))
+    s1 = np.concatenate([zero, np.cumsum(x, axis=0)])
+    s2 = np.concatenate([zero, np.cumsum(x**2, axis=0)])
+    mean = np.full(s1.shape, np.nan)
+    var = np.full(s1.shape, np.nan)
+    t = np.arange(n, len(s1))
+    mean[t] = (s1[t] - s1[t - n]) / n
+    var[t] = ((s2[t] - s2[t - n]) / n - mean[t] ** 2) / (n - 1)
+    return mean, var
+
+
+def _rolling_moments(
+    j: Joint,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Rolling ``len(j.window)``-day sample means and covariances (ddof=1)."""
+    x = j.full.to_numpy(dtype="float64")
+    n = len(j.window)
+    k = x.shape[1]
+    s1 = np.concatenate([np.zeros((1, k)), np.cumsum(x, axis=0)])
+    mean = (s1[n:] - s1[:-n]) / n
+    s2 = np.concatenate(
+        [np.zeros((1, k, k)), np.cumsum(x[:, :, None] * x[:, None, :], axis=0)]
+    )
+    cov = (s2[n:] - s2[:-n] - n * mean[:, :, None] * mean[:, None, :]) / (n - 1)
+    return mean, cov
+
+
+def james_stein(j: Joint) -> NDArray[np.float64] | None:
+    """James-Stein (1961) shrunk means under an unknown covariance.
+
+    With X = sqrt(n) times each ``len(j.window)``-day sample mean and the
+    Wishart A = (n - 1) S on m = n - 1 degrees of freedom, eq. 23 with the
+    optimum c, ``(1 - (k - 2) / (m - k + 3) / (X' A^-1 X)) X``, shrunk toward 0 and not
+    truncated at 0 (positive-part is Baranchik's). The paper gives no
+    standard error. Rows match ``trailing_means``; None with fewer than three
+    assets or ``n <= k``.
+    """
+    k = len(j.names)
+    n = len(j.window)
+    if k < 3 or n <= k:  # noqa: PLR2004
+        return None
+    mean, cov = _rolling_moments(j)
+    sol = (np.linalg.pinv(cov) @ mean[..., None]).squeeze(-1)
+    quad = (n / (n - 1)) * np.sum(mean * sol, axis=1)
+    factor = np.where(quad > 0, 1.0 - (k - 2) / ((n - k + 2) * quad), 0.0)
+    out = np.full((len(j.full) + 1, k), np.nan)
+    out[n:] = factor[:, None] * mean
+    return out
+
+
+def bayes_stein(j: Joint) -> tuple[NDArray[np.float64], float] | None:
+    """Jorion (1986) Bayes-Stein means and today's portfolio SE.
+
+    Shrinks each ``len(j.window)``-day sample mean Y toward the minimum-
+    variance portfolio mean ``Y_0 = (1' Sigma^-1 Y) / (1' Sigma^-1 1)``
+    (eq. 14) with weight ``v = (k + 2) / ((k + 2) + n (Y - Y_0 1)' Sigma^-1
+    (Y - Y_0 1))`` (eq. 17) and ``Sigma = (n - 1) / (n - k - 2) * S``
+    (eq. 18). Today's SE is from eq. 15's predictive covariance less Sigma,
+    ``Sigma / (n + lambda) + lambda / (n (n + 1 + lambda)) 1 1' / (1' Sigma^-1
+    1)`` with v = lambda / (n + lambda). None with fewer than three assets or
+    ``n <= k + 2``.
+    """
+    k = len(j.names)
+    n = len(j.window)
+    if k < 3 or n <= k + 2:  # noqa: PLR2004
+        return None
+    mean, cov = _rolling_moments(j)
+    sigma = cov * ((n - 1) / (n - k - 2))
+    inv = np.linalg.pinv(sigma)
+    inv_ones = inv.sum(axis=2)
+    denom = inv_ones.sum(axis=1)
+    y0 = np.sum(inv_ones * mean, axis=1) / denom
+    gap = mean - y0[:, None]
+    quad = np.einsum("bi,bij,bj->b", gap, inv, gap)
+    v = (k + 2) / ((k + 2) + n * np.maximum(quad, 0.0))
+    out = np.full((len(j.full) + 1, k), np.nan)
+    out[n:] = (1.0 - v[:, None]) * mean + v[:, None] * y0[:, None]
+    v_last = float(v[-1])
+    # lambda / (n (n + 1 + lambda)) with v = lambda / (n + lambda)
+    var_p = (1.0 - v_last) / n * float(j.w @ sigma[-1] @ j.w) + v_last / (
+        (n + 1 - v_last) * float(denom[-1])
+    )
+    return out, math.sqrt(max(var_p, 0.0))
+
+
+def ewma_volatility(r: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Moskowitz-Ooi-Pedersen (2012) eq. 1 ex-ante annualised volatility.
+
+    Row t of ``len(r) + 1`` uses days before t with exponential weights of
+    center of mass ``MOP_COM`` (delta = 60/61):
+    ``sigma_t^2 = 261 sum_{i=0}^{t-1} (1 - delta) delta^i (r_{t-1-i} - r_bar_t)^2``
+    where ``r_bar_t = sum_{i=0}^{t-1} (1 - delta) delta^i r_{t-1-i}``.
+    NaN before ``MOP_BURN`` days, until the weights sum to ``MOP_COVERAGE``
+    (this app's choice; the paper's sum runs over an unbounded past).
+    """
+    delta = MOP_COM / (MOP_COM + 1)
+    n, k = r.shape
+    s1 = np.zeros((n + 1, k), dtype="float64")
+    s2 = np.zeros((n + 1, k), dtype="float64")
+    for t in range(n):
+        s1[t + 1] = delta * s1[t] + (1.0 - delta) * r[t]
+        s2[t + 1] = delta * s2[t] + (1.0 - delta) * r[t] ** 2
+    power = delta ** np.arange(n + 1)[:, None]
+    var = MOP_DAYS * np.maximum(s2 - (1.0 + power) * s1**2, 0.0)
+    sd = np.sqrt(var)
+    sd[:MOP_BURN] = np.nan
+    return sd
+
+
+def momentum_returns(
+    j: Joint, rf: pd.Series, lag_months: int
+) -> tuple[NDArray[np.float64], float, int]:
+    """Moskowitz-Ooi-Pedersen (2012) eq. 1 and eq. 3 daily expected returns.
+
+    Fits eq. 3 at lag h = ``lag_months`` (one of ``MOP_LAGS``),
+    ``r_t^s / sigma_{t-1}^s = alpha + beta sign(r_{t-h}^s) + eps_t^s``,
+    pooled across holdings on the calendar months completed before each day,
+    where ``sigma`` is the eq. 1 EWMA ex-ante volatility at the month's start
+    and ``r^s`` a month's compounded return less the compounded risk-free
+    rate. The first and last months may be partial and are left out. With a
+    +-1 regressor, ``alpha + beta`` is the mean scaled return after a +1 sign
+    and ``alpha - beta`` after -1. The daily rate compounds over a month's
+    share of the year's days (``per_year`` / 12) to the month's expected total
+    return, ``(1 + rf)^(days) + sigma (alpha + beta sign(r_{t-h}))``, the sign
+    from h months before the day's own; NaN until both signs have been seen.
+    Second, today's portfolio daily SE from standard errors clustered by
+    month (MOP 2012 Section 3.1), with the usual CR1 small-sample factor
+    G / (G - 1) (N - 1) / (N - 2), carried to the daily rate by its
+    derivative; 0 with fewer than two months or three observations. Third,
+    the fewer of the two signs' distinct months today, for a thin-data
+    warning.
+    """
+    x = j.full.to_numpy(dtype="float64")
+    month = per_year(j.full.index) / MONTHS_PER_YEAR  # days to compound over
     known = rf.reindex(j.full.index).fillna(0.0).to_numpy(dtype="float64")
-    return known + beta * premium
+    sd = ewma_volatility(x - known[:, None])
+    growth = np.concatenate([np.ones((1, x.shape[1])), np.cumprod(1 + x, axis=0)])
+    cash = np.concatenate([[1.0], np.cumprod(1 + known)])
+    periods = pd.DatetimeIndex(j.full.index).to_period("M")
+    starts = np.flatnonzero(np.r_[True, periods[1:] != periods[:-1]])
+    ends = np.append(starts[1:], len(x))
+    count = len(starts)
+    excess = growth[ends] / growth[starts] - (cash[ends] / cash[starts])[:, None]
+    excess[[0, -1]] = np.nan  # possibly partial months
+    scaled = excess / sd[starts]
+    signs = np.full_like(excess, np.nan)
+    signs[lag_months:] = np.sign(excess[: count - lag_months])
+    rows = np.arange(len(growth))
+    own = np.searchsorted(starts, rows, side="right") - 1  # today: the last month
+    done = np.searchsorted(ends, rows, side="right")
+    means: list[NDArray[np.float64]] = []
+    sums: list[NDArray[np.float64]] = []
+    counts: list[NDArray[np.int64]] = []
+    for sign in (1.0, -1.0):
+        hit = (signs == sign) & np.isfinite(scaled)
+        s_m = np.where(hit, scaled, 0.0).sum(axis=1)
+        n_m = hit.sum(axis=1)
+        total = np.concatenate([[0.0], np.cumsum(s_m)])[done]
+        seen = np.concatenate([[0], np.cumsum(n_m)])[done]
+        mean = total / np.maximum(seen, 1)
+        means.append(np.where(seen > 0, mean, np.nan))
+        sums.append(s_m)
+        counts.append(n_m)
+    alpha, beta = (means[0] + means[1]) / 2, (means[0] - means[1]) / 2
+    rates = np.append(known, known[-1] if len(known) else 0.0)
+    fitted = alpha[:, None] + beta[:, None] * signs[own]
+    total = (1 + rates[:, None]) ** month + sd * fitted
+    daily = total ** (1 / month) - 1
+    se = 0.0
+    if np.isfinite(daily[-1]).all():
+        sign_now = signs[-1]
+        # d(daily) / d(fitted) for each holding today
+        weights = j.w * sd[-1] * total[-1] ** (1 / month - 1) / month
+        score = np.zeros(count)
+        for idx, sign in enumerate((1.0, -1.0)):
+            u_m = sums[idx] - counts[idx] * float(means[idx][-1])
+            c_g = float(weights[sign_now == sign].sum())
+            score += c_g * u_m / int(counts[idx].sum())
+        clusters = int(((counts[0] + counts[1]) > 0).sum())
+        obs = int(counts[0].sum() + counts[1].sum())
+        if clusters > 1 and obs > 2:  # noqa: PLR2004 - else no clustered error
+            cr1 = clusters / (clusters - 1) * (obs - 1) / (obs - 2)
+            se = math.sqrt(cr1 * float(score @ score))
+    return daily, se, min(int((c > 0).sum()) for c in counts)
+
+
+def factor_returns(
+    adjusted: pd.DataFrame,
+    names: Sequence[str],
+    w: NDArray[np.float64],
+    factors: pd.DataFrame,
+) -> tuple[NDArray[np.float64], float] | None:
+    """Fama-French (1997) three-factor expected monthly returns and portfolio SE.
+
+    Regresses each holding's monthly excess returns (month-end ``adjusted``
+    closes over ``RF``) on ``Mkt-RF``, ``SMB`` and ``HML`` over every month
+    both have (the full-period constant-slope regression, eq. 4). Each
+    holding's monthly cost of equity is eq. 3, ``RF + b_i E[Mkt-RF] + s_i
+    E[SMB] + h_i E[HML]``, with ``RF`` the latest month's one-month T-bill in
+    ``factors`` and ``E[.]`` the average monthly premium since July 1963
+    (``FRENCH_START``), as in Table 7. The portfolio's monthly SE is Table
+    8's, ``Prem' var(u_g) Prem + g' var(u_Prem) g + 1'[var(u_Prem) o
+    var(u_g)]1``, with var(u_g) the slopes' OLS covariance and var(u_Prem)
+    the premiums' mean covariance. None with a Korean holding, without
+    factors or under ``FACTOR_MIN_MONTHS`` months (this app's floor: the
+    paper sets none, and its shortest rolling window is three years).
+    """
+    if (
+        factors.empty
+        or any(korean(n) for n in names)
+        or any(n not in adjusted.columns for n in names)
+    ):
+        return None
+    closes = adjusted[list(names)].dropna(how="all")
+    if closes.empty:
+        return None
+    monthly = (
+        closes.groupby(pd.DatetimeIndex(closes.index).to_period("M"))
+        .last()
+        .pct_change(fill_method=None)
+    )
+    fac = factors.copy()
+    fac.index = pd.DatetimeIndex(fac.index).to_period("M")
+    both = cast("pd.DataFrame", monthly.join(fac, how="inner")).dropna()
+    if len(both) < FACTOR_MIN_MONTHS:
+        return None
+    x = np.column_stack([np.ones(len(both)), both[list(FACTORS)].to_numpy()])
+    y = both[list(names)].to_numpy() - both[["RF"]].to_numpy()
+    coef = np.linalg.lstsq(x, y, rcond=None)[0]
+    betas = coef[1:].T
+    hist = factors[list(FACTORS)].to_numpy(dtype="float64")
+    mean_f = hist.mean(axis=0)
+    cost = float(factors["RF"].iloc[-1]) + betas @ mean_f
+    b_p = betas.T @ w
+    resid = (y - x @ coef) @ w
+    s2 = float(resid @ resid) / (len(both) - x.shape[1])
+    cov_b = s2 * np.linalg.pinv(x.T @ x)[1:, 1:]
+    cov_f = np.cov(hist, rowvar=False) / len(hist)
+    var_m = float(b_p @ cov_f @ b_p + mean_f @ cov_b @ mean_f + np.trace(cov_b @ cov_f))
+    return cost, math.sqrt(max(var_m, 0.0))
 
 
 def added(j: Joint, cov: NDArray[np.float64], ticker: str, fraction: float) -> Added:
@@ -2048,6 +2479,19 @@ class Simulation:
     paths: perf.PathRisk
     fan: list[dict[str, float]]
     ends: list[dict[str, float]]
+    outcomes: NDArray[np.float64]  # each path's growth of 1 at zero drift
+
+
+@dataclass(frozen=True, slots=True)
+class Tradeoff:
+    """Simulated returns over the horizon under one expected return."""
+
+    mean: float
+    median: float
+    gain: float  # share of paths ending above the start
+    low: float  # 5th percentile
+    es: float | None  # mean loss of the worst 5%
+    high: float  # 95th percentile
 
 
 def simulation(
@@ -2059,13 +2503,30 @@ def simulation(
 ) -> Simulation:
     """Summary of growth ``paths``; ``current`` and ``peak`` are past wealth.
 
-    The paths are zero drift; ``drift`` (daily) compounds onto them.
+    The paths are zero drift; the daily ``drift`` compounds onto them.
     """
+    outcomes = paths[:, -1].copy()
     paths = paths * (1 + drift) ** np.arange(paths.shape[1])
     return Simulation(
         perf.path_risk(paths[:, 1:], current, peak),
         fan(paths, value),
         histogram(paths, value),
+        outcomes,
+    )
+
+
+def tradeoff(outcomes: NDArray[np.float64], days: int, drift: float) -> Tradeoff:
+    """``Simulation.outcomes`` over ``days`` with the daily ``drift`` compounded on."""
+    r = outcomes * (1 + drift) ** days - 1
+    low, median, high = np.percentile(r, (5, 50, 95))
+    tail = quant.var_es(r, 0.95)
+    return Tradeoff(
+        float(r.mean()),
+        float(median),
+        float((r > 0).mean()),
+        float(low),
+        None if tail is None else tail[1],
+        float(high),
     )
 
 
@@ -2237,7 +2698,8 @@ def density(
     block, its mean block re-estimated there (``quant.block_length``), as
     the fan resamples the window; blocks with fewer days before them are
     left out. ``drift`` (daily, on ``j.full``'s days) compounds onto each
-    block's months at its first day's rate, as ``simulation`` onto the fan's.
+    block's months at its first day's rate, as ``simulation`` onto the fan's;
+    blocks where it is NaN are left out.
     """
     held = j.full.to_numpy(dtype="float64")
     if f is not None:
@@ -2246,6 +2708,10 @@ def density(
     n = len(j.window)
     if f is None:
         outcomes, starts = outcomes[starts >= n], starts[starts >= n]
+    rates = None if drift is None else drift[-len(held) :][starts]
+    if rates is not None:  # blocks with no forecast of the drift are left out
+        known = np.isfinite(rates)
+        outcomes, starts, rates = outcomes[known], starts[known], rates[known]
     rng = np.random.default_rng(quant.SEED)
     samples = np.empty((len(starts), paths))
     for i, start in enumerate(starts):
@@ -2262,8 +2728,7 @@ def density(
                 else quant.model_paths(f, j.w, picks, f.model.states[start])
             )
             samples[i] = np.prod(1 + np.maximum(daily, -1.0), axis=1) - 1
-    if drift is not None:
-        rates = drift[-len(held) :][starts]
+    if rates is not None:
         samples = (1 + samples) * (1 + rates[:, None]) ** quant.MONTH_DAYS - 1
     return Density(quant.berkowitz(quant.pit(outcomes, samples)), len(starts))
 
@@ -2898,6 +3363,35 @@ class Source(Protocol):
     def history(self, tickers: Sequence[str], start: date) -> Prices: ...
 
 
+class FactsSource(Protocol):
+    def facts(self, tickers: Sequence[str]) -> dict[str, Facts]: ...
+
+
+class FactorsSource(Protocol):
+    def factors(self) -> pd.DataFrame: ...
+
+
+@final
+class French:
+    """Ken French's Data Library: the daily US factors, on the days all have."""
+
+    def __init__(self, root: Path) -> None:
+        """Nothing is cached under ``root``, unlike ``Yahoo``."""
+        del root
+
+    def factors(self) -> pd.DataFrame:
+        tables: list[pd.DataFrame] = []
+        for name in FRENCH_FILES:
+            response = httpx.get(
+                FRENCH_URL + name, timeout=FRENCH_TIMEOUT, follow_redirects=True
+            )
+            _ = response.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                text = archive.read(archive.namelist()[0]).decode("latin-1")
+            tables.append(parse_french(text))
+        return pd.concat(tables, axis=1, join="inner")
+
+
 @final
 class Yahoo:
     """Daily closes and adjusted closes from yfinance."""
@@ -2927,6 +3421,19 @@ class Yahoo:
                 for name in ("Close", "Adj Close", "Open", "High", "Low")
             )
         )
+
+    def facts(self, tickers: Sequence[str]) -> dict[str, Facts]:
+        """Each ticker's ``Facts``; one Yahoo has no market cap for is left out."""
+        import yfinance as yf  # noqa: PLC0415
+
+        today = datetime.now(UTC).date()
+        out: dict[str, Facts] = {}
+        for ticker in tickers:
+            info = cast("Mapping[str, object]", yf.Ticker(ticker).info)
+            found = facts_of(info, today)
+            if found.market_cap > 0:
+                out[ticker] = found
+        return out
 
 
 def market_series(ticker: str) -> bool:
@@ -2973,6 +3480,8 @@ class Fetcher:
 
     __slots__ = (
         "_deepened",
+        "_factors",
+        "_facts",
         "_lock",
         "_progress",
         "_saving",
@@ -2981,10 +3490,18 @@ class Fetcher:
         "root",
     )
 
-    def __init__(self, root: Path, source: Callable[[Path], Source] = Yahoo) -> None:
-        """Save prices under ``root``; ``source`` builds the fetcher per run."""
+    def __init__(
+        self,
+        root: Path,
+        source: Callable[[Path], Source] = Yahoo,
+        facts: Callable[[Path], FactsSource] = Yahoo,
+        factors: Callable[[Path], FactorsSource] = French,
+    ) -> None:
+        """Save under ``root``; ``source`` and ``facts`` build the fetchers per run."""
         self.root = root
         self._source = source
+        self._facts = facts
+        self._factors = factors
         self._lock = threading.Lock()
         self._saving = threading.Lock()  # one read-merge-write of the files at a time
         self._progress = Progress()
@@ -3024,6 +3541,61 @@ class Fetcher:
             daemon=True,
         ).start()
         return True
+
+    def start_facts(self, tickers: Sequence[str]) -> bool:
+        """Fetch ``tickers``' ``Facts`` unless a fetch is already running."""
+        with self._lock:
+            if self._progress.running or not tickers:
+                return False
+            self._progress = Progress(running=True, message=", ".join(tickers))
+        threading.Thread(
+            target=self._run_facts,
+            args=(list(tickers),),
+            name="finagent-facts",
+            daemon=True,
+        ).start()
+        return True
+
+    def _run_facts(self, tickers: list[str]) -> None:
+        try:
+            got = self._facts(self.root).facts(tickers)
+            with self._saving:
+                save_facts(self.root, got)
+        except Exception as error:  # noqa: BLE001 - shown on the page, not lost
+            self._finish(
+                f"기본 정보를 받지 못했습니다: {type(error).__name__}: {error}"
+            )
+            return
+        lost = [t for t in tickers if t not in got]
+        parts = [f"{len(got)}종목 기본 정보 저장"] if got else []
+        if lost:
+            parts.append(f"받지 못함: {', '.join(lost)}")
+        self._finish(" · ".join(parts), failed=bool(lost))
+
+    def start_factors(self) -> bool:
+        """Fetch Ken French's monthly factors unless a fetch is already running."""
+        with self._lock:
+            if self._progress.running:
+                return False
+            self._progress = Progress(running=True, message="Fama–French 요인")
+        threading.Thread(
+            target=self._run_factors, name="finagent-factors", daemon=True
+        ).start()
+        return True
+
+    def _run_factors(self) -> None:
+        try:
+            frame = self._factors(self.root).factors()
+            with self._saving:
+                self.root.mkdir(parents=True, exist_ok=True)
+                _write(frame, self.root / FACTORS_FILE)
+        except Exception as error:  # noqa: BLE001 - shown on the page, not lost
+            self._finish(
+                f"요인 자료를 받지 못했습니다: {type(error).__name__}: {error}"
+            )
+            return
+        last = cast("pd.Timestamp", frame.index[-1]).date()
+        self._finish(f"Fama–French 요인 저장({last}까지)", failed=False)
 
     def deepen(self, prices: Prices) -> bool:
         """Once per session, fetch the indices and USD/KRW back to ``LONG_START``.

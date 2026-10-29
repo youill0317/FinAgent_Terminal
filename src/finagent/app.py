@@ -479,7 +479,7 @@ def training_settings() -> None:
         " 종목"
         + (" · 목록에 없는 티커는 입력하면 가격을 받아 추가" if typed else "")
         + f" · 환율 {portfolio.FX}는 항상 포함 · 지수·금리 제외"
-        "\n\n**기준** 꼬리위험·전망 탭 사용 조건: 보유 종목을 모두 담은 모델 ·"
+        "\n\n**기준** 시뮬레이션 탭 사용 조건: 보유 종목을 모두 담은 모델 ·"
         f" 기준 통화와 다른 종목은 {portfolio.FX}로 환산",
     )
     if error := state.pop("train_error", ""):
@@ -1581,16 +1581,14 @@ def screen_results(root: Path, table: pd.DataFrame, c: screen.Criteria) -> None:
 
 PF_SECTIONS = {
     "returns": "수익률",
-    "analysis": "위험지표",
-    "correlation": "상관·분산",
-    "tail": "꼬리위험",
-    "outlook": "전망",
+    "stats": "통계",
+    "simulation": "시뮬레이션",
     "stress": "스트레스",
 }
 PF_WINDOW_HELP = (
     "**정의** 지표·분포 추정에 쓰는 최근 일간 수익률 기간 · "
     + " · ".join(f"{k} {v}개월" for k, v in portfolio.WINDOWS.items())
-    + "\n\n**기준** 전망·편입 효과: 재표본 대상 과거 수익률 · 시뮬레이션 길이:"
+    + "\n\n**기준** 시뮬레이션·편입 효과: 재표본 대상 과거 수익률 · 시뮬레이션 길이:"
     " 전망 기간"
 )
 PF_HORIZON_HELP = (
@@ -1871,7 +1869,7 @@ def cached_paths(
 
     ``_w`` replaces ``_j``'s weights on the same draws; ``key`` stands for it.
     ``_f`` is the volatility filter when ``fhs``; ``drift`` the daily
-    expected return (``portfolio.simulation``).
+    expected return.
     """
     del key
     growth = calc.growth(_j, _picks, _f if fhs else None, _w)
@@ -2009,7 +2007,7 @@ class Subject:
 
 
 def pf_subject(p: portfolio.Portfolio, prices: portfolio.Prices) -> Subject:
-    pid = p.model_dump_json()
+    pid = p.model_dump_json(exclude={"views"})  # read by the BL model only
     items = calc.holdings(p, prices.close)
     w = portfolio.weights(items)
     unknown = portfolio.unpriced(items)
@@ -3245,12 +3243,6 @@ def pf_stats(s: Subject, prices: portfolio.Prices, months: int) -> None:
             pf_advanced(stats, s.bench_label)
 
 
-def pf_analysis(p: portfolio.Portfolio, prices: portfolio.Prices, months: int) -> None:
-    s = pf_subject(p, prices)
-    pf_stats(s, prices, months)
-    pf_style_box(s, prices, "pf_style")
-
-
 def pf_style_box(s: Subject, prices: portfolio.Prices, key: str) -> None:
     box = st.expander("스타일 분석", key=key, on_change="rerun")
     if box.open and not s.w.empty:
@@ -3931,7 +3923,7 @@ def pf_vol(
             default="gjr",
             required=True,
             key="pf_vol_model",
-            persist_state="page",  # 전망 shows it only under FHS
+            persist_state="page",
             help="**정의** FHS·EVT VaR·ES, FHS 시뮬레이션, FHS·EVT 사후검정의"
             " 변동성 필터 · GJR-GARCH(1,1): 음의 충격에 더 큰 분산 반응 · HAR: 어제·"
             "지난주·지난달 평균 분산의 회귀(Corsi 2009) · 경로의존(PDV): 과거 수익률과"
@@ -4002,7 +3994,7 @@ def pf_vol(
     return PfVol(v, chosen, f, label)
 
 
-def pf_density(d: portfolio.Density, *, fhs: bool, capm: bool = False) -> None:
+def pf_density(d: portfolio.Density, *, fhs: bool, drift: str = PF_ZERO_DRIFT) -> None:
     drawn = (
         f"필터 추정 기간의 겹치지 않는 {quant.MONTH_DAYS}일 구간마다 첫날 변동성"
         " 기준 모의"
@@ -4010,11 +4002,7 @@ def pf_density(d: portfolio.Density, *, fhs: bool, capm: bool = False) -> None:
         else f"전체 기간의 겹치지 않는 {quant.MONTH_DAYS}일 구간마다 직전 선택 기간"
         " 수익률의 묶음 재표본(Politis–White 2004, 묶음 길이도 그 기간"
         " 추정) · 앞에 선택 기간만큼 자료가 있는 구간"
-    ) + (
-        " · 기대수익: 구간 첫날 무위험수익률 + 지금 베타 × 위험프리미엄"
-        if capm
-        else f" · {PF_ZERO_DRIFT}"
-    )
+    ) + f" · {drift}"
     headed(
         f"**분포 검증** · 1개월, {d.blocks}구간",
         "**정의** 1개월 수익률 예측 분포의 사후 검증 · PIT: 예측 1개월 수익률"
@@ -4233,7 +4221,7 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
     adjusted: pd.DataFrame,
     warns: list[str],
     drift: PfDrift | None = None,
-) -> None:
+) -> portfolio.Simulation:
     """Monte Carlo of today's weights; the draws are shared across weights.
 
     ``key`` stands for ``j`` and ``s.rets``; ``vol`` is the filter under FHS,
@@ -4242,7 +4230,7 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
     for the first heading; ``drift`` the expected returns, None for zero.
     """
     base, held = s.base, s.rets
-    today = 0.0 if drift is None else float(drift.daily[-1])
+    today = 0.0 if drift is None else drift.today
     assumed = PF_ZERO_DRIFT if drift is None else drift.note
     label = state.get("pf_horizon") or "1M"  # 전망 기간, in the top row
     days = portfolio.HORIZONS[label]
@@ -4316,6 +4304,7 @@ def pf_paths(  # noqa: PLR0913 - the section's inputs
             " 점선: 지금 평가액",
         )
         st.altair_chart(pf_end_chart(sim.ends, value, base), alt="분포")
+    return sim
 
 
 def pf_fhs_note(vol: PfVol) -> str:
@@ -4384,7 +4373,7 @@ def pf_tails(
     """``t``: ``j``'s tails, below the VaR·ES box."""
     with st.container(border=True):
         headed(
-            f"**사후검정** · 95% VaR·ES, 최근 {quant.BACKTEST_DAYS}일"
+            f"**사후검정** · 1일 95% VaR·ES, 최근 {quant.BACKTEST_DAYS}일"
             + (f", 직전 {t.lookback:,}일 기준" if t.lookback else ""),
             f"**정의** 최근 {quant.BACKTEST_DAYS}일 각각의 95% VaR·ES 예측과"
             " 실제 손실의 비교 · 초과 횟수: 손실 > 그날 VaR인 날 · 기대: 일수 × 5% ·"
@@ -4482,7 +4471,7 @@ def pf_backtest(t: portfolio.Tails) -> None:
 def pf_risk_inputs(
     s: Subject, prices: portfolio.Prices, months: int
 ) -> tuple[Key, portfolio.Joint, float, list[str]] | None:
-    """The tail and outlook sections' joint returns (cached).
+    """The simulation section's joint returns (cached).
 
     Last, the "!" lines for the section's first heading.
     """
@@ -4498,16 +4487,84 @@ def pf_risk_inputs(
     return key, j, value, pf_gaps(dropped, j.late)
 
 
-def pf_tail(
-    s: Subject, prices: portfolio.Prices, months: int, row: DeltaGenerator
+def pf_simulation(
+    s: Subject,
+    prices: portfolio.Prices,
+    months: int,
+    row: DeltaGenerator,
+    p: portfolio.Portfolio | None = None,
 ) -> None:
-    """``row``: the 추정 기간 row, which the 변동성 모델 control joins."""
+    """VaR·ES, the paths, then their checks.
+
+    ``row``: the 추정 기간 row, which the 변동성 모델 control joins; ``p``,
+    the saved portfolio whose views (내 견해) the BL model reads.
+    """
     found = pf_risk_inputs(s, prices, months)
     if found is None:
         return
     key, j, value, warns = found
     with row:
         vol = pf_vol(key, s, prices, j, inline=True)
+    gens = pf_gens(j, s.base, prices.adjusted)
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        gen = pf_generator_controls(gens)
+        fhs = gen is None and st.toggle(
+            "현재 변동성 반영 (FHS)",
+            key="pf_fhs",
+            persist_state="page",  # kept while a generator hides it
+            help="**정의** 필터 잔차 재표본(Filtered Historical Simulation) ·"
+            " 오늘 변동성에서 시작하는 경로\n\n**해석** 끄면 과거 수익률 묶음"
+            " 재표본 · 켜면 지금 변동성 수준 반영\n\n**기준** 필터: 위 변동성 모델"
+            " · 재표본 전용",
+        )
+        facts = calc.load_facts(pf_root())
+        views = p.views if p is not None else ()
+        lag = state.get("pf_mom_lag") or PF_MOM_LAG
+        premium = p.premium if p is not None else portfolio.BL_PREMIUM
+        drifts = pf_drifts(key, j, s.base, prices, facts, views, lag, premium)
+        if state.get("pf_drift") not in drifts:  # e.g. James-Stein, now 2 holdings
+            state.pf_drift = "zero"
+        expected = st.segmented_control(
+            "기대수익",
+            list(drifts),
+            format_func=PF_DRIFTS.__getitem__,
+            default="zero",
+            required=True,
+            key="pf_drift",
+            help="**정의** 경로에 더하는 기대수익 · 0: 평균 수익 0 · 과거 평균:"
+            " 종목별 추정 기간 표본평균 · James–Stein(1961): 표본평균을 공분산 역행렬"
+            " 노름(Wishart)으로 0 쪽 수축 · Bayes–Stein(Jorion 1986): 표본평균을"
+            " 최소분산 포트폴리오 평균 쪽으로 수축 · 모멘텀(Moskowitz–Ooi–Pedersen"
+            " 2012): 사전 변동성(식 1, EWMA) × (α + β × h개월 전 1개월 초과수익"
+            " 부호, 식 3), h는 옆에서 선택 · 팩터(Fama–French 1997): 3요인 월간"
+            " 회귀 베타 ×"
+            " 1963-07 이후 월평균 프리미엄 · 내 견해(BL): 시가총액 가중치 역최적화"
+            " 사전분포(Idzorek 2005)를 내 견해 쪽으로 확신도만큼 이동\n\n**기준**"
+            " James–Stein·Bayes–Stein: 보유 종목 3개 이상 · 팩터: 한국 종목 없음,"
+            f" 모든 보유 종목 월간 자료 {portfolio.FACTOR_MIN_MONTHS}개월 이상(논문이"
+            " 시험한 최단 기간),"
+            " 요인 자료(옆 버튼으로 받기) · 내 견해(BL): 보유 종목 시가총액(옆 기본"
+            " 정보 받기) 및 내 견해 입력",
+        )
+        if expected == "momentum":
+            st.segmented_control(
+                "모멘텀 시차",
+                list(portfolio.MOP_LAGS),
+                default=PF_MOM_LAG,
+                required=True,
+                key="pf_mom_lag",
+                help="**정의** 식 3의 h: 몇 개월 전 한 달이 올랐는지 내렸는지로"
+                " 예측할지\n\n**해석** Moskowitz–Ooi–Pedersen(2012)은 h = 1–12에서"
+                " 추세 지속, 13–60에서 약한 반전을 보고 · 예측에 쓸 h는 논문이 정하지"
+                " 않아 직접 선택",
+            )
+            if drifts["momentum"].warn:
+                notice(drifts["momentum"].warn)
+        pf_facts_button(j, facts)
+        pf_factors_button(j)
+        if p is not None:
+            pf_views_editor(p, j)
+        pf_blocked_generators(gens)
     f = vol.f
     t = cached_tails((*key, "tails", *vol.key), j, vol.f, vol.v)
     excesses = quant.MIN_EXCESSES / quant.GPD_SHARE
@@ -4537,83 +4594,430 @@ def pf_tail(
             warns,
         )
         pf_tail_table(t, value, s.base)
+    drift = drifts[expected or "zero"]
+    paths = vol if fhs else None
+    sim = pf_paths(key, j, value, s, paths, gen, gens.adjusted, [], drift)
+    pf_tradeoff(sim, drifts, expected or "zero")
     pf_tails(t, j, value, s.base)
+    if gen is not None:  # a generator drew the paths: no density check
+        return
+    chosen = ("fhs", *vol.key) if fhs else ("resample",)
+    if drift.daily is None:  # today's figures only: no past forecasts to test
+        with st.container(border=True):
+            headed(
+                "**분포 검증** · 1개월",
+                "**정의** 1개월 수익률 예측 분포의 사후 검증",
+                [f"**조건** 과거 시점의 기대수익이 있는 모형 · {drift.check}"],
+            )
+        return
+    with st.container(border=True):
+        pf_density(
+            cached_density(
+                (*key, "density", *chosen, expected, *drift.key),
+                j,
+                f if fhs else None,
+                drift.daily,
+            ),
+            fhs=fhs,
+            drift=drift.check,
+        )
 
 
-PF_DRIFTS = {"zero": "0", "capm": "시장 기대"}
+PF_Z95 = 1.96  # a two-sided 95% normal interval
+PF_CONFIDENCE = 50.0  # a new view's 확신도 (%)
+PF_VIEWS_WIDTH = 380  # px, so the 내 견해 popover shows every column
+PF_MOM_LAG = "12M"  # 모멘텀 시차 default
+PF_BL_DOMINANT = 0.8  # one holding's market-cap share that makes BL's "market" it
+PF_DRIFTS = {
+    "zero": "0",
+    "mean": "과거 평균",
+    "stein": "James–Stein",
+    "jorion": "Bayes–Stein",
+    "momentum": "모멘텀",
+    "factor": "팩터",
+    "bl": "내 견해(BL)",
+}
+
+
+def pf_facts_button(j: portfolio.Joint, facts: dict[str, portfolio.Facts]) -> None:
+    """기본 정보 받기 for holdings without saved figures, else 갱신 for all."""
+    if args.demo or portfolio.missing_packages():
+        return
+    fetcher = portfolio_fetcher(str(pf_root()))
+    absent = [n for n in j.names if n not in facts]
+    held = [facts[n].day for n in j.names if n in facts]
+    if st.button(
+        "기본 정보 받기" if absent else "기본 정보 갱신",
+        icon=":material/download:" if absent else ":material/refresh:",
+        key="pf_facts_fetch",
+        disabled=fetcher.progress.running,
+        help="**정의** Yahoo 종목 정보: 시가총액(Black–Litterman 사전분포용)\n\n"
+        + (
+            f"**기준** 없는 종목: {', '.join(absent)}"
+            if absent
+            else f"**기준** 가장 오래된 정보: {min(held)}"
+        ),
+    ):
+        _ = fetcher.start_facts(absent or list(j.names))
+        st.rerun()
+
+
+def pf_factors_button(j: portfolio.Joint) -> None:
+    """요인 받기, or 갱신 once saved; not for a book with a Korean holding."""
+    if args.demo or j.korean.any():
+        return
+    fetcher = portfolio_fetcher(str(pf_root()))
+    factors = calc.load_factors(pf_root())
+    last = (
+        cast("pd.Timestamp", factors.index[-1]).strftime("%Y-%m")
+        if len(factors)
+        else None
+    )
+    if st.button(
+        "요인 받기" if last is None else "요인 갱신",
+        icon=":material/download:" if last is None else ":material/refresh:",
+        key="pf_factors_fetch",
+        disabled=fetcher.progress.running,
+        help="**정의** Kenneth R. French Data Library의 미국 월간 3요인(Fama–French"
+        " 1997): 시장(Mkt-RF)·규모(SMB)·가치(HML), 1963-07 이후\n\n**기준** "
+        + ("저장된 자료 없음" if last is None else f"{last}까지 저장됨"),
+    ):
+        _ = fetcher.start_factors()
+        st.rerun()
+
+
+def pf_views_editor(p: portfolio.Portfolio, j: portfolio.Joint) -> None:
+    """내 견해: each holding's annual return and confidence, saved with ``p``."""
+    if args.demo:
+        return
+    saved = {v.ticker: v for v in p.views}
+    rows = pd.DataFrame(
+        {
+            "종목": list(j.names),
+            "연 기대수익 (%)": [
+                saved[n].annual * 100 if n in saved else None for n in j.names
+            ],
+            "확신도 (%)": [
+                saved[n].confidence * 100 if n in saved else PF_CONFIDENCE
+                for n in j.names
+            ],
+        }
+    )
+    with st.popover(
+        "내 견해",
+        icon=":material/edit_note:",
+        help="**정의** 종목별 연 기대수익과 그 확신도 · Black–Litterman 모형에 쓰임"
+        f"\n\n**기준** {p.base} 기준 · 비워 두면 견해 없음 · 포트폴리오에 저장",
+    ):
+        edited = st.data_editor(
+            rows,
+            width=PF_VIEWS_WIDTH,
+            hide_index=True,
+            disabled=["종목"],
+            column_config={
+                "연 기대수익 (%)": st.column_config.NumberColumn(format="%.1f"),
+                "확신도 (%)": st.column_config.NumberColumn(
+                    min_value=1, max_value=100, step=1, format="%d"
+                ),
+            },
+            key=f"pf_views_{p.id}",
+        )
+        premium = st.number_input(
+            "시장 위험프리미엄 (연 %)",
+            value=p.premium * 100,
+            step=0.5,
+            format="%.1f",
+            key=f"pf_premium_{p.id}",
+            help="**정의** 시장(보유 종목 시가총액 가중)이 무위험수익률보다 연 몇 %"
+            " 더 벌 것으로 보는지 · λ = 이 값 ÷ 시장 분산, 사전분포 Π = λΣw\n\n"
+            "**기준** Idzorek(2005)은 사용자가 정하는 값으로 다룸, 예시 3% ·"
+            " 견해 없는 종목의 기대수익이 이 값에 비례",
+        )
+        if st.button("저장", key=f"pf_views_save_{p.id}"):
+            records = cast("list[dict[str, object]]", edited.to_dict("records"))
+            views = tuple(
+                portfolio.View(
+                    ticker=str(r["종목"]),
+                    annual=cast("float", r["연 기대수익 (%)"]) / 100,
+                    confidence=cast("float", r["확신도 (%)"]) / 100,
+                )
+                for r in records
+                if pd.notna(cast("float", r["연 기대수익 (%)"]))
+                and pd.notna(cast("float", r["확신도 (%)"]))
+            )
+            kept = tuple(v for v in p.views if v.ticker not in j.names)
+            error = pf_store(
+                lambda book: portfolio.set_views(
+                    book, p.id, (*kept, *views), premium / 100
+                )
+            )
+            if error:
+                st.error(error)
+            else:
+                state.toast = f"견해 {len(views)}개를 저장했습니다"
+                st.rerun()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PfDrift:
-    """CAPM daily expected returns on the joint's days, their note and key."""
+    """One model's daily expected returns of the portfolio and its notes.
 
-    daily: NDArray[np.float64]
-    note: str
-    key: tuple[int, str]  # the risk-free rates' (``pf_rates_key``)
+    ``daily`` is on the joint's days, each from earlier days only, for the
+    density check; ``today`` the paths'.
+    """
+
+    daily: NDArray[np.float64] | None  # None: today's figures only
+    today: float
+    se: float  # today's standard error, daily; 0 when none is known
+    annual: float  # today's, compounded over a year (factor: 12 x monthly)
+    band: tuple[float, float] | None  # annual, today +- 1.96 se; None at se 0
+    note: str  # the paths' 기준
+    check: str  # the density check's
+    key: tuple[object, ...]  # the risk-free rates' (``pf_rates_key``)
+    warn: str = ""  # shown as a "!" when the estimate rests on thin data
 
 
-def pf_drift(
-    j: portfolio.Joint, base: portfolio.Currency, prices: portfolio.Prices
-) -> PfDrift:
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_drifts(
+    key: Key, _j: portfolio.Joint, _rf: pd.Series, lag: str
+) -> tuple[dict[str, tuple[NDArray[np.float64], float, float]], int]:
+    """Each history model's (daily, today, se); ``key`` stands for ``_j``, ``_rf``.
+
+    ``lag`` names momentum's eq. 3 lag (``portfolio.MOP_LAGS``); second, the
+    fewer of momentum's two signs' distinct months today.
+
+    Row t of each series uses days before t only: ``mean`` the window's
+    sample mean (``portfolio.trailing_means``), ``stein`` James-Stein (1961),
+    whose paper gives no standard error (0 here), ``jorion`` Jorion (1986)
+    Bayes-Stein and ``momentum`` Moskowitz-Ooi-Pedersen (2012) eq. 1 and 3.
+    """
+    del key
+    mean, _ = calc.trailing_means(_j)
+    held = _j.portfolio
+    sampled = float(np.std(held, ddof=1) / math.sqrt(len(held)))
+    out: dict[str, tuple[NDArray[np.float64], float]] = {"mean": (mean @ _j.w, sampled)}
+    stein = calc.james_stein(_j)
+    if stein is not None:
+        out["stein"] = (stein @ _j.w, 0.0)
+    jorion = calc.bayes_stein(_j)
+    if jorion is not None:
+        out["jorion"] = (jorion[0] @ _j.w, jorion[1])
+    trend, error, months = calc.momentum_returns(_j, _rf, portfolio.MOP_LAGS[lag])
+    if np.isfinite(trend[-1]).all():
+        out["momentum"] = (trend @ _j.w, error)
+    return {k: (v[:-1], float(v[-1]), se) for k, (v, se) in out.items()}, months
+
+
+def pf_drifts(  # noqa: PLR0913 - the models' inputs
+    key: Key,
+    j: portfolio.Joint,
+    base: portfolio.Currency,
+    prices: portfolio.Prices,
+    facts: dict[str, portfolio.Facts],
+    views: tuple[portfolio.View, ...] = (),
+    lag: str = PF_MOM_LAG,
+    premium: float = portfolio.BL_PREMIUM,
+) -> dict[str, PfDrift]:
+    """Every expected-return model ``j`` and the saved ``facts`` allow, in order."""
     rates, source, quote = pf_rates(base, prices.close)
     rf = calc.risk_free(rates, pd.DatetimeIndex(j.full.index), quote)
-    daily = calc.expected_returns(j, rf)
-    annual = (1 + daily[-1]) ** calc.per_year(j.full.index) - 1
+    rated = pf_rates_key(rates)
+    found, months = cached_drifts((*key, "drifts", *rated), j, rf, lag)
+    h = portfolio.MOP_LAGS[lag]
+    year = calc.per_year(j.full.index)
+    n = len(j.window)
     rate = f"무위험수익률 {source}" if not rates.empty else "무위험수익률 0"
-    return PfDrift(
-        daily,
-        f"기대수익 연 {portfolio.percent(annual)}(CAPM: {rate} + 베타 × 위험프리미엄 연"
-        f" {portfolio.ERP:.0%})",
-        pf_rates_key(rates),
+    what = {
+        "mean": (
+            f"과거 평균: 종목별 직전 {n}거래일 표본평균",
+            f"구간 직전 {n}거래일 종목별 표본평균",
+        ),
+        "stein": (
+            f"James–Stein(1961): 직전 {n}거래일 표본평균을 공분산 역행렬"
+            " 노름(Wishart, 자유도 n − 1, 상수 (k − 2) ÷ (n − k + 2))으로 0 쪽"
+            " 수축 · 논문에 표준오차 없음, 경로 모두 같은 기대수익",
+            f"구간 직전 {n}거래일 평균의 James–Stein(1961) 수축",
+        ),
+        "jorion": (
+            f"Bayes–Stein(Jorion 1986): 직전 {n}거래일 표본평균을"
+            " 최소분산 포트폴리오 평균 쪽으로 수축",
+            f"구간 직전 {n}거래일 평균의 Bayes–Stein(Jorion 1986) 수축",
+        ),
+        "momentum": (
+            f"시계열 모멘텀(Moskowitz–Ooi–Pedersen 2012, 식 1·3): 월 기대수익 ="
+            f" {rate}(월 복리) + 사전 변동성(식 1, 일간 EWMA 질량중심 60일) × (α +"
+            f" β × {h}개월 전 달력 월의 복리 초과수익 부호), 보유 종목 풀링 추정 · 월"
+            f" 군집 표준오차(CR1) · 시차 {h}개월: 직접 선택 · 이 앱의 선택: 부호별"
+            f" {quant.MIN_MONTHS}개월 미만이면 !, 일부만 있을 수 있는 첫·마지막"
+            " 달 제외, 변동성은 가중치 합이"
+            f" {portfolio.MOP_COVERAGE:.0%}가 되는 {portfolio.MOP_BURN}거래일 이후부터",
+            "구간 첫날 무위험수익률 + 구간 전 완료된 달력 월로 추정한"
+            f" Moskowitz–Ooi–Pedersen(2012) 식 1·3, 시차 {h}개월",
+        ),
+    }
+
+    def band(today: float, se: float) -> tuple[float, float] | None:
+        if se <= 0:
+            return None
+        low, high = today - PF_Z95 * se, today + PF_Z95 * se
+        return (1 + low) ** year - 1, (1 + high) ** year - 1
+
+    out = {
+        "zero": PfDrift(
+            np.zeros(len(j.full)),
+            0.0,
+            0.0,
+            0.0,
+            None,
+            PF_ZERO_DRIFT,
+            PF_ZERO_DRIFT,
+            (),
+        )
+    }
+    thin = (
+        f"**모멘텀 자료 부족** 상승 뒤·하락 뒤 중 적은 쪽이 {months}개월뿐"
+        f"(권장 {quant.MIN_MONTHS}개월 이상) · 계수가 우연에 크게 흔들릴 수 있음"
     )
-
-
-def pf_outlook(s: Subject, prices: portfolio.Prices, months: int) -> None:
-    found = pf_risk_inputs(s, prices, months)
-    if found is None:
-        return
-    key, j, value, warns = found
-    gens = pf_gens(j, s.base, prices.adjusted)
-    with st.container(horizontal=True, vertical_alignment="bottom"):
-        gen = pf_generator_controls(gens)
-        fhs = gen is None and st.toggle(
-            "현재 변동성 반영 (FHS)",
-            key="pf_fhs",
-            persist_state="page",  # kept while a generator hides it
-            help="**정의** 필터 잔차 재표본(Filtered Historical Simulation) ·"
-            " 오늘 변동성에서 시작하는 경로\n\n**해석** 끄면 과거 수익률 묶음"
-            " 재표본 · 켜면 지금 변동성 수준 반영\n\n**기준** 필터: 옆 변동성 모델"
-            " · 재표본 전용",
+    for model, (daily, today, se) in found.items():
+        annual = (1 + today) ** year - 1
+        note, check = what[model]
+        out[model] = PfDrift(
+            daily,
+            today,
+            se,
+            annual,
+            band(today, se),
+            f"기대수익 연 {portfolio.percent(annual)}({note})",
+            f"기대수익: {check}",
+            (*rated, lag) if model == "momentum" else (),
+            thin if model == "momentum" and months < quant.MIN_MONTHS else "",
         )
-        # the filter only for FHS, its controls next to the toggle
-        vol = pf_vol(key, s, prices, j, inline=True) if fhs else None
-        expected = st.segmented_control(
-            "기대수익",
-            list(PF_DRIFTS),
-            format_func=PF_DRIFTS.__getitem__,
-            default="zero",
-            required=True,
-            key="pf_drift",
-            help="**정의** 경로에 더하는 기대수익 · 0: 평균 수익 0 · 시장 기대:"
-            " 무위험수익률 + 포트폴리오 베타(S&P 500, 추정 기간) × 위험프리미엄"
-            f" 연 {portfolio.ERP:.0%}(CAPM)",
-        )
-        pf_blocked_generators(gens)
-    drift = pf_drift(j, s.base, prices) if expected == "capm" else None
-    pf_paths(key, j, value, s, vol, gen, gens.adjusted, warns, drift)
-    if gen is not None:  # a generator drew the paths: no density check
-        return
-    f = None if vol is None else vol.f
-    chosen = ("resample",) if vol is None else ("fhs", *vol.key)
-    if drift is not None:
-        chosen = (*chosen, "capm", *drift.key)
-    with st.container(border=True):
-        pf_density(
-            cached_density(
-                (*key, "density", *chosen), j, f, None if drift is None else drift.daily
+    factors = calc.load_factors(pf_root())
+    span = (
+        f"{cast('pd.Timestamp', factors.index[0]).strftime('%Y-%m')}–"
+        f"{cast('pd.Timestamp', factors.index[-1]).strftime('%Y-%m')}"
+        if len(factors)
+        else ""
+    )
+    fit = calc.factor_returns(prices.adjusted, j.names, j.w, factors)
+    if fit is not None:
+        costs, error = fit
+        monthly = float(costs @ j.w)
+        # The month's expected return, compounded over its share of the days.
+        power = portfolio.MONTHS_PER_YEAR / year
+        today = (1 + monthly) ** power - 1
+        whole = portfolio.MONTHS_PER_YEAR * monthly  # Table 7: 12 x monthly
+        se = power * (1 + monthly) ** (power - 1) * error
+        se = se if math.isfinite(se) else 0.0
+        low, high = monthly - PF_Z95 * error, monthly + PF_Z95 * error
+        out["factor"] = PfDrift(
+            None,
+            today,
+            se,
+            whole,
+            (
+                (portfolio.MONTHS_PER_YEAR * low, portfolio.MONTHS_PER_YEAR * high)
+                if se > 0
+                else None
             ),
-            fhs=fhs,
-            capm=drift is not None,
+            f"기대수익 연 {portfolio.percent(whole)}(Fama–French(1997) 3요인, 식 3: 월"
+            " 기대수익 = 최근 월 1개월 T-bill(RF) + Σ 요인 베타 × 1963-07 이후"
+            f" 월평균 프리미엄({span}), 연 = 월 × 12(Table 7) · 경로에는 월 복리로"
+            " 얹음 · 베타:"
+            " 보유 기간 전체 월간 초과수익 회귀(식 4), 알파 0 · 표준오차(Table 8):"
+            " 요인 평균 + 회귀 계수 오차 · Kenneth R. French Data Library · 달러"
+            " 기준, 환율 변화 0)",
+            f"{PF_DRIFTS['factor']}: 지금 값만 있음",
+            (span,),
+        )
+    mkt_w = calc.market_weights(facts, j.names, prices.close)
+    posterior = calc.black_litterman(j, rf, mkt_w, views, premium)
+    if posterior is not None and mkt_w is not None:
+        top = int(np.argmax(mkt_w))
+        dominant = (
+            f"**시장이 사실상 한 종목** 보유 종목 시가총액 중 {j.names[top]} 비중"
+            f" {float(mkt_w[top]):.0%} · 사전분포가 다른 종목과 이 종목의 공분산으로만"
+            " 정해짐"
+            if mkt_w[top] >= PF_BL_DOMINANT
+            else ""
+        )
+        today = float(posterior @ j.w)
+        whole = (1 + today) ** year - 1
+        held = [facts[name].day for name in j.names if name in facts]
+        day = min(held, default=None)
+        said = ", ".join(
+            f"{v.ticker} {portfolio.percent(v.annual)}·확신 {v.confidence:.0%}"
+            for v in views
+            if v.ticker in j.names
+        )
+        out["bl"] = PfDrift(
+            None,
+            today,
+            0.0,
+            whole,
+            None,
+            f"기대수익 연 {portfolio.percent(whole)}(Black–Litterman(1992),"
+            f" Idzorek(2005): 시가총액 가중치(Yahoo {day}) 역최적화 사전분포"
+            f" Π = rf + λΣw_mkt(λ = 시장 위험프리미엄 연"
+            f" {portfolio.percent(premium, signed=False)} ÷ 시장 분산, 직접 입력)에"
+            f" 내 견해 {said} 반영 · 공분산: 추정 기간"
+            f" {n}거래일 초과수익, τ = {portfolio.BL_TAU} · 확신도:"
+            " Idzorek(2005), Walters(2011) 닫힌 해)",
+            f"{PF_DRIFTS['bl']}: 지금 값만 있음",
+            (str(day), *rated),
+            dominant,
+        )
+    return out
+
+
+def pf_tradeoff(
+    sim: portfolio.Simulation, drifts: dict[str, PfDrift], shown: str
+) -> None:
+    """Each model's horizon returns on the same paths; ``shown`` drew the fan."""
+    label = state.get("pf_horizon") or "1M"
+    days = portfolio.HORIZONS[label]
+    rows = {m: calc.tradeoff(sim.outcomes, days, d.today) for m, d in drifts.items()}
+
+    def pct(x: float | None, *, signed: bool = True) -> str:
+        return PF_DASH if x is None else portfolio.percent(x, signed=signed)
+
+    def span(band: tuple[float, float] | None) -> str:
+        return PF_DASH if band is None else f"{pct(band[0])} ~ {pct(band[1])}"
+
+    def reward(r: portfolio.Tradeoff) -> str:
+        return PF_DASH if r.es is None or r.es <= 0 else pf_ratio(r.mean / r.es)
+
+    with st.container(border=True):
+        headed(
+            f"**수익과 위험** · 기대수익 모형별, {label}",
+            "**정의** 같은 모의 경로에 모형별 기대수익을 얹은 기간 수익률 · 95% 구간:"
+            " 연 기대수익 ± 1.96 표준오차 · 평균: 경로 평균 · 이익 확률: 기간 끝"
+            " 평가액이 지금보다 높은 경로 비율 · 하위·상위 5%: 기간 수익률의 5·95"
+            " 백분위 · ES 5%: 가장 나쁜 5% 경로의 평균 손실 · 평균 ÷ ES: 꼬리 손실"
+            " 1당 기대 수익\n\n**해석** 모형 간 차이는 구간에 없는 가정의 차이"
+            "\n\n**기준** ●: 위 경로에 쓴"
+            " 모형 · 표준오차: 과거 평균은 표본평균 오차, Bayes–Stein(Jorion 1986)은"
+            " 사후 평균 공분산"
+            "(식 15·18), 모멘텀(MOP 2012)은 월 군집 표준오차, 팩터(Fama–French"
+            " 1997)는 요인 평균 공분산 + 회귀 계수 오차 · James–Stein과 내 견해(BL)는"
+            " 논문에 없어 0 · 0: 없음(—) · 연 기대수익: 오늘 기준, 기간 동안 일정,"
+            " 하루 값의 연 복리(팩터만 논문 Table 7대로 월 × 12)",
+            [d.warn for d in drifts.values() if d.warn],
+        )
+        pf_table(
+            {
+                "모형": [("● " if m == shown else "") + PF_DRIFTS[m] for m in rows],
+                "연 기대수익": [pct(drifts[m].annual) for m in rows],
+                "95% 구간": [span(drifts[m].band) for m in rows],
+                "평균": [pct(r.mean) for r in rows.values()],
+                "중앙값": [pct(r.median) for r in rows.values()],
+                "이익 확률": [pct(r.gain, signed=False) for r in rows.values()],
+                "하위 5%": [pct(r.low) for r in rows.values()],
+                "ES 5%": [pct(r.es, signed=False) for r in rows.values()],
+                "상위 5%": [pct(r.high) for r in rows.values()],
+                "평균 ÷ ES": [reward(r) for r in rows.values()],
+            },
+            "수익과 위험",
         )
 
 
@@ -4827,9 +5231,8 @@ def pf_stress_section(s: Subject, prices: portfolio.Prices, months: int) -> None
 # ---- one stock, and adding it to a portfolio
 
 STOCK_SECTIONS = {
-    "analysis": "위험지표",
-    "tail": "꼬리위험",
-    "outlook": "전망",
+    "stats": "통계",
+    "simulation": "시뮬레이션",
     "stress": "스트레스",
     "whatif": "편입 효과",
 }
@@ -5253,15 +5656,13 @@ def stock_section(  # noqa: PLR0913 - the view's inputs
     s = stock_subject(ticker, portfolio.currency(ticker), prices)
     if len(s.rets) < 2:  # noqa: PLR2004
         pf_no_prices()
-    elif section == "analysis":
+    elif section == "stats":
         pf_stats(s, prices, months)
         if portfolio.korean(ticker):
             stock_betas(s, prices, months)
         pf_style_box(s, prices, "stock_style")
-    elif section == "tail":
-        pf_tail(s, prices, months, row)
-    elif section == "outlook":
-        pf_outlook(s, prices, months)
+    elif section == "simulation":
+        pf_simulation(s, prices, months, row)
     else:
         pf_stress_section(s, prices, months)
 
@@ -5303,16 +5704,16 @@ def stock_view(
         "보기",
         list(STOCK_SECTIONS),
         format_func=STOCK_SECTIONS.__getitem__,
-        default="analysis",
+        default="stats",
         required=True,
         key="stock_section",
         label_visibility="collapsed",
     )
-    horizons = {"outlook": "pf_horizon", "whatif": "whatif_horizon"}
+    horizons = {"simulation": "pf_horizon", "whatif": "whatif_horizon"}
     row = st.container(horizontal=True, vertical_alignment="bottom")
     with row:
-        months = pf_periods(horizons.get(section or "analysis"))
-    stock_section(section or "analysis", ticker, book, prices, months, row)
+        months = pf_periods(horizons.get(section or "stats"))
+    stock_section(section or "stats", ticker, book, prices, months, row)
 
 
 # ---- famous investors (SEC 13F)
@@ -5320,10 +5721,8 @@ def stock_view(
 PF_MODES = {"mine": "내 포트폴리오", "stock": "종목 분석", "investors": "유명 투자자"}
 INV_SECTIONS = {
     "returns": "수익률",
-    "analysis": "위험지표",
-    "correlation": "상관·분산",
-    "tail": "꼬리위험",
-    "outlook": "전망",
+    "stats": "통계",
+    "simulation": "시뮬레이션",
     "stress": "스트레스",
     "compare": "비교",
 }
@@ -5831,7 +6230,7 @@ def inv_controls(section: str) -> tuple[int, DeltaGenerator]:
     row = st.container(horizontal=True, vertical_alignment="bottom")
     with row:
         months = (
-            pf_periods("pf_horizon" if section == "outlook" else None)
+            pf_periods("pf_horizon" if section == "simulation" else None)
             if section != "returns"
             else portfolio.WINDOWS["3Y"]
         )
@@ -6376,15 +6775,12 @@ def inv_section(  # noqa: PLR0913 - the view's inputs
     s = inv_subject(key, data, prices, top=top, equal=equal)
     if s is None:
         pf_no_prices()
-    elif section == "analysis":
+    elif section == "stats":
         pf_stats(s, prices, months)
-        pf_style_box(s, prices, "inv_style")
-    elif section == "correlation":
         inv_correlation(s, book, people, prices, months, top=top, equal=equal)
-    elif section == "tail":
-        pf_tail(s, prices, months, row)
-    elif section == "outlook":
-        pf_outlook(s, prices, months)
+        pf_style_box(s, prices, "inv_style")
+    elif section == "simulation":
+        pf_simulation(s, prices, months, row)
     elif section == "stress":
         pf_stress_section(s, prices, months)
     else:
@@ -6453,20 +6849,17 @@ def pf_section(
         return
     row = st.container(horizontal=True, vertical_alignment="bottom")
     with row:
-        months = pf_periods("pf_horizon" if section == "outlook" else None)
-    if section == "analysis":
-        pf_analysis(p, prices, months)
-        return
+        months = pf_periods("pf_horizon" if section == "simulation" else None)
     s = pf_subject(p, prices)
-    if section == "correlation":
+    if section == "stats":
+        pf_stats(s, prices, months)
         compare = partial(pf_book_heatmap, book, prices, p.base, months)
         pf_correlation(s, prices, months, compare)
+        pf_style_box(s, prices, "pf_style")
     elif section == "stress":
         pf_stress_section(s, prices, months)
-    elif section == "tail":
-        pf_tail(s, prices, months, row)
     else:
-        pf_outlook(s, prices, months)
+        pf_simulation(s, prices, months, row, p)
 
 
 # ---------------------------------------------------------------- pages

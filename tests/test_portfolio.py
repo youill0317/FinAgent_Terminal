@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 import pandas as pd
 import pytest
+from pydantic import ValidationError
 
 from finagent import portfolio as pf
 
@@ -247,14 +248,8 @@ def test_an_expected_return_moves_the_fan_and_the_density_check() -> None:
     )
     j = pf.joint(adjusted, pd.Series({"AAA": 1.0}), "USD", 12)
 
-    rf = pd.Series(1e-4, index=j.full.index)
-    rf.iloc[:5] = np.nan  # before the first rate: none
     beta = float(j.w @ pf.asset_betas(j))
-    premium = math.pow(1 + pf.ERP, 1 / pf.per_year(j.full.index)) - 1
-    expected = pf.expected_returns(j, rf)
     assert beta == pytest.approx(1.0, abs=0.1)
-    assert expected[:5] == pytest.approx([beta * premium] * 5)
-    assert expected[-1] == pytest.approx(1e-4 + beta * premium)
 
     ones = np.ones((3, 4))
     fan = pf.simulation(ones, 100.0, 1.0, 1.0, 0.01).fan
@@ -273,6 +268,241 @@ def test_an_expected_return_moves_the_fan_and_the_density_check() -> None:
     assert abs(drift.mean) < 0.1
     assert drift.p > 0.01
     assert drift.sd == pytest.approx(zero.sd, abs=0.1)  # the spread is not touched
+
+
+def test_past_means_forecast_each_day_from_the_days_before_it() -> None:
+    prices = market()
+    j = pf.joint(prices.adjusted, pd.Series({"AAA": 0.5, "BBB.KS": 0.5}), "USD", 12)
+    x = j.full.to_numpy(dtype="float64")
+    n = len(j.window)
+    mean, var = pf.trailing_means(j)
+    assert mean.shape == (len(x) + 1, 2)
+    assert np.isnan(mean[n - 1 : n]).all()
+    assert mean[n] == pytest.approx(x[:n].mean(axis=0))
+    assert mean[-1] == pytest.approx(j.window.to_numpy().mean(axis=0))  # today's
+    assert var[-1] == pytest.approx(x[-n:].var(axis=0, ddof=1) / n)
+
+
+def test_james_stein_and_bayes_stein_shrink_sample_means() -> None:
+    prices = market()
+    two = pf.joint(prices.adjusted, pd.Series({"AAA": 0.5, "BBB.KS": 0.5}), "USD", 12)
+    assert pf.james_stein(two) is None
+    assert pf.bayes_stein(two) is None
+
+    adjusted = prices.adjusted.copy()
+    rng = np.random.default_rng(42)
+    adjusted["CCC"] = 80.0 * np.exp(np.cumsum(rng.normal(0.0, 0.012, len(adjusted))))
+    w = pd.Series({"AAA": 0.4, "BBB.KS": 0.3, "CCC": 0.3})
+    j = pf.joint(adjusted, w, "USD", 12)
+    x = j.window.to_numpy(dtype="float64")
+    n = len(j.window)
+    k = len(j.names)
+    y = x.mean(axis=0)
+    s = np.cov(x, rowvar=False, ddof=1)
+
+    # James & Stein (1961): X = sqrt(n) y, A = (n - 1) S ~ Wishart(m = n - 1),
+    # (1 - (k - 2) / (m - k + 3) / (X' A^-1 X)) X, toward 0.
+    js = pf.james_stein(j)
+    assert js is not None
+    m = n - 1
+    big_x = math.sqrt(n) * y
+    quad = float(big_x @ np.linalg.inv(m * s) @ big_x)
+    c_js = 1.0 - (k - 2) / (m - k + 3) / quad
+    assert js[-1] == pytest.approx(c_js * y)
+
+    # Jorion (1986): shrink toward minimum-variance mean y0.
+    bs = pf.bayes_stein(j)
+    assert bs is not None
+    bs_mean, bs_se = bs
+    sigma: NDArray[np.float64] = s * ((n - 1) / (n - k - 2))
+    sigma_inv = np.linalg.inv(sigma)
+    ones = np.ones(k, dtype="float64")
+    denom = float(ones @ sigma_inv @ ones)
+    y0 = float(ones @ sigma_inv @ y) / denom
+    diff = y - y0 * ones
+    v = (k + 2) / ((k + 2) + n * float(diff @ sigma_inv @ diff))
+    assert bs_mean[-1] == pytest.approx((1.0 - v) * y + v * y0 * ones)
+    # Eq. 15 less Sigma, lambda from v = lambda / (n + lambda).
+    lam = v * n / (1.0 - v)
+    v_mu: NDArray[np.float64] = sigma / (n + lam) + lam / (
+        n * (n + 1 + lam) * denom
+    ) * np.outer(ones, ones)
+    assert bs_se == pytest.approx(math.sqrt(float(j.w @ v_mu @ j.w)))
+
+
+@pytest.mark.parametrize("months", list(pf.MOP_LAGS.values()))
+def test_momentum_follows_moskowitz_ooi_pedersen(months: int) -> None:
+    prices = market()
+    j = pf.joint(prices.adjusted, pd.Series({"AAA": 0.5, "BBB.KS": 0.5}), "USD", 6)
+    x = j.full.to_numpy(dtype="float64")
+    rf = pd.Series(1e-4, index=j.full.index)
+    got, error, seen = pf.momentum_returns(j, rf, months)
+    assert got.shape == (len(x) + 1, 2)
+    assert math.isfinite(error)
+    assert error > 0
+    assert seen > 0
+
+    # Eq. (1) ex-ante volatility at the first day its weights sum to 99%.
+    excess = x - rf.to_numpy()[:, None]
+    sigma = pf.ewma_volatility(excess)
+    burn = pf.MOP_BURN
+    assert np.isnan(sigma[:burn]).all()
+    delta = pf.MOP_COM / (pf.MOP_COM + 1.0)
+    weights = (1.0 - delta) * delta ** np.arange(burn - 1, -1, -1)
+    assert weights.sum() >= pf.MOP_COVERAGE > weights[1:].sum()
+    bar = weights @ excess[:burn]
+    var0 = pf.MOP_DAYS * (weights @ (excess[:burn] - bar) ** 2)
+    assert sigma[burn] == pytest.approx(np.sqrt(var0))
+
+    # Eq. 3 at lag h, refitted by pooled OLS on calendar months' compounded
+    # returns; the first and last months may be partial and are left out.
+    rfs = rf.to_numpy(dtype="float64")
+    periods = pd.DatetimeIndex(j.full.index).to_period("M")
+    rows = [np.flatnonzero(periods == p) for p in periods.unique()]
+
+    def compounded(r: NDArray[np.int64]) -> NDArray[np.float64]:
+        stock: NDArray[np.float64] = np.prod(1 + x[r], axis=0)
+        cash: NDArray[np.float64] = np.prod(1 + rfs[r], keepdims=True)
+        return stock - cash
+
+    signs: list[float] = []
+    scaled: list[float] = []
+    for m in range(1 + months, len(rows) - 1):
+        lagged, now = compounded(rows[m - months]), compounded(rows[m])
+        vols = sigma[rows[m][:1]].ravel()
+        keep = np.isfinite(vols)
+        signs.extend(cast("list[float]", np.sign(lagged[keep]).tolist()))
+        scaled.extend(cast("list[float]", (now[keep] / vols[keep]).tolist()))
+    design = np.column_stack([np.ones(len(signs)), signs])
+    coef: NDArray[np.float64] = np.linalg.lstsq(design, np.array(scaled), rcond=None)[0]
+    sign_now = np.sign(compounded(rows[len(rows) - 1 - months]))
+    fitted = coef @ np.vstack([np.ones(len(sign_now)), sign_now])
+    today = sigma[-1:].ravel()
+    days = pf.per_year(j.full.index) / pf.MONTHS_PER_YEAR
+    total = (1 + rfs[-1:]) ** days + today * fitted
+    assert got[-1] == pytest.approx(total ** (1 / days) - 1)
+
+
+def test_quote_figures_give_market_cap_weights(tmp_path: Path) -> None:
+    day = date(2026, 1, 2)
+    us = pf.facts_of({"currency": "USD", "marketCap": 1_000_000.0}, day)
+    kr = pf.facts_of({"currency": "KRW", "marketCap": 1_300_000_000.0}, day)
+    assert us.market_cap == pytest.approx(1_000_000.0)
+    assert math.isnan(pf.facts_of({}, day).market_cap)
+
+    pf.save_facts(tmp_path, {"AAA": us})
+    pf.save_facts(tmp_path, {"BBB.KS": kr, "NONE": pf.facts_of({}, day)})
+    saved = pf.load_facts(tmp_path)
+    assert saved["AAA"].market_cap == pytest.approx(1_000_000.0)
+    assert math.isnan(saved["NONE"].market_cap)
+
+    prices = market()
+    fx = float(pf.fx_series(prices.adjusted).dropna().iloc[-1])
+    weights = pf.market_weights(saved, ["AAA", "BBB.KS"], prices.adjusted)
+    assert weights is not None
+    total_cap = 1_000_000.0 * fx + 1_300_000_000.0
+    expected = [1_000_000.0 * fx / total_cap, 1_300_000_000.0 / total_cap]
+    assert weights == pytest.approx(expected)
+    assert pf.market_weights(saved, ["AAA", "NONE"], prices.adjusted) is None
+    assert pf.market_weights(saved, ["AAA", "MISSING"], prices.adjusted) is None
+
+
+def test_french_csv_parses_monthly_factors_from_july_1963() -> None:
+    text = (
+        "This file was created by using the 202609 CRSP database.\n"
+        "\n"
+        ",Mkt-RF,SMB,HML,RF\n"
+        "196306,   -0.50,    0.10,    0.20,    0.23\n"
+        "196307,   -0.39,   -0.48,   -0.81,    0.27\n"
+        "196308,    5.08,   -0.80,    1.70,    0.25\n"
+        "\n"
+        " Annual Factors: January-December \n"
+        "1963,   10.00,    1.00,    2.00,    3.00\n"
+    )
+    frame_ = pf.parse_french(text)
+    assert list(frame_.columns) == ["Mkt-RF", "SMB", "HML", "RF"]
+    assert list(frame_.index) == [
+        pd.Timestamp("1963-07-01"),
+        pd.Timestamp("1963-08-01"),
+    ]
+    assert frame_.loc["1963-07-01", "Mkt-RF"] == pytest.approx(-0.0039)
+
+
+def test_factor_returns_follow_fama_french_1997() -> None:
+    days = pd.bdate_range("2020-01-01", "2025-12-31")
+    months = pd.date_range("2020-01-01", "2025-12-01", freq="MS")
+    rng = np.random.default_rng(0)
+    factors = pd.DataFrame(
+        rng.normal(0.005, 0.03, (len(months), len(pf.FACTORS))),
+        index=months,
+        columns=list(pf.FACTORS),
+    ).assign(RF=0.002)
+    loads = np.array([1.1, 0.4, -0.3])
+    # Build monthly stock growth matching the 3-factor model, then interpolate daily.
+    m_ret = 0.002 + factors[list(pf.FACTORS)].to_numpy() @ loads
+    m_end = pd.DatetimeIndex([m + pd.offsets.MonthEnd(1) for m in months])
+    m_prices = pd.Series(np.cumprod(1.0 + m_ret), index=m_end)
+    daily_price = m_prices.reindex(days.union(m_end)).interpolate("time").reindex(days)
+    adjusted = pd.DataFrame({"A": daily_price.to_numpy()}, index=days)
+
+    w = np.array([1.0], dtype="float64")
+    fit = pf.factor_returns(adjusted, ["A"], w, factors)
+    assert fit is not None
+    got, se = fit
+    premia = factors[list(pf.FACTORS)].mean().to_numpy()
+    assert got == pytest.approx([0.002 + float(loads @ premia)], abs=5e-4)
+    # Table 8: Prem' var(u_g) Prem + g' var(u_Prem) g + 1'[var(u_Prem) o var(u_g)]1
+    month_end = adjusted.groupby(pd.DatetimeIndex(adjusted.index).to_period("M")).last()
+    rets = month_end["A"].pct_change().dropna()
+    fac = factors.set_axis(pd.DatetimeIndex(factors.index).to_period("M"))
+    both = fac.join(rets, how="inner")
+    x = np.column_stack([np.ones(len(both)), both[list(pf.FACTORS)].to_numpy()])
+    y = (both["A"] - both["RF"]).to_numpy(dtype="float64")
+    coef, *_ = np.linalg.lstsq(x, y, rcond=None)
+    resid = y - x @ coef
+    var_g = float(resid @ resid) / (len(y) - 4) * np.linalg.inv(x.T @ x)[1:, 1:]
+    hist = factors[list(pf.FACTORS)].to_numpy(dtype="float64")
+    var_prem = np.cov(hist, rowvar=False) / len(hist)
+    g = coef[1:]
+    total = premia @ var_g @ premia + g @ var_prem @ g + float((var_prem * var_g).sum())
+    assert se == pytest.approx(math.sqrt(float(total)))
+
+    # No factors, a Korean holding, or too few months: no model.
+    none = factors.iloc[:0]
+    assert pf.factor_returns(adjusted, ["A"], w, none) is None
+    assert pf.factor_returns(adjusted.iloc[-100:], ["A"], w, factors) is None
+    # 36 monthly returns are the floor; 35 are not enough.
+    assert pf.factor_returns(adjusted.loc["2022-12-01":], ["A"], w, factors)
+    assert pf.factor_returns(adjusted.loc["2023-01-01":], ["A"], w, factors) is None
+    korean = adjusted.rename(columns={"A": "005930.KS"})
+    assert pf.factor_returns(korean, ["005930.KS"], w, factors) is None
+
+
+def test_a_tradeoff_shifts_the_same_paths_by_the_drift() -> None:
+    ends = np.linspace(0.8, 1.2, 1001)
+    flat = pf.tradeoff(ends, 21, 0.0)
+    up = pf.tradeoff(ends, 21, 0.001)
+    assert flat.mean == pytest.approx(0.0, abs=1e-12)
+    assert flat.median == pytest.approx(0.0, abs=1e-12)
+    assert flat.gain == pytest.approx(0.5, abs=0.001)
+    assert flat.low == pytest.approx(-0.18)
+    assert flat.high == pytest.approx(0.18)
+    assert flat.es is not None
+    assert up.es is not None
+    assert up.mean == pytest.approx(1.001**21 - 1, abs=1e-12)
+    assert up.gain > flat.gain
+    assert up.es < flat.es
+
+
+def test_the_density_check_skips_months_without_a_drift() -> None:
+    prices = market()
+    j = pf.joint(prices.adjusted, pd.Series({"AAA": 1.0}), "USD", 12)
+    held = len(j.full)
+    some = np.full(held, 1e-4)
+    some[: held // 2] = np.nan
+    every = pf.density(j, drift=np.full(held, 1e-4))
+    fewer = pf.density(j, drift=some)
+    assert 0 < fewer.blocks < every.blocks
 
 
 # ---------------------------------------------------------------- storage
@@ -310,3 +540,62 @@ def test_prices_merge_and_round_trip(tmp_path: Path) -> None:
     pf.save_prices(tmp_path, merged)
     assert pf.load_prices(tmp_path).tickers == {"AAA", "BBB"}
     assert pf.load_prices(tmp_path / "missing").tickers == frozenset()
+
+
+def test_black_litterman_combines_equilibrium_prior_and_views() -> None:
+    prices = market()
+    j = pf.joint(prices.adjusted, pd.Series({"AAA": 0.5, "BBB.KS": 0.5}), "USD", 6)
+    rf = pd.Series(1e-4, index=j.full.index)
+    mkt_w = np.array([0.6, 0.4], dtype="float64")
+    x = j.window.to_numpy(dtype="float64")
+    rf_window = rf.reindex(j.window.index).ffill().fillna(0.0).to_numpy(dtype="float64")
+    excess = x - rf_window[:, None]
+    sigma = np.cov(excess, rowvar=False, ddof=1)
+    tau_sigma: NDArray[np.float64] = pf.BL_TAU * sigma
+    # Formula 1: lambda = the specified premium (here 4% a year, a day at the
+    # views' compounding) over the market portfolio's variance.
+    premium = math.pow(1.04, 1 / pf.per_year(j.full.index)) - 1
+    lam = premium / float(mkt_w @ sigma @ mkt_w)
+    prior: NDArray[np.float64] = 1e-4 + lam * (sigma @ mkt_w)
+    variance = cast("list[float]", np.diag(tau_sigma).tolist())[0]
+    prior_aaa = cast("list[float]", prior.tolist())[0]
+    q = math.pow(1.2, 1 / pf.per_year(j.full.index)) - 1
+
+    def posterior(c: float) -> NDArray[np.float64]:
+        got = pf.black_litterman(
+            j, rf, mkt_w, [pf.View(ticker="AAA", annual=0.2, confidence=c)], 0.04
+        )
+        assert got is not None
+        return got
+
+    # By hand, one view on AAA: the gap shared through AAA's covariances.
+    for c in (1.0, 0.3):
+        shrink = variance / c  # its variance plus Omega, (1 - c) / c of it
+        gap = q - prior_aaa
+        assert posterior(c) == pytest.approx(prior + tau_sigma[:, 0] / shrink * gap)
+    assert posterior(1.0)[:1] == pytest.approx([q])  # full confidence: the view
+    assert posterior(1e-6) == pytest.approx(prior, rel=1e-4)  # none: the prior
+    # No view on a holding or missing market weights: no model.
+    other = [pf.View(ticker="ZZZ", annual=0.2, confidence=0.5)]
+    view = [pf.View(ticker="AAA", annual=0.2, confidence=0.5)]
+    assert pf.black_litterman(j, rf, mkt_w, other) is None
+    assert pf.black_litterman(j, rf, None, view) is None
+
+
+def test_views_are_saved_with_the_portfolio(tmp_path: Path) -> None:
+    book, pid = pf.add_portfolio(pf.Book(), "내 계좌", "USD")
+    views = (pf.View(ticker="AAA", annual=0.1, confidence=0.6),)
+    pf.save_book(tmp_path, pf.set_views(book, pid, views, 0.05))
+    saved = pf.load_book(tmp_path).get(pid)
+    assert saved is not None
+    assert saved.views == views
+    assert saved.premium == pytest.approx(0.05)
+    # Files from before views: none.
+    old = '{"version": 1, "portfolios": [{"id": "x", "name": "a", "trades": []}]}'
+    _ = (tmp_path / pf.BOOK_FILE).write_text(old, encoding="utf-8")
+    loaded = pf.load_book(tmp_path).get("x")
+    assert loaded is not None
+    assert loaded.views == ()
+    assert loaded.premium == pf.BL_PREMIUM
+    with pytest.raises(ValidationError):
+        _ = pf.View(ticker="AAA", annual=0.1, confidence=0.0)

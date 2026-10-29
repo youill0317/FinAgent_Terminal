@@ -5,8 +5,9 @@ The macro dashboard keeps all of these. The S&P 500/400 screener
 yfinance, contact Wikipedia, SEC EDGAR (with the user's ``SEC_USER_AGENT``)
 and Yahoo through yfinance, and write its data files, only under
 ``data/screen/``. The portfolio page
-(``src/finagent/portfolio.py``) is the other: it may import yfinance and write
-its trade log and price files, only under ``data/portfolio/``. The investor
+(``src/finagent/portfolio.py``) is the other: it may import yfinance, download
+Ken French's factor files and write its trade log, price, quote and factor
+files, only under ``data/portfolio/``. The investor
 view (``src/finagent/investors.py``) is the third: it may contact SEC EDGAR
 and OpenFIGI, import yfinance (sectors) and write only under
 ``data/investors/``; its prices go to the portfolio page's store via app.py.
@@ -44,6 +45,7 @@ INVESTORS_MODULE: Final = SRC / "investors.py"
 COLAB_MODULE: Final = SRC / "colab_jobs.py"
 SCREEN_HOSTS: Final = frozenset({"en.wikipedia.org", "data.sec.gov", "www.sec.gov"})
 INVESTORS_HOSTS: Final = frozenset({"data.sec.gov", "www.sec.gov", "api.openfigi.com"})
+PORTFOLIO_HOSTS: Final = frozenset({"mba.tuck.dartmouth.edu"})
 
 PERSISTENCE_TERMS: Final = (
     r"\bsqlite\b",
@@ -150,7 +152,8 @@ def test_data_hosts_are_public_and_live_in_sources_module() -> None:
     hosts = set(URL_HOST_PATTERN.findall(SOURCES_MODULE.read_text("utf-8")))
     screen_hosts = set(URL_HOST_PATTERN.findall(SCREEN_MODULE.read_text("utf-8")))
     investor_hosts = set(URL_HOST_PATTERN.findall(INVESTORS_MODULE.read_text("utf-8")))
-    allowed = {SOURCES_MODULE, SCREEN_MODULE, INVESTORS_MODULE}
+    portfolio_hosts = set(URL_HOST_PATTERN.findall(PORTFOLIO_MODULE.read_text("utf-8")))
+    allowed = {SOURCES_MODULE, SCREEN_MODULE, INVESTORS_MODULE, PORTFOLIO_MODULE}
     other_modules = [path for path in _python_files() if path not in allowed]
 
     links = {
@@ -162,6 +165,7 @@ def test_data_hosts_are_public_and_live_in_sources_module() -> None:
     assert hosts == PUBLIC_HOSTS
     assert screen_hosts == SCREEN_HOSTS
     assert investor_hosts == INVESTORS_HOSTS
+    assert portfolio_hosts == PORTFOLIO_HOSTS
     assert links <= KEY_PAGES
 
 

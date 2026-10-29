@@ -342,12 +342,6 @@ def per_year(*_: object) -> float:
     return VALUE
 
 
-def expected_returns(j: portfolio.Joint, rf: pd.Series) -> NDArray[np.float64]:
-    """Zero: the canned paths take no drift."""
-    del rf
-    return np.zeros(len(j.full))
-
-
 def growth(
     j: portfolio.Joint, picks: NDArray[np.int64], *_: object
 ) -> NDArray[np.float64]:
@@ -368,7 +362,7 @@ def simulated(days: int) -> portfolio.Simulation:
     ends = [{"start": VALUE, "end": VALUE, "count": COUNT}] * portfolio.BINS
     levels = dict.fromkeys(perf.PATH_LEVELS, perf.Reach(SHARE, SHARE, SHARE))
     paths = perf.PathRisk(levels, levels, COUNT, COUNT, COUNT, SHARE)
-    return portfolio.Simulation(paths, fan, ends)
+    return portfolio.Simulation(paths, fan, ends, np.ones(COUNT))
 
 
 def tails(j: portfolio.Joint, *_: object) -> portfolio.Tails:
@@ -446,3 +440,72 @@ def reverse(*_: object) -> float:
 
 def turbulence(*_: object) -> portfolio.Turbulence:
     return portfolio.Turbulence(_today(), COUNT, VALUE, SHARE, VALUE, SHARE)
+
+
+def trailing_means(
+    j: portfolio.Joint,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    shape = (len(j.full) + 1, len(j.names))
+    return np.zeros(shape), np.ones(shape)
+
+
+def james_stein(j: portfolio.Joint) -> NDArray[np.float64] | None:
+    if len(j.names) < 3:  # noqa: PLR2004
+        return None
+    return np.zeros((len(j.full) + 1, len(j.names)))
+
+
+def bayes_stein(
+    j: portfolio.Joint,
+) -> tuple[NDArray[np.float64], float] | None:
+    if len(j.names) < 3:  # noqa: PLR2004
+        return None
+    return np.zeros((len(j.full) + 1, len(j.names))), 0.0
+
+
+def tradeoff(*_: object) -> portfolio.Tradeoff:
+    return portfolio.Tradeoff(SHARE, SHARE, SHARE, SHARE, SHARE, SHARE)
+
+
+def momentum_returns(
+    j: portfolio.Joint, rf: pd.Series, lag_months: int
+) -> tuple[NDArray[np.float64], float, int]:
+    del rf, lag_months
+    return np.zeros((len(j.full) + 1, len(j.names))), 0.0, COUNT
+
+
+def load_facts(*_: object) -> dict[str, portfolio.Facts]:
+    """Every demo ticker's figures at ``VALUE``, as if fetched today."""
+    names = ("DEMOA", "DEMOB", "DEMOC", "DEMOK.KS")
+    return {
+        name: portfolio.Facts(
+            day=_today(),
+            currency="KRW" if portfolio.korean(name) else "USD",
+            market_cap=VALUE,
+        )
+        for name in names
+    }
+
+
+def market_weights(
+    _: object, names: Sequence[str], close: object
+) -> NDArray[np.float64]:
+    del close
+    return np.full(len(names), 1.0 / len(names))
+
+
+def load_factors(*_: object) -> pd.DataFrame:
+    """One month of zero factors, so the factor model is offered."""
+    columns = [*portfolio.FACTORS, "RF"]
+    return pd.DataFrame([[0.0] * len(columns)], index=_days()[-1:], columns=columns)
+
+
+def factor_returns(
+    _: object, names: Sequence[str], w: object, factors: object
+) -> tuple[NDArray[np.float64], float]:
+    del w, factors
+    return np.zeros(len(names)), 0.0
+
+
+def black_litterman(j: portfolio.Joint, *_: object) -> NDArray[np.float64]:
+    return np.zeros(len(j.names))
