@@ -661,3 +661,93 @@ def test_stages_running_at_once_share_one_progress_line() -> None:
     lanes.lane("SEC")("SEC", 5, 50)
     lanes.end("yahoo")
     assert sent == [("재무", 10, 100), ("재무 · SEC", 15, 150), ("SEC", 5, 50)]
+
+
+def instant(end: str, value: float, *, filed: str = "") -> dict[str, object]:
+    stop = date.fromisoformat(end)
+    return {
+        "end": end,
+        "val": value,
+        "form": "10-K",
+        "fp": "FY",
+        "filed": filed or f"{stop.year + 1}-02-15",
+    }
+
+
+def test_sec_years_carry_ftse_items_from_10ks() -> None:
+    facts = companyfacts(
+        **{
+            INCOME: years(2024, 2025, 30.0),
+            REVENUES: years(2024, 2025, 100.0),
+            "NetIncomeLoss": years(2024, 2025, 20.0),
+            "Assets": [
+                instant("2024-12-31", 400.0),
+                instant("2025-12-31", 500.0, filed="2026-02-15"),
+                instant("2025-12-31", 510.0, filed="2026-03-01"),  # restated
+            ],
+            "ShortTermInvestments": [instant("2025-12-31", 7.0)],
+            "MarketableSecuritiesCurrent": [instant("2025-12-31", 99.0)],
+        }
+    )
+
+    rows = {r["end"]: r for r in screen.margin_history(facts) if r["period"] == "FY"}
+    assert rows["2025-12-31"]["ta"] == 510.0
+    assert rows["2025-12-31"]["sti"] == 7.0  # the first concept wins
+    assert rows["2024-12-31"]["ni"] == 20.0
+    assert math.isnan(cast("float", rows["2024-12-31"]["sti"]))
+
+    years_ = pd.DataFrame(list(rows.values()))
+    got = screen.sec_annual(years_)
+    assert got["sec_fy_end"] == "2025-12-31"
+    assert got["sec_ta_0"] == 510.0
+    assert got["sec_ta_1"] == 400.0
+    assert got["sec_sales_0"] == 100.0
+
+
+def test_annual_items_prefer_sec_and_keep_years_apart() -> None:
+    table = pd.DataFrame(
+        {
+            "ticker": ["SAME", "NEWER", "BEHIND", "NONE"],
+            "sector": ["Financials", "", "", ""],
+            "currency": ["USD", "", "USD", "EUR"],
+            "fy_end": ["2025-12-31", "2024-12-31", "2025-12-31", "2025-12-31"],
+            "sec_fy_end": ["2025-12-31", "2025-12-31", "2024-12-31", math.nan],
+        }
+    )
+    for column in screen.ANNUAL_COLUMNS:
+        table[column] = 1.0
+        table[f"sec_{column}"] = 2.0
+    table.loc[0, "sec_ltd_0"] = math.nan  # SEC lacks it: Yahoo's, same year
+    table.loc[1, "sec_ltd_0"] = math.nan  # a newer year: none
+
+    screen.annual_items(table)
+
+    assert list(table["annual_source"]) == ["SEC", "SEC", "야후", "야후"]
+    assert list(table["ta_0"]) == [2.0, 2.0, 1.0, 1.0]
+    assert table.loc[0, "ltd_0"] == 1.0
+    assert table.loc[0, "sales_0"] == 1.0  # a bank's sales stay Yahoo's
+    assert table.loc[1, "sales_0"] == 2.0
+    assert math.isnan(cast("float", table.loc[1, "ltd_0"]))
+    assert list(table["fy_end"]) == ["2025-12-31"] * 4
+    assert list(table["currency"]) == ["USD", "USD", "USD", "EUR"]
+
+
+def test_sec_items_build_cash_and_liabilities_from_parts() -> None:
+    end = "2025-12-31"
+    facts = companyfacts(
+        **{
+            "CashAndCashEquivalentsAtCarryingValue": [instant(end, 30.0)],
+            "ShortTermInvestments": [instant(end, 5.0)],
+            "LiabilitiesAndStockholdersEquity": [instant(end, 300.0)],
+            "StockholdersEquity": [instant(end, 90.0)],
+            screen.EQUITY[0]: [instant(end, 100.0)],
+            screen.REDEEMABLE: [instant(end, 2.0)],
+        }
+    )
+
+    items = screen.sec_items(facts)
+
+    assert items["cash_sti"][end] == 35.0
+    cash_only = companyfacts(CashAndCashEquivalentsAtCarryingValue=[instant(end, 30.0)])
+    assert end not in screen.sec_items(cash_only)["cash_sti"]  # left to Yahoo
+    assert items["tl"][end] == 198.0  # with minority interests in equity

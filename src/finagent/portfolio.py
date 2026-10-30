@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 # The guardrail test reads these two dotted forms as the math modules.
 import finagent.perf as perf  # noqa: PLR0402
 import finagent.quant as quant  # noqa: PLR0402
+from finagent import markets
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
@@ -3611,6 +3612,94 @@ class Yahoo:
             if found.market_cap > 0:
                 out[ticker] = found
         return out
+
+
+@final
+class Official:
+    """US stocks and ETFs from Alpaca, their market caps from Massive; the rest Yahoo's.
+
+    ``series`` gives a market series (USD/KRW, the T-bill, VIX) from an
+    official source, None when it has no key or fails. Korean listings and
+    indices stay with Yahoo, as does everything without a provider.
+    Alpaca's history starts in 2016.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        keys: markets.Keys,
+        series: Callable[[str, date], pd.Series | None] | None = None,
+    ) -> None:
+        """Yahoo's caches go under ``root``; ``keys`` and ``series`` pick sources."""
+        self._root = root
+        self._keys = keys
+        self._series = series
+
+    def history(self, tickers: Sequence[str], start: date) -> Prices:
+        us = [t for t in tickers if markets.us_listed(t)] if self._keys.alpaca else []
+        found = {
+            t: got
+            for t in tickers
+            if t not in us and self._series is not None
+            for got in [self._series(t, start)]
+            if got is not None and len(got)
+        }
+        rest = [t for t in tickers if t not in us and t not in found]
+        parts = [Yahoo(self._root).history(rest, start)] if rest else []
+        if us:
+            parts.append(alpaca_prices(markets.Alpaca(self._keys), us, start))
+        if found:
+            levels = _daily(pd.DataFrame(found))
+            parts.append(Prices(levels, levels.copy()))
+        return joined(parts)
+
+    def facts(self, tickers: Sequence[str]) -> dict[str, Facts]:
+        """Each ticker's ``Facts``; one without a market cap is left out."""
+        us = [t for t in tickers if markets.us_listed(t)] if self._keys.massive else []
+        rest = [t for t in tickers if t not in us]
+        out = Yahoo(self._root).facts(rest) if rest else {}
+        today = datetime.now(UTC).date()
+        massive = markets.Massive(self._keys)
+        for ticker in us:
+            got = massive.overview(ticker)
+            if got is not None and got.market_cap > 0:
+                out[ticker] = Facts(
+                    day=today, currency=got.currency or "USD", market_cap=got.market_cap
+                )
+        return out
+
+
+def alpaca_prices(
+    alpaca: markets.Alpaca, tickers: Sequence[str], start: date
+) -> Prices:
+    """Alpaca's split-adjusted bars as closes and ranges; all-adjusted ones.
+
+    Yahoo's Close is split-adjusted and its Adj Close also for dividends.
+    """
+    last = datetime.now(markets.NEW_YORK).date()
+    split = alpaca.bars(tickers, start, last, "split")
+    whole = alpaca.bars(tickers, start, last, "all")
+
+    def wide(bars: pd.DataFrame, field_: str) -> pd.DataFrame:
+        return _daily(bars.pivot_table(index="date", columns="ticker", values=field_))
+
+    return Prices(
+        wide(split, "close"),
+        wide(whole, "close"),
+        wide(split, "open"),
+        wide(split, "high"),
+        wide(split, "low"),
+    )
+
+
+def joined(parts: Sequence[Prices]) -> Prices:
+    """``parts``' tickers side by side, on every day any of them has."""
+    if not parts:
+        return no_prices()
+    frames = zip(
+        *((p.close, p.adjusted, p.open, p.high, p.low) for p in parts), strict=True
+    )
+    return Prices(*(pd.concat(list(f), axis=1).sort_index() for f in frames))
 
 
 def market_series(ticker: str) -> bool:

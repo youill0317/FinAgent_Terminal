@@ -36,6 +36,7 @@ from finagent import (
     display,
     generative,
     investors,
+    markets,
     perf,
     portfolio,
     quant,
@@ -1187,7 +1188,8 @@ def analysis(d: Dashboard) -> None:
 @st.cache_resource(show_spinner=False)
 def screen_updater(root: str, universe: str) -> screen.Updater:
     """One updater per universe's data folder, shared by every tab."""
-    return screen.Updater(Path(root), source=partial(screen.Yahoo, universe=universe))
+    source = partial(screen.Official, universe=universe, keys=market_keys())
+    return screen.Updater(Path(root), source=source)
 
 
 @st.cache_data(show_spinner="스크리닝 계산 중…", max_entries=2)
@@ -1616,7 +1618,13 @@ PF_DIALOGS = {
 @st.cache_resource(show_spinner=False)
 def portfolio_fetcher(root: str) -> portfolio.Fetcher:
     """One price fetcher per data folder, shared by every tab."""
-    return portfolio.Fetcher(Path(root))
+    official = partial(portfolio.Official, keys=market_keys(), series=pf_official)
+    return portfolio.Fetcher(Path(root), source=official, facts=official)
+
+
+def market_keys() -> markets.Keys:
+    """Alpaca's and Massive's keys from the same env path as the others."""
+    return markets.keys(resolve_env(args.env_file, os.environ))
 
 
 def pf_root() -> Path:
@@ -2090,13 +2098,18 @@ def pf_series(points: Points) -> pd.Series:
     )
 
 
-def pf_cd91() -> Fetch | None:
+def pf_ecos(indicator: str, years: int) -> Fetch | None:
     found = next(
-        (i for spec in catalog.PANELS for i in spec.indicators if i.id == PF_CD91), None
+        (i for spec in catalog.PANELS for i in spec.indicators if i.id == indicator),
+        None,
     )
     if found is None or not isinstance(found.fetch, EcosSeries):
         return None
-    return dataclasses.replace(found.fetch, years=PF_RATE_YEARS)
+    return dataclasses.replace(found.fetch, years=years)
+
+
+def pf_cd91() -> Fetch | None:
+    return pf_ecos(PF_CD91, PF_RATE_YEARS)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -2131,6 +2144,39 @@ def pf_dashboard_series(name: str) -> pd.Series:
             return pf_series(known)
     today = rt.dashboard.today().isoformat()
     return pf_fetched(name, today, rt.dashboard.refreshes)
+
+
+# Yahoo's market series from official sources: USD/KRW (FRED's DEXKOUS
+# comes out a week at a time) and KOSPI from ECOS, the T-bill on the same
+# discount basis as ^IRX, and VIX's close from FRED.
+PF_ECOS_SERIES = {portfolio.FX: "kr_usdkrw", portfolio.KOSPI: "kr_kospi"}
+PF_FRED_SERIES = {portfolio.RF_USD: "DTB3", portfolio.VIX: "VIXCLS"}
+PF_ECOS_YEARS = 30  # ECOS answers 10,000 rows at most, about 40 years of days
+
+
+def pf_official(ticker: str, start: date) -> pd.Series | None:
+    """``ticker``'s series from ECOS or FRED since ``start``.
+
+    None for other tickers, without the source's key, or on an error, so
+    Yahoo's stands in.
+    """
+    years = math.ceil((rt.dashboard.today() - start).days / 365.25)
+    fetch: Fetch | None = None
+    if ticker in PF_ECOS_SERIES:
+        fetch = pf_ecos(PF_ECOS_SERIES[ticker], min(years, PF_ECOS_YEARS))
+    elif ticker in PF_FRED_SERIES:
+        fetch = FredSeries(PF_FRED_SERIES[ticker], years=years)
+    if fetch is None:
+        return None
+
+    async def get() -> Points:
+        async with rt.dashboard.fetch_context() as ctx:
+            return await fetch.fetch(ctx, rt.dashboard.today())
+
+    try:
+        return pf_series(rt.call(get()))
+    except (SourceError, OSError, ValueError):
+        return None
 
 
 def pf_rates(
@@ -5124,7 +5170,8 @@ def pf_facts_button(j: portfolio.Joint, facts: dict[str, portfolio.Facts]) -> No
         icon=":material/download:" if absent else ":material/refresh:",
         key="pf_facts_fetch",
         disabled=fetcher.progress.running,
-        help="**정의** Yahoo 종목 정보: 시가총액(Black–Litterman 사전분포용)\n\n"
+        help="**정의** 종목 정보: 시가총액(Black–Litterman 사전분포용) · 미국 종목:"
+        " Massive(MASSIVE_API_KEY가 있을 때), 그 외: Yahoo\n\n"
         + (
             f"**기준** 없는 종목: {', '.join(absent)}"
             if absent
@@ -5461,7 +5508,7 @@ def pf_drifts(  # noqa: PLR0913 - the models' inputs
             whole,
             None,
             f"기대수익 연 {portfolio.percent(whole)}(Black–Litterman(1992),"
-            f" Idzorek(2005): 시가총액 가중치(Yahoo {day}) 역최적화 사전분포"
+            f" Idzorek(2005): 시가총액 가중치({day}) 역최적화 사전분포"
             f" Π = rf + λΣw_mkt(λ = 시장 위험프리미엄 연"
             f" {portfolio.percent(premium, signed=False)} ÷ 시장 분산, 직접 입력)에"
             f" 내 견해 {said} 반영 · 공분산: 추정 기간"

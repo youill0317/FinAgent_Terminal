@@ -18,7 +18,10 @@ retraining (``src/finagent/colab_jobs.py``) is the fifth: it may run the
 ``colab`` CLI as a subprocess and write only under ``data/models/`` (its job
 state, a staging folder and the swapped weights; ``tests/test_colab_jobs.py``).
 torch, for the optional Kronos generator, is imported only inside
-``generative.load_kronos``.
+``generative.load_kronos``. Alpaca's daily bars and Massive's reference
+data (``src/finagent/markets.py``) are the sixth: that module may contact
+their two API hosts, with the user's keys, and persists nothing; the
+portfolio page and the screener save what it returns as they save Yahoo's.
 """
 
 from __future__ import annotations
@@ -46,6 +49,9 @@ COLAB_MODULE: Final = SRC / "colab_jobs.py"
 SCREEN_HOSTS: Final = frozenset({"en.wikipedia.org", "data.sec.gov", "www.sec.gov"})
 INVESTORS_HOSTS: Final = frozenset({"data.sec.gov", "www.sec.gov", "api.openfigi.com"})
 PORTFOLIO_HOSTS: Final = frozenset({"mba.tuck.dartmouth.edu"})
+# The sixth: Alpaca's and Massive's APIs.
+MARKETS_MODULE: Final = SRC / "markets.py"
+MARKETS_HOSTS: Final = frozenset({"data.alpaca.markets", "api.massive.com"})
 
 PERSISTENCE_TERMS: Final = (
     r"\bsqlite\b",
@@ -153,7 +159,14 @@ def test_data_hosts_are_public_and_live_in_sources_module() -> None:
     screen_hosts = set(URL_HOST_PATTERN.findall(SCREEN_MODULE.read_text("utf-8")))
     investor_hosts = set(URL_HOST_PATTERN.findall(INVESTORS_MODULE.read_text("utf-8")))
     portfolio_hosts = set(URL_HOST_PATTERN.findall(PORTFOLIO_MODULE.read_text("utf-8")))
-    allowed = {SOURCES_MODULE, SCREEN_MODULE, INVESTORS_MODULE, PORTFOLIO_MODULE}
+    market_hosts = set(URL_HOST_PATTERN.findall(MARKETS_MODULE.read_text("utf-8")))
+    allowed = {
+        SOURCES_MODULE,
+        SCREEN_MODULE,
+        INVESTORS_MODULE,
+        PORTFOLIO_MODULE,
+        MARKETS_MODULE,
+    }
     other_modules = [path for path in _python_files() if path not in allowed]
 
     links = {
@@ -166,6 +179,7 @@ def test_data_hosts_are_public_and_live_in_sources_module() -> None:
     assert screen_hosts == SCREEN_HOSTS
     assert investor_hosts == INVESTORS_HOSTS
     assert portfolio_hosts == PORTFOLIO_HOSTS
+    assert market_hosts == MARKETS_HOSTS
     assert links <= KEY_PAGES
 
 

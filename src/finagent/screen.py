@@ -3,7 +3,7 @@
 This module is an exception to the dashboard's data rules
 (``tests/test_guardrails.py``): it imports ``yfinance`` (unofficial Yahoo
 Finance data), reads the constituents lists from Wikipedia, asks SEC EDGAR
-for 10-K operating margins when the user set ``SEC_USER_AGENT``, and writes
+for 10-K margins and annual items when the user set ``SEC_USER_AGENT``, and writes
 files, all under ``data/screen/`` in the folder the app runs from: S&P 500's
 at its top, S&P 400's in ``sp400/``. yfinance's own caches go there too.
 Nothing here runs until the header's 갱신 button starts an ``Updater``; the page
@@ -21,9 +21,10 @@ Stored parts per universe and how often they are fetched:
   when the stored file lacks a column this version writes.
 - ``estimates-YYYY-MM-DD.csv``: once per day.
 - ``ciks-YYYY-MM-DD.csv``: SEC's ticker → CIK list, like the universe.
-- ``margins-YYYY-Qn.csv``: each non-financial stock's 10-K full-year revenue
-  and operating income from SEC companyfacts, one row per fiscal year, once
-  per calendar quarter. The companyfacts JSON itself is not kept.
+- ``margins-YYYY-Qn.csv``: each stock's 10-K full-year revenue, operating
+  income and FTSE's other annual items (``SEC_ITEMS``) from SEC companyfacts,
+  one row per fiscal year, once per calendar quarter. The companyfacts JSON
+  itself is not kept.
 
 Only the newest dated file of each kind is read; an update that finishes
 deletes the older ones (``prune``).
@@ -62,7 +63,7 @@ import httpx
 import numpy as np
 import pandas as pd
 
-from finagent import sec_pace
+from finagent import markets, sec_pace
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
@@ -247,6 +248,37 @@ FUNDAMENTAL_COLUMNS: Final = (
     "currency",
     "error",
 )
+# FTSE's annual items (``ANNUAL_ROWS``, sales aside: the revenue) as us-gaap
+# concepts, the first one a fiscal year has winning. Two without one are
+# built from parts as Yahoo's are (``sec_items``); the rest are left to Yahoo,
+# as is current debt: filers tag DebtCurrent before or after reclassifying.
+SEC_ITEMS: Final = {
+    "ni": ("NetIncomeLoss",),  # to the parent; the others differ from Yahoo's
+    "ocf": (
+        "NetCashProvidedByUsedInOperatingActivities",
+        "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    ),
+    "ta": ("Assets",),
+    "ca": ("AssetsCurrent",),
+    "cl": ("LiabilitiesCurrent",),
+    "cash_sti": ("CashCashEquivalentsAndShortTermInvestments",),
+    "sti": (
+        "ShortTermInvestments",
+        "MarketableSecuritiesCurrent",
+        "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+    ),
+    "ltd": ("LongTermDebtNoncurrent",),
+    "tl": ("Liabilities",),
+    "pref": ("PreferredStockValue",),
+    "inv_adv": ("LongTermInvestments",),
+}
+CASH: Final = "CashAndCashEquivalentsAtCarryingValue"
+LIABILITIES_AND_EQUITY: Final = "LiabilitiesAndStockholdersEquity"
+EQUITY: Final = (
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "StockholdersEquity",
+)
+REDEEMABLE: Final = "RedeemableNoncontrollingInterestEquityCarryingAmount"
 MARGIN_COLUMNS: Final = (
     "ticker",
     "period",  # "FY" for a fiscal year, "Q" for one of the TTM quarters
@@ -255,6 +287,7 @@ MARGIN_COLUMNS: Final = (
     "op_income",
     "concept",  # the revenue concept
     "filed",
+    *SEC_ITEMS,  # "FY" rows only
     "error",
 )
 # FY1 is the fiscal year in progress (or ended and not yet reported), FY2 the
@@ -848,6 +881,60 @@ def quarterly(facts: Mapping[str, object], concept: str) -> Values:
     return out | derived
 
 
+def balance(facts: Mapping[str, object], concept: str) -> Values:
+    """A us-gaap concept's 10-K USD instants (balance sheet values) by date.
+
+    Only form 10-K and fp FY count; the latest filed value of a date wins.
+    """
+    units = _get(_get(_get(facts.get("facts"), "us-gaap"), concept), "units")
+    entries = _get(units, "USD")
+    out: Values = {}
+    for item in cast("list[object]", entries if isinstance(entries, list) else []):
+        end, filed = _get(item, "end"), _get(item, "filed")
+        value = _number(_get(item, "val"))
+        if (
+            _get(item, "start") is None
+            and isinstance(end, str)
+            and isinstance(filed, str)
+            and _get(item, "form") == "10-K"
+            and _get(item, "fp") == "FY"
+            and not math.isnan(value)
+        ):
+            _keep(out, end, value, filed)
+    return out
+
+
+def _first(facts: Mapping[str, object], concepts: Sequence[str]) -> dict[str, float]:
+    """Per date, the value of the first of ``concepts`` that has one."""
+    found: dict[str, float] = {}
+    for concept in concepts:
+        values = annual(facts, concept) | balance(facts, concept)
+        for end, (value, _) in values.items():
+            _ = found.setdefault(end, value)
+    return found
+
+
+def sec_items(facts: Mapping[str, object]) -> dict[str, dict[str, float]]:
+    """Each ``SEC_ITEMS`` item by fiscal year end: 10-K full years or instants.
+
+    Without a concept of their own, as Yahoo builds them: cash and short-term
+    investments are cash plus ``sti`` where SEC has it (a missing ``sti`` may
+    be one under another name); liabilities are the liabilities and equity
+    less equity (with minority interests) and redeemable minority interests.
+    """
+    out = {stem: _first(facts, concepts) for stem, concepts in SEC_ITEMS.items()}
+    for end, cash in _first(facts, (CASH,)).items():
+        if end in out["sti"]:
+            _ = out["cash_sti"].setdefault(end, cash + out["sti"][end])
+    equity = _first(facts, EQUITY)
+    redeemable = _first(facts, (REDEEMABLE,))
+    for end, total in _first(facts, (LIABILITIES_AND_EQUITY,)).items():
+        if end in equity:
+            tl = total - equity[end] - redeemable.get(end, 0.0)
+            _ = out["tl"].setdefault(end, tl)
+    return out
+
+
 def sec_window(ends: Sequence[str], years: int = SEC_YEARS) -> list[str]:
     """The newest ``years`` year ends within that many years of the newest."""
     newest = sorted(ends, reverse=True)
@@ -860,18 +947,24 @@ def sec_window(ends: Sequence[str], years: int = SEC_YEARS) -> list[str]:
 def margin_history(facts: Mapping[str, object]) -> list[dict[str, object]]:
     """Each fiscal year's 10-K revenue and operating income, then four quarters.
 
-    Every year end of ``OPERATING_INCOME`` or a revenue concept is an "FY"
-    row, newest first. The revenue concept is the one in ``REVENUE_CONCEPTS``
-    with the most years in ``sec_window`` that also have operating income,
-    the earlier on a tie; a year without it takes the next concept that has
-    one. The newest ``TTM_QUARTERS`` quarter ends of any value are "Q" rows,
-    revenue in the first concept of that order with all of them, else in the
-    first with that quarter. A quarter's revenue above ``QUARTER_SHARE`` of
-    its fiscal year's in the same concept is dropped as mistagged.
+    Every year end of ``OPERATING_INCOME``, a revenue concept or net income
+    is an "FY" row, newest first, with its ``SEC_ITEMS``. The revenue concept
+    is the one in ``REVENUE_CONCEPTS`` with the most years in ``sec_window``
+    that also have operating income, the earlier on a tie; a year without it
+    takes the next concept that has one. The newest ``TTM_QUARTERS`` quarter
+    ends of any value are "Q" rows, revenue in the first concept of that
+    order with all of them, else in the first with that quarter. A quarter's
+    revenue above ``QUARTER_SHARE`` of its fiscal year's in the same concept
+    is dropped as mistagged.
     """
     income = annual(facts, OPERATING_INCOME)
     revenues = {concept: annual(facts, concept) for concept in REVENUE_CONCEPTS}
-    ends = sorted(set(income).union(*revenues.values()), reverse=True)
+    items = sec_items(facts)
+    # Net income's years too, for a bank without operating income or revenue.
+    ends = sorted(
+        set(income).union(*revenues.values(), annual(facts, SEC_ITEMS["ni"][0])),
+        reverse=True,
+    )
     window = sec_window(ends)
     first = max(
         REVENUE_CONCEPTS,
@@ -891,6 +984,7 @@ def margin_history(facts: Mapping[str, object]) -> list[dict[str, object]]:
                 "op_income": op_income,
                 "concept": concept,
                 "filed": max(filed, op_filed),
+                **{stem: items[stem].get(end, math.nan) for stem in SEC_ITEMS},
             }
         )
     if not rows:
@@ -953,6 +1047,8 @@ SEC_SUMMARY: Final = (
     "sec_years",
     "sec_ttm",
     "sec_ttm_end",
+    "sec_fy_end",  # the newest 10-K year end, of the "sec_..._0" items
+    *(f"sec_{column}" for column in ANNUAL_COLUMNS),
 )
 
 
@@ -979,7 +1075,33 @@ def sec_row(years: pd.DataFrame, quarters: pd.DataFrame) -> dict[str, object]:
         "sec_years": len(window),
         "sec_ttm": sec_ttm(quarters, str(ends.max()) if len(ends) else ""),
         "sec_ttm_end": quarters["end"].max(),
+        **sec_annual(years),
     }
+
+
+def sec_annual(years: pd.DataFrame) -> dict[str, object]:
+    """The newest fiscal year's items ("_0") and the year before's ("_1").
+
+    The year before is the one ending a ``YEAR_DAYS`` span earlier; sales
+    are the revenue.
+    """
+    rows = years.rename(columns={"revenue": "sales"}).sort_values(
+        "end", ascending=False
+    )
+    out: dict[str, object] = {f"sec_{column}": math.nan for column in ANNUAL_COLUMNS}
+    if rows.empty:
+        return {"sec_fy_end": "", **out}
+    newest = rows.iloc[0]
+    stop = date.fromisoformat(str(newest["end"]))
+    before = [
+        row
+        for _, row in rows.iloc[1:].iterrows()
+        if _within((stop - date.fromisoformat(str(row["end"]))).days, YEAR_DAYS)
+    ]
+    for year, row in enumerate([newest, *before[:1]]):
+        for stem in ANNUAL_ROWS:
+            out[f"sec_{stem}_{year}"] = _number(row.get(stem))
+    return {"sec_fy_end": str(newest["end"]), **out}
 
 
 def sec_margins(margins: pd.DataFrame) -> pd.DataFrame:
@@ -1302,12 +1424,44 @@ def prepare(inputs: Inputs) -> pd.DataFrame:
         .astype("str")
     )
     table["op_margin"] = table["sec_ttm"].where(ttm, table["op_margin"])
+    annual_items(table)
     state = year_state(table)
     table[list(state.columns)] = state
     revised = revisions(table)
     table[list(revised.columns)] = revised
     table["error"] = _errors(table)
     return table.drop(columns=["error_estimates"], errors="ignore")
+
+
+def annual_items(table: pd.DataFrame) -> None:
+    """FTSE's annual items from SEC's 10-Ks, else Yahoo's, in place.
+
+    SEC's newest fiscal year is used unless it ends before Yahoo's
+    (``STALE_SLACK_DAYS`` aside); an item SEC lacks takes Yahoo's only when
+    both have the same year and Yahoo's is in dollars, as SEC's (USD facts)
+    are. A bank's revenue concept is its fee income
+    alone, so financials keep Yahoo's sales. ``annual_source`` names the
+    year's source.
+    """
+    sec_end = pd.to_datetime(table["sec_fy_end"], errors="coerce")
+    gap = (sec_end - pd.to_datetime(table["fy_end"], errors="coerce")).dt.days
+    sec = sec_end.notna() & ~(gap < -STALE_SLACK_DAYS)
+    dollars = table["currency"].isin(["USD", ""])
+    same = (gap.abs() <= STALE_SLACK_DAYS) & dollars
+    banks = table["sector"] == FINANCIALS
+    for column in ANNUAL_COLUMNS:
+        found = table[f"sec_{column}"]
+        if column.startswith("sales_"):
+            found = found.where(~banks)
+        yahoo = table[column].where(~sec | same)
+        table[column] = found.where(sec & found.notna(), yahoo)
+    table["annual_source"] = np.select(
+        [sec, pd.to_datetime(table["fy_end"], errors="coerce").notna()],
+        ["SEC", "야후"],
+        "",
+    )
+    table["fy_end"] = table["sec_fy_end"].where(sec, table["fy_end"])
+    table["currency"] = table["currency"].where(~sec, "USD")
 
 
 def judge(prepared: pd.DataFrame, c: Criteria) -> pd.DataFrame:
@@ -1468,7 +1622,8 @@ def measure_lines(row: Mapping[str, object], c: Criteria) -> list[tuple[str, str
     Each line is the measure's Z-score, the test and the values it used; a
     measure turned off is 미적용, one FTSE does not use for the stock 해당 없음.
     """
-    year = f"{row.get('fy_end') or '—'} 회계연도"
+    source = MARGIN_SOURCES.get(str(row.get("annual_source")), "")
+    year = f"{row.get('fy_end') or '—'} 회계연도" + (f" ({source})" if source else "")
     measures = {
         "q_roa": (
             "순이익 ÷ 평균 총자산",
@@ -1900,6 +2055,56 @@ class Yahoo:
             return estimates_row(
                 trend, _frame(stock.eps_revisions), _frame(stock.earnings_estimate)
             )
+
+
+@final
+class Official:
+    """``Yahoo`` with Alpaca's daily bars when its keys are given.
+
+    The members, fundamentals and estimates stay Yahoo's (Wikipedia and
+    yfinance); Alpaca has neither.
+    """
+
+    def __init__(
+        self, root: Path, universe: str = "sp500", keys: markets.Keys | None = None
+    ) -> None:
+        """``Yahoo``'s, plus the provider keys."""
+        self._yahoo = Yahoo(root, universe)
+        keys = keys or markets.Keys()
+        self._alpaca = markets.Alpaca(keys) if keys.alpaca else None
+
+    def constituents(self) -> pd.DataFrame:
+        return self._yahoo.constituents()
+
+    def prices(self, tickers: Sequence[str], start: date, end: date) -> pd.DataFrame:
+        """As ``Yahoo.prices``: ``end`` is exclusive."""
+        if self._alpaca is None:
+            return self._yahoo.prices(tickers, start, end)
+        last = end - timedelta(days=1)
+        split = self._alpaca.bars(tickers, start, last, "split")
+        whole = self._alpaca.bars(tickers, start, last, "all")
+        return alpaca_long(split, whole)
+
+    def fundamentals(self, ticker: str) -> Mapping[str, object]:
+        return self._yahoo.fundamentals(ticker)
+
+    def estimates(self, ticker: str) -> Mapping[str, object]:
+        return self._yahoo.estimates(ticker)
+
+
+def alpaca_long(split: pd.DataFrame, whole: pd.DataFrame) -> pd.DataFrame:
+    """Alpaca's split-adjusted bars with the all-adjusted close as ``adj_close``.
+
+    Yahoo's Close is split-adjusted and its Adj Close also for dividends.
+    """
+    if split.empty:
+        return empty_prices()
+    adjusted = cast("pd.DataFrame", whole[["ticker", "date", "close"]]).rename(
+        columns={"close": "adj_close"}
+    )
+    frame = split.merge(adjusted, on=["ticker", "date"], how="inner")
+    frame = frame.dropna(subset=["close", "adj_close"])
+    return cast("pd.DataFrame", frame[list(PRICE_COLUMNS)]).reset_index(drop=True)
 
 
 @final
