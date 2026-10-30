@@ -343,10 +343,15 @@ def per_year(*_: object) -> float:
 
 
 def growth(
-    j: portfolio.Joint, picks: NDArray[np.int64], *_: object
+    j: portfolio.Joint, picks: NDArray[np.int64], *_: object, demean: bool = True
 ) -> NDArray[np.float64]:
-    del j
+    del j, demean
     return np.full((1, picks.shape[1] + 1), VALUE)
+
+
+def normal_paths(mean: float, var: float, days: int) -> NDArray[np.float64]:
+    del mean, var
+    return np.full((1, days + 1), VALUE)
 
 
 def simulation(paths: NDArray[np.float64], *_: object) -> portfolio.Simulation:
@@ -354,7 +359,7 @@ def simulation(paths: NDArray[np.float64], *_: object) -> portfolio.Simulation:
 
 
 def simulated(days: int) -> portfolio.Simulation:
-    """A fan, histogram and path shares at ``VALUE`` over ``days``."""
+    """A fan, histogram, tails and path shares at ``VALUE`` over ``days``."""
     fan = [
         {"day": float(day), **{f"p{q}": VALUE for q in portfolio.PERCENTILES}}
         for day in range(days + 1)
@@ -362,7 +367,19 @@ def simulated(days: int) -> portfolio.Simulation:
     ends = [{"start": VALUE, "end": VALUE, "count": COUNT}] * portfolio.BINS
     levels = dict.fromkeys(perf.PATH_LEVELS, perf.Reach(SHARE, SHARE, SHARE))
     paths = perf.PathRisk(levels, levels, COUNT, COUNT, COUNT, SHARE)
-    return portfolio.Simulation(paths, fan, ends, np.ones(COUNT))
+    tails = dict.fromkeys(portfolio.END_LEVELS, (SHARE, SHARE))
+    reach = [
+        {
+            "x": side * level,
+            "side": side,
+            "end": SHARE,
+            "touched": SHARE,
+            "swing": SHARE,
+        }
+        for side in (-1.0, 1.0)
+        for level in (0.0, *perf.PATH_LEVELS)
+    ]
+    return portfolio.Simulation(paths, fan, ends, np.ones(COUNT), tails, reach)
 
 
 def tails(j: portfolio.Joint, *_: object) -> portfolio.Tails:
@@ -379,15 +396,24 @@ def tails(j: portfolio.Joint, *_: object) -> portfolio.Tails:
         rows,
         dict.fromkeys(METHODS, test),
         quant.BACKTEST_DAYS,
-        np.full(len(j.names), SHARE),
         len(j.window),
         len(j.window),
     )
 
 
-def density(*_: object, drift: object = None) -> portfolio.Density:
-    del drift
+def density(*_: object, drift: object = None, days: int = 0) -> portfolio.Density:
+    del drift, days
     return portfolio.Density(quant.Berkowitz(VALUE, VALUE, VALUE, VALUE, VALUE), COUNT)
+
+
+def normal_density(*_: object) -> portfolio.Density:
+    return density()
+
+
+def normal_tails(j: portfolio.Joint, *_: object) -> portfolio.Tails:
+    t = tails(j)
+    test = t.backtests[METHODS[0]]
+    return portfolio.Tails((), {portfolio.NORMAL_METHOD: test}, None, t.days, t.history)
 
 
 def generator(
@@ -457,21 +483,25 @@ def james_stein(j: portfolio.Joint) -> NDArray[np.float64] | None:
 
 def bayes_stein(
     j: portfolio.Joint,
-) -> tuple[NDArray[np.float64], float] | None:
+) -> tuple[NDArray[np.float64], float, NDArray[np.float64]] | None:
     if len(j.names) < 3:  # noqa: PLR2004
         return None
-    return np.zeros((len(j.full) + 1, len(j.names))), 0.0
+    return np.zeros((len(j.full) + 1, len(j.names))), 0.0, trailing_variance(j)
+
+
+def trailing_variance(j: portfolio.Joint) -> NDArray[np.float64]:
+    return np.full(len(j.full) + 1, SHARE**2)
 
 
 def tradeoff(*_: object) -> portfolio.Tradeoff:
-    return portfolio.Tradeoff(SHARE, SHARE, SHARE, SHARE, SHARE, SHARE)
+    return portfolio.Tradeoff(SHARE, SHARE, SHARE, SHARE, SHARE, SHARE, SHARE, SHARE)
 
 
 def momentum_returns(
     j: portfolio.Joint, rf: pd.Series, lag_months: int
-) -> tuple[NDArray[np.float64], float, int]:
+) -> tuple[NDArray[np.float64], float, int, NDArray[np.float64]]:
     del rf, lag_months
-    return np.zeros((len(j.full) + 1, len(j.names))), 0.0, COUNT
+    return np.zeros((len(j.full) + 1, len(j.names))), 0.0, COUNT, trailing_variance(j)
 
 
 def load_facts(*_: object) -> dict[str, portfolio.Facts]:
@@ -502,10 +532,13 @@ def load_factors(*_: object) -> pd.DataFrame:
 
 def factor_returns(
     _: object, names: Sequence[str], w: object, factors: object
-) -> tuple[NDArray[np.float64], float]:
+) -> tuple[NDArray[np.float64], float, float]:
     del w, factors
-    return np.zeros(len(names)), 0.0
+    return np.zeros(len(names)), 0.0, 0.0
 
 
-def black_litterman(j: portfolio.Joint, *_: object) -> NDArray[np.float64]:
-    return np.zeros(len(j.names))
+def black_litterman(
+    j: portfolio.Joint, *_: object
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    k = len(j.names)
+    return np.zeros(k), np.zeros((k, k))

@@ -41,6 +41,8 @@ def test_growth_paths_equal_a_per_asset_replay_with_daily_rebalancing() -> None:
     assert growth.shape == (50, 31)
     assert np.allclose(growth[:, 0], 1.0)
     assert np.allclose(growth[:, 1:], by_hand)
+    kept = quant.growth_paths(rets, W, picks, demean=False)  # the days' own mean
+    assert np.allclose(kept[:, 1:], np.cumprod(1 + (rets @ W)[picks], axis=1))
 
 
 # ---------------------------------------------------------------- beta

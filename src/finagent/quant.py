@@ -695,6 +695,8 @@ def growth_paths(
     w: NDArray[np.float64],
     picks: NDArray[np.int64],
     f: Devolatilised | None = None,
+    *,
+    demean: bool = True,
 ) -> NDArray[np.float64]:
     """Growth of 1 along drawn paths, shape (paths, horizon + 1).
 
@@ -703,11 +705,12 @@ def growth_paths(
     those days (its last rows) instead and each asset's volatility starts at
     today's, moved by the shocks of the first ``FEEDBACK_DAYS``
     (``filtered_paths``). Daily returns
-    are demeaned (zero drift) and floored at -100%.
+    are demeaned (zero drift; without ``f``, kept as drawn unless ``demean``)
+    and floored at -100%.
     """
     if f is None:
         steps = rets @ w
-        daily = (steps - steps.mean())[picks]
+        daily = (steps - steps.mean() if demean else steps)[picks]
     else:
         days = replace(f, z=f.z[-len(rets) :])
         if f.model is None:

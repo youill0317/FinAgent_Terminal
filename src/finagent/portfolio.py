@@ -83,8 +83,10 @@ KOREAN_MAJORITY: Final = 0.5  # a book more Korean than this by value closes in 
 PATHS: Final = 20_000  # a path share's Monte Carlo SD <= 0.35%p; 1Y peak ~150 MB
 PERCENTILES: Final = (5, 25, 50, 75, 95)
 BINS: Final = 40
+END_LEVELS: Final = (0.95, 0.99)  # VaR and ES of the simulated horizon value
+REACH_STEPS: Final = 30  # the reach curve's thresholds: 1%p steps out to ±30%
 WINDOWS: Final = {"6M": 6, "1Y": 12, "3Y": 36}
-HORIZONS: Final = {"1M": 21, "3M": 63, "6M": 126, "1Y": 252}
+HORIZONS: Final = {"1D": 1, "1M": 21, "3M": 63, "6M": 126, "1Y": 252}
 FACTS_FILE: Final = "facts.json"  # on request: each holding's Yahoo market cap
 FACTORS_FILE: Final = "factors.parquet"  # on request: Ken French's monthly US factors
 FRENCH_URL: Final = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
@@ -1997,7 +1999,7 @@ def black_litterman(
     mkt_w: NDArray[np.float64] | None,
     views: Sequence[View],
     premium: float = BL_PREMIUM,
-) -> NDArray[np.float64] | None:
+) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
     """Each holding's daily combined expected return, Idzorek's formula 19.
 
     Black-Litterman (1992) and Idzorek (2005): reverse-optimised prior
@@ -2008,7 +2010,10 @@ def black_litterman(
     holding is P = its unit row, Q its ``annual`` return a day; Omega
     diagonal, (1 - c) / c times the view's own prior variance (Idzorek's
     confidence c, in Walters' closed form), so c = 1 takes the view as is
-    and tau cancels. The paper gives no standard error. None without
+    and tau cancels. The paper gives no standard error. Second, the daily
+    covariance of returns about it, Sigma + M (He-Litterman 1999), M the
+    posterior covariance of the mean, ``tau Sigma`` less what the views
+    explain (no Omega inverse, which c = 1 makes singular). None without
     ``mkt_w`` or a view on a holding.
     """
     on = [v for v in views if v.ticker in j.names]
@@ -2034,7 +2039,8 @@ def black_litterman(
     spread = seen @ p.T
     omega = np.diag((1 - c) / c * np.diag(spread))
     gain = np.linalg.solve(spread + omega, seen).T
-    return prior + gain @ (q - p @ prior)
+    posterior_cov = prior_cov - gain @ seen
+    return prior + gain @ (q - p @ prior), sigma + posterior_cov
 
 
 def trailing_means(j: Joint) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -2075,6 +2081,17 @@ def _rolling_moments(
     return mean, cov
 
 
+def trailing_variance(j: Joint) -> NDArray[np.float64]:
+    """The portfolio's daily variances over the window's length.
+
+    On ``trailing_means``' rows: row t's from the days before t.
+    """
+    _, cov = _rolling_moments(j)
+    out = np.full(len(j.full) + 1, np.nan)
+    out[len(j.window) :] = np.einsum("i,bij,j->b", j.w, cov, j.w)
+    return out
+
+
 def james_stein(j: Joint) -> NDArray[np.float64] | None:
     """James-Stein (1961) shrunk means under an unknown covariance.
 
@@ -2098,8 +2115,10 @@ def james_stein(j: Joint) -> NDArray[np.float64] | None:
     return out
 
 
-def bayes_stein(j: Joint) -> tuple[NDArray[np.float64], float] | None:
-    """Jorion (1986) Bayes-Stein means and today's portfolio SE.
+def bayes_stein(
+    j: Joint,
+) -> tuple[NDArray[np.float64], float, NDArray[np.float64]] | None:
+    """Jorion (1986) Bayes-Stein means, today's portfolio SE and daily variances.
 
     Shrinks each ``len(j.window)``-day sample mean Y toward the minimum-
     variance portfolio mean ``Y_0 = (1' Sigma^-1 Y) / (1' Sigma^-1 1)``
@@ -2107,8 +2126,9 @@ def bayes_stein(j: Joint) -> tuple[NDArray[np.float64], float] | None:
     (Y - Y_0 1))`` (eq. 17) and ``Sigma = (n - 1) / (n - k - 2) * S``
     (eq. 18). Today's SE is from eq. 15's predictive covariance less Sigma,
     ``Sigma / (n + lambda) + lambda / (n (n + 1 + lambda)) 1 1' / (1' Sigma^-1
-    1)`` with v = lambda / (n + lambda). None with fewer than three assets or
-    ``n <= k + 2``.
+    1)`` with v = lambda / (n + lambda). Third, the portfolio's eq. 15
+    predictive variance, ``w' Sigma w`` plus the SE squared, on the means'
+    rows. None with fewer than three assets or ``n <= k + 2``.
     """
     k = len(j.names)
     n = len(j.window)
@@ -2125,12 +2145,12 @@ def bayes_stein(j: Joint) -> tuple[NDArray[np.float64], float] | None:
     v = (k + 2) / ((k + 2) + n * np.maximum(quad, 0.0))
     out = np.full((len(j.full) + 1, k), np.nan)
     out[n:] = (1.0 - v[:, None]) * mean + v[:, None] * y0[:, None]
-    v_last = float(v[-1])
     # lambda / (n (n + 1 + lambda)) with v = lambda / (n + lambda)
-    var_p = (1.0 - v_last) / n * float(j.w @ sigma[-1] @ j.w) + v_last / (
-        (n + 1 - v_last) * float(denom[-1])
-    )
-    return out, math.sqrt(max(var_p, 0.0))
+    spread = np.einsum("i,bij,j->b", j.w, sigma, j.w)
+    var_p = np.maximum((1.0 - v) / n * spread + v / ((n + 1 - v) * denom), 0.0)
+    var = np.full(len(j.full) + 1, np.nan)
+    var[n:] = spread + var_p
+    return out, math.sqrt(float(var_p[-1])), var
 
 
 def ewma_volatility(r: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -2157,9 +2177,9 @@ def ewma_volatility(r: NDArray[np.float64]) -> NDArray[np.float64]:
     return sd
 
 
-def momentum_returns(
+def momentum_returns(  # noqa: PLR0915 - eq. 1 and 3, the SE and the variance
     j: Joint, rf: pd.Series, lag_months: int
-) -> tuple[NDArray[np.float64], float, int]:
+) -> tuple[NDArray[np.float64], float, int, NDArray[np.float64]]:
     """Moskowitz-Ooi-Pedersen (2012) eq. 1 and eq. 3 daily expected returns.
 
     Fits eq. 3 at lag h = ``lag_months`` (one of ``MOP_LAGS``),
@@ -2178,7 +2198,11 @@ def momentum_returns(
     G / (G - 1) (N - 1) / (N - 2), carried to the daily rate by its
     derivative; 0 with fewer than two months or three observations. Third,
     the fewer of the two signs' distinct months today, for a thin-data
-    warning.
+    warning. Fourth, the portfolio's daily variance under eq. 3 on the
+    means' rows: each holding's month is ``sigma`` times the residual spread
+    of the fit on the months before, joined by the window's correlations
+    before the day and spread evenly over the month's days; NaN without a
+    fit.
     """
     x = j.full.to_numpy(dtype="float64")
     month = per_year(j.full.index) / MONTHS_PER_YEAR  # days to compound over
@@ -2199,7 +2223,9 @@ def momentum_returns(
     own = np.searchsorted(starts, rows, side="right") - 1  # today: the last month
     done = np.searchsorted(ends, rows, side="right")
     means: list[NDArray[np.float64]] = []
+    seens: list[NDArray[np.int64]] = []
     sums: list[NDArray[np.float64]] = []
+    squares: list[NDArray[np.float64]] = []
     counts: list[NDArray[np.int64]] = []
     for sign in (1.0, -1.0):
         hit = (signs == sign) & np.isfinite(scaled)
@@ -2210,6 +2236,9 @@ def momentum_returns(
         mean = total / np.maximum(seen, 1)
         means.append(np.where(seen > 0, mean, np.nan))
         sums.append(s_m)
+        seens.append(seen)
+        q_m = (np.where(hit, scaled, 0.0) ** 2).sum(axis=1)
+        squares.append(np.concatenate([[0.0], np.cumsum(q_m)])[done])
         counts.append(n_m)
     alpha, beta = (means[0] + means[1]) / 2, (means[0] - means[1]) / 2
     rates = np.append(known, known[-1] if len(known) else 0.0)
@@ -2231,7 +2260,31 @@ def momentum_returns(
         if clusters > 1 and obs > 2:  # noqa: PLR2004 - else no clustered error
             cr1 = clusters / (clusters - 1) * (obs - 1) / (obs - 2)
             se = math.sqrt(cr1 * float(score @ score))
-    return daily, se, min(int((c > 0).sum()) for c in counts)
+    obs = seens[0] + seens[1]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        resid = sum(
+            squares[i] - seens[i] * np.where(seens[i] > 0, means[i], 0.0) ** 2
+            for i in range(2)
+        ) / np.where(obs > 2, obs - 2, np.nan)  # noqa: PLR2004 - two coefficients
+    spread = sd * np.sqrt(np.maximum(resid, 0.0))[:, None]
+    var = _momentum_variance(j, spread) / month
+    var[~np.isfinite(daily).all(axis=1)] = np.nan
+    return daily, se, min(int((c > 0).sum()) for c in counts), var
+
+
+def _momentum_variance(j: Joint, spread: NDArray[np.float64]) -> NDArray[np.float64]:
+    """The portfolio's month variances from each row's holding ``spread``.
+
+    Row t's holdings are joined by the correlations of the window's length
+    of days before t; NaN where fewer precede.
+    """
+    _, cov = _rolling_moments(j)
+    sd = np.sqrt(np.einsum("bii->bi", cov))
+    corr = cov / (sd[:, :, None] * sd[:, None, :])
+    out = np.full(len(spread), np.nan)
+    n = len(j.window)
+    out[n:] = np.einsum("i,bi,bij,bj,j->b", j.w, spread[n:], corr, spread[n:], j.w)
+    return out
 
 
 def factor_returns(
@@ -2239,7 +2292,7 @@ def factor_returns(
     names: Sequence[str],
     w: NDArray[np.float64],
     factors: pd.DataFrame,
-) -> tuple[NDArray[np.float64], float] | None:
+) -> tuple[NDArray[np.float64], float, float] | None:
     """Fama-French (1997) three-factor expected monthly returns and portfolio SE.
 
     Regresses each holding's monthly excess returns (month-end ``adjusted``
@@ -2251,7 +2304,9 @@ def factor_returns(
     (``FRENCH_START``), as in Table 7. The portfolio's monthly SE is Table
     8's, ``Prem' var(u_g) Prem + g' var(u_Prem) g + 1'[var(u_Prem) o
     var(u_g)]1``, with var(u_g) the slopes' OLS covariance and var(u_Prem)
-    the premiums' mean covariance. None with a Korean holding, without
+    the premiums' mean covariance. Third, the portfolio's monthly return
+    variance under the model, ``b' cov(f) b`` over the factors since July
+    1963 plus the residual variance. None with a Korean holding, without
     factors or under ``FACTOR_MIN_MONTHS`` months (this app's floor: the
     paper sets none, and its shortest rolling window is three years).
     """
@@ -2285,9 +2340,10 @@ def factor_returns(
     resid = (y - x @ coef) @ w
     s2 = float(resid @ resid) / (len(both) - x.shape[1])
     cov_b = s2 * np.linalg.pinv(x.T @ x)[1:, 1:]
-    cov_f = np.cov(hist, rowvar=False) / len(hist)
+    spread_f = np.cov(hist, rowvar=False)
+    cov_f = spread_f / len(hist)
     var_m = float(b_p @ cov_f @ b_p + mean_f @ cov_b @ mean_f + np.trace(cov_b @ cov_f))
-    return cost, math.sqrt(max(var_m, 0.0))
+    return cost, math.sqrt(max(var_m, 0.0)), float(b_p @ spread_f @ b_p) + s2
 
 
 def added(j: Joint, cov: NDArray[np.float64], ticker: str, fraction: float) -> Added:
@@ -2442,16 +2498,20 @@ def growth(
     picks: NDArray[np.int64],
     f: quant.Devolatilised | None = None,
     w: NDArray[np.float64] | None = None,
+    *,
+    demean: bool = True,
 ) -> NDArray[np.float64]:
     """Growth of 1 along the drawn days, shape (paths, horizon + 1).
 
     ``picks`` index into the window's days; with ``f`` (``volatility``),
     into their residuals: filtered HS from today's volatility, which then
     follows the filter along each path (``quant.growth_paths``).
-    ``w`` replaces ``j.w``, e.g. after a what-if, on the same draws.
+    ``w`` replaces ``j.w``, e.g. after a what-if, on the same draws;
+    ``demean`` False keeps the drawn days' own mean (without ``f``).
     """
     mix = j.w if w is None else w
-    return quant.growth_paths(j.window.to_numpy(dtype="float64"), mix, picks, f)
+    rets = j.window.to_numpy(dtype="float64")
+    return quant.growth_paths(rets, mix, picks, f, demean=demean)
 
 
 def fan(growth: NDArray[np.float64], value: float) -> list[dict[str, float]]:
@@ -2474,12 +2534,37 @@ def histogram(growth: NDArray[np.float64], value: float) -> list[dict[str, float
     ]
 
 
+def reach_curve(risk: perf.PathRisk) -> list[dict[str, float]]:
+    """``risk``'s shares at 0..``REACH_STEPS``% as chart rows, losses first.
+
+    ``x`` is the return threshold: minus the level for ``risk.falls``, plus
+    it for ``risk.rises``; ``side`` -1 or 1 keeps each side's 0 apart.
+    """
+    rows: list[dict[str, float]] = []
+    for side, reach in ((-1.0, risk.falls), (1.0, risk.rises)):
+        steps = range(REACH_STEPS, -1, -1) if side < 0 else range(REACH_STEPS + 1)
+        for k in steps:
+            r = reach[k / 100]
+            rows.append(
+                {
+                    "x": side * k / 100,
+                    "side": side,
+                    "end": r.end,
+                    "touched": r.touched,
+                    "swing": r.swing,
+                }
+            )
+    return rows
+
+
 @dataclass(frozen=True, slots=True)
 class Simulation:
     paths: perf.PathRisk
     fan: list[dict[str, float]]
     ends: list[dict[str, float]]
     outcomes: NDArray[np.float64]  # each path's growth of 1 at zero drift
+    tails: dict[float, tuple[float, float]]  # END_LEVELS → end return's (VaR, ES)
+    reach: list[dict[str, float]]  # reach_curve rows
 
 
 @dataclass(frozen=True, slots=True)
@@ -2492,6 +2577,8 @@ class Tradeoff:
     low: float  # 5th percentile
     es: float | None  # mean loss of the worst 5%
     high: float  # 95th percentile
+    q25: float  # 25th percentile
+    q75: float  # 75th percentile
 
 
 def simulation(
@@ -2503,22 +2590,34 @@ def simulation(
 ) -> Simulation:
     """Summary of growth ``paths``; ``current`` and ``peak`` are past wealth.
 
-    The paths are zero drift; the daily ``drift`` compounds onto them.
+    The paths are zero drift; the daily ``drift`` compounds onto them, and
+    all but ``outcomes`` are of the drifted paths. ``tails`` leaves out a
+    level ``quant.var_es`` has too few paths for.
     """
     outcomes = paths[:, -1].copy()
     paths = paths * (1 + drift) ** np.arange(paths.shape[1])
+    grid = (*perf.PATH_LEVELS, *(k / 100 for k in range(REACH_STEPS + 1)))
+    risk = perf.path_risk(paths[:, 1:], current, peak, tuple(dict.fromkeys(grid)))
+    shown = replace(
+        risk,
+        falls={level: risk.falls[level] for level in perf.PATH_LEVELS},
+        rises={level: risk.rises[level] for level in perf.PATH_LEVELS},
+    )
+    tails = {level: quant.var_es(paths[:, -1] - 1, level) for level in END_LEVELS}
     return Simulation(
-        perf.path_risk(paths[:, 1:], current, peak),
+        shown,
         fan(paths, value),
         histogram(paths, value),
         outcomes,
+        {level: tail for level, tail in tails.items() if tail is not None},
+        reach_curve(risk),
     )
 
 
 def tradeoff(outcomes: NDArray[np.float64], days: int, drift: float) -> Tradeoff:
     """``Simulation.outcomes`` over ``days`` with the daily ``drift`` compounded on."""
     r = outcomes * (1 + drift) ** days - 1
-    low, median, high = np.percentile(r, (5, 50, 95))
+    low, q25, median, q75, high = np.percentile(r, (5, 25, 50, 75, 95))
     tail = quant.var_es(r, 0.95)
     return Tradeoff(
         float(r.mean()),
@@ -2527,6 +2626,8 @@ def tradeoff(outcomes: NDArray[np.float64], days: int, drift: float) -> Tradeoff
         float(low),
         None if tail is None else tail[1],
         float(high),
+        float(q25),
+        float(q75),
     )
 
 
@@ -2555,15 +2656,30 @@ def generated_returns(
     return out @ j.w
 
 
-def path_growth(daily: NDArray[np.float64]) -> NDArray[np.float64]:
+def path_growth(
+    daily: NDArray[np.float64], *, demean: bool = True
+) -> NDArray[np.float64]:
     """Growth of 1 along daily portfolio returns (n, h), shape (n, h + 1).
 
-    Demeaned (zero drift) and floored at -100%, as ``quant.growth_paths``.
+    Demeaned (zero drift) unless not ``demean``, and floored at -100%, as
+    ``quant.growth_paths``.
     """
-    steps = np.maximum(daily - daily.mean(), -1.0) + 1.0
+    steps = np.maximum(daily - daily.mean() if demean else daily, -1.0) + 1.0
     growth = np.ones((len(daily), daily.shape[1] + 1))
     _ = np.cumprod(steps, axis=1, out=growth[:, 1:])
     return growth
+
+
+def normal_paths(mean: float, var: float, days: int) -> NDArray[np.float64]:
+    """Growth of 1 under i.i.d. normal daily portfolio returns, (PATHS, days + 1).
+
+    With weights reset daily, normal holdings' returns make the portfolio's
+    normal too, so one draw a day stands for them all. Seeded by
+    ``quant.SEED``; floored at -100% as ``path_growth``.
+    """
+    rng = np.random.default_rng(quant.SEED)
+    daily = rng.normal(mean, math.sqrt(max(var, 0.0)), (PATHS, days))
+    return path_growth(daily, demean=False)
 
 
 # ---------------------------------------------------------------- VaR and ES
@@ -2585,7 +2701,6 @@ class Tails:
     # By method, full history; None for a method short of data; {} if all are
     backtests: dict[str, quant.Backtest | None]
     lookback: int | None  # days behind each backtest forecast (``backtest_lookback``)
-    component: NDArray[np.float64] | None  # 97.5% ES by holding
     days: int
     history: int
 
@@ -2652,7 +2767,6 @@ def tails(j: Joint, f: quant.Devolatilised, v: Vol | None = None) -> Tails:
         rows=tuple(rows),
         backtests=backtests,
         lookback=lookback,
-        component=quant.component_es(x, j.w),
         days=len(x),
         history=len(full),
     )
@@ -2687,11 +2801,13 @@ def density(
     f: quant.Devolatilised | None = None,
     paths: int = DENSITY_PATHS,
     drift: NDArray[np.float64] | None = None,
+    days: int = quant.MONTH_DAYS,
 ) -> Density:
-    """Berkowitz test of 1-month forecasts made as the 1M fan makes them.
+    """Berkowitz test of ``days``-day forecasts made as the fan makes them.
 
-    Each non-overlapping 21-day block (``quant.blocks``) of the portfolio's
-    returns is set against ``paths`` compounded months. With ``f``, over its
+    Each non-overlapping ``days``-day block (``quant.blocks``) of the
+    portfolio's returns, the last ``quant.BACKTEST_DAYS`` at most, is set
+    against ``paths`` compounded blocks. With ``f``, over its
     own days, they are simulated from the filter's state on the block's
     first day, as the FHS fan simulates from today's. Without, they are
     stationary-bootstrapped from the window's length of days before the
@@ -2704,7 +2820,7 @@ def density(
     held = j.full.to_numpy(dtype="float64")
     if f is not None:
         held = held[-len(f.z) :]
-    outcomes, starts = quant.blocks(held @ j.w)
+    outcomes, starts = quant.blocks(held @ j.w, days)
     n = len(j.window)
     if f is None:
         outcomes, starts = outcomes[starts >= n], starts[starts >= n]
@@ -2712,16 +2828,19 @@ def density(
     if rates is not None:  # blocks with no forecast of the drift are left out
         known = np.isfinite(rates)
         outcomes, starts, rates = outcomes[known], starts[known], rates[known]
+    last = slice(-quant.BACKTEST_DAYS, None)
+    outcomes, starts = outcomes[last], starts[last]
+    rates = None if rates is None else rates[last]
     rng = np.random.default_rng(quant.SEED)
     samples = np.empty((len(starts), paths))
     for i, start in enumerate(starts):
         if f is None:
             before = held[start - n : start]
             block = quant.block_length(before @ j.w)
-            picks = quant.stationary_indices(n, paths, quant.MONTH_DAYS, block, rng)
+            picks = quant.stationary_indices(n, paths, days, block, rng)
             samples[i] = quant.growth_paths(before, j.w, picks)[:, -1] - 1
         else:
-            picks = rng.integers(0, len(f.z), size=(paths, quant.MONTH_DAYS))
+            picks = rng.integers(0, len(f.z), size=(paths, days))
             daily = (
                 quant.filtered_paths(f, j.w, picks, f.sigma[start] ** 2)
                 if f.model is None
@@ -2729,7 +2848,65 @@ def density(
             )
             samples[i] = np.prod(1 + np.maximum(daily, -1.0), axis=1) - 1
     if rates is not None:
-        samples = (1 + samples) * (1 + rates[:, None]) ** quant.MONTH_DAYS - 1
+        samples = (1 + samples) * (1 + rates[:, None]) ** days - 1
+    return Density(quant.berkowitz(quant.pit(outcomes, samples)), len(starts))
+
+
+NORMAL_METHOD: Final = "정규"  # ``normal_tails``' backtest
+
+
+def normal_tails(
+    j: Joint,
+    mean: NDArray[np.float64],
+    var: NDArray[np.float64],
+    lookback: int | None,
+) -> Tails:
+    """The 1-day backtest of i.i.d. normal forecasts, as ``tails``' table.
+
+    ``mean`` and ``var`` are daily, row t of ``j.full`` from earlier days
+    only. Each of the last ``quant.BACKTEST_DAYS`` gets ``DENSITY_PATHS``
+    draws of its normal; None where a forecast is missing. ``lookback``: the
+    days behind each forecast, if one window.
+    """
+    days = quant.BACKTEST_DAYS
+    held = j.full.to_numpy(dtype="float64") @ j.w
+    m, v = mean[-days:], var[-days:]
+    test = None
+    if len(held) >= days and np.isfinite(m).all() and np.isfinite(v).all():
+        z = np.random.default_rng(quant.SEED).standard_normal((days, DENSITY_PATHS))
+        test = quant.backtest(held[-days:], m[:, None] + np.sqrt(v)[:, None] * z)
+    return Tails(
+        rows=(),
+        backtests={NORMAL_METHOD: test},
+        lookback=lookback,
+        days=len(j.window),
+        history=len(held),
+    )
+
+
+def normal_density(
+    j: Joint,
+    mean: NDArray[np.float64],
+    var: NDArray[np.float64],
+    days: int = quant.MONTH_DAYS,
+    paths: int = DENSITY_PATHS,
+) -> Density:
+    """``density`` for i.i.d. normal forecasts, as ``normal_paths`` draws them.
+
+    Each block's ``paths`` compound ``days`` daily draws of the normal of
+    its first day's ``mean`` and ``var`` (on ``j.full``'s rows); blocks
+    without them are left out.
+    """
+    held = j.full.to_numpy(dtype="float64") @ j.w
+    outcomes, starts = quant.blocks(held, days)
+    known = np.isfinite(mean[starts]) & np.isfinite(var[starts])
+    last = slice(-quant.BACKTEST_DAYS, None)
+    outcomes, starts = outcomes[known][last], starts[known][last]
+    rng = np.random.default_rng(quant.SEED)
+    samples = np.empty((len(starts), paths))
+    for i, start in enumerate(starts):
+        daily = mean[start] + math.sqrt(var[start]) * rng.standard_normal((paths, days))
+        samples[i] = np.prod(1 + np.maximum(daily, -1.0), axis=1) - 1
     return Density(quant.berkowitz(quant.pit(outcomes, samples)), len(starts))
 
 
