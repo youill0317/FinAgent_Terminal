@@ -99,15 +99,16 @@ AI_CSS = """<style>
 # content. auto-fill keeps a card the same width however many share the row,
 # so one or two cards do not stretch across it, and 1fr rows keep a wrapped
 # card as tall as the row above. 188px fits the 최대 낙폭 dates; 160px keeps
-# the eight 고급 cards on one line at 1600px wide; 260px fits amounts and the
-# 난기류 pill; 280px the what-if "before → after" values.
+# the eight 고급 and 시장 cards on one line at 1600px wide; 260px fits amounts
+# and the 난기류 pill; 280px the what-if "before → after" values. Headings
+# break between words, not inside one.
 CARDS_CSS = """<style>
 .st-key-pf_risk_cards, .st-key-pf_spread_cards, .st-key-detail_cards,
 .st-key-screen_stock_cards
   {display: grid; grid-auto-rows: 1fr;
   grid-template-columns: repeat(auto-fill, minmax(188px, 1fr))}
-.st-key-pf_more_cards {display: grid; grid-auto-rows: 1fr;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))}
+.st-key-pf_more_cards, [class*="st-key-tape_cards_"] {display: grid;
+  grid-auto-rows: 1fr; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))}
 .st-key-pf_now_cards, .st-key-pf_return_cards, .st-key-pf_trade_cards,
 .st-key-pf_split_cards, .st-key-pf_turbulence_cards, .st-key-pf_reverse_cards,
 .st-key-inv_now_cards, .st-key-inv_return_cards, .st-key-inv_overlap_cards,
@@ -116,6 +117,7 @@ CARDS_CSS = """<style>
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr))}
 .st-key-pf_whatif_cards, .st-key-pf_whatif_path_cards {display: grid;
   grid-auto-rows: 1fr; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr))}
+h1, h2, h3 {word-break: keep-all; overflow-wrap: break-word}
 </style>"""
 FRED_NOTICE = "**조건** FRED API 키 · 환경변수 FRED_API_KEY 또는 .env"
 
@@ -123,6 +125,14 @@ FRED_NOTICE = "**조건** FRED API 키 · 환경변수 FRED_API_KEY 또는 .env"
 def notice(text: str) -> None:
     """A "!" whose hover shows ``text``, like a heading's "?"."""
     st.badge("", icon=":material/priority_high:", color="orange", help=text)
+
+
+def list_height(rows: int) -> int:
+    """A long table's height, so a short list leaves no empty rows below it.
+
+    Rows and the header are 35px each; past ``LIST_HEIGHT`` the table scrolls.
+    """
+    return min(LIST_HEIGHT, (rows + 1) * 35 + 3)
 
 
 def headed(text: str, help_: str | None = None, warns: Sequence[str] = ()) -> None:
@@ -578,25 +588,25 @@ def view_settings(d: Dashboard, on: frozenset[str]) -> None:
         (title, icon, ids) for _, title, icon, ids in display.PANEL_PAGES
     ]
     for row in itertools.batched(sections, 3):
-        for col, (title, icon, ids) in zip(
-            st.columns(3, border=True), row, strict=False
-        ):
+        # Bordered per card, not per column: a short last row has no empty card.
+        for col, (title, icon, ids) in zip(st.columns(3), row, strict=False):
+            card = col.container(border=True, height="stretch")
             views = [view for view in d.views if view.id in ids]
             switchable = [view for view in views if view.extra]
             count = sum(view.id in on for view in switchable)
-            col.markdown(f"{icon} **{title}** :gray[{count}/{len(switchable)}]")
+            card.markdown(f"{icon} **{title}** :gray[{count}/{len(switchable)}]")
             for view in views:
                 note = display.view_note(
                     view.core, view.extra, curve=view.id == "curve"
                 )
-                col.checkbox(
+                card.checkbox(
                     f"{view.title} :gray[{note}]",
                     key=f"view_{view.id}",
                     disabled=not view.extra,
                 )
 
 
-@st.dialog("보기 설정", width="large")
+@st.dialog("설정", width="large")
 def settings_dialog(d: Dashboard) -> None:
     on = frozenset(view.id for view in d.views if state.get(f"view_{view.id}"))
     # Fixed labels: a changed one would reopen the first tab.
@@ -744,22 +754,22 @@ def notices(d: Dashboard) -> None:
 def tape(d: Dashboard) -> None:
     st.header("시장", anchor="market")
     groups = display.tape_groups(d.tape, display.rows_by_id(d))
-    width = max((len(rows) for _, rows in groups), default=0)
-    for title, rows in groups:
+    for i, (title, rows) in enumerate(groups):
         headed(f"**{title}**", display.TAPE_HELP.get(title))
-        for col, row in zip(st.columns(width), rows, strict=False):
-            flat = display.change(row) == 0
-            col.metric(
-                display.TAPE_LABELS.get(row.id, row.label),
-                display.fmt(row.value, row.fmt),
-                display.metric_delta(row),
-                delta_color=display.metric_color(row),
-                delta_arrow="off" if flat else "auto",
-                help=GUIDES.get(row.id, row.code),
-                border=True,
-                height="stretch",
-                chart_data=display.trend(row),
-            )
+        with st.container(horizontal=True, key=f"tape_cards_{i}"):
+            for row in rows:
+                flat = display.change(row) == 0
+                st.metric(
+                    display.TAPE_LABELS.get(row.id, row.label),
+                    display.fmt(row.value, row.fmt),
+                    display.metric_delta(row),
+                    delta_color=display.metric_color(row),
+                    delta_arrow="off" if flat else "auto",
+                    help=GUIDES.get(row.id, row.code),
+                    border=True,
+                    height="stretch",
+                    chart_data=display.trend(row),
+                )
 
 
 def regime(d: Dashboard) -> None:
@@ -1553,7 +1563,7 @@ def screen_results(root: Path, table: pd.DataFrame, c: screen.Criteria) -> None:
     event = st.dataframe(
         styled,
         hide_index=True,
-        height=LIST_HEIGHT,
+        height=list_height(len(shown)),
         placeholder="—",  # NaN cells; the grid ignores the Styler's dash for them
         on_select="rerun",
         selection_mode="single-cell",
@@ -6649,7 +6659,7 @@ def inv_holdings(
         event = st.dataframe(
             shown.style.map(inv_style, subset=["직전 분기 대비"]),
             hide_index=True,
-            height=LIST_HEIGHT,
+            height=list_height(len(shown)),
             on_select="rerun",
             selection_mode="single-cell",
             key=f"inv_table_{state.get('inv_gen', 0)}",
@@ -7323,8 +7333,9 @@ def inv_view(
     data = inv_load(str(root), cik, stamp)
     found = data[1]
     if not found:
-        if not fetcher.progress.running:
-            st.info("저장된 13F 자료가 없습니다.")
+        # The bar above already says no 13F is saved, and why when blocked.
+        if not fetcher.progress.running and not blocked:
+            st.info("상단 갱신을 누르면 SEC에서 13F를 다시 받습니다.")
         return
     hold = bool(blocked) or fetcher.progress.running
     inv_prices(pfetch, hold, cik, investors.tickers(found, data[2]), prices)

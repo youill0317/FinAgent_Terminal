@@ -323,6 +323,8 @@ def regime_card(cell: RegimeCell) -> tuple[str, str]:
     card's unit; the rest (what is measured) joins the label.
     """
     head, _, rest = cell.unit.partition(" ")
+    if not cell.unit:
+        return cell.label, cell.value
     if head not in {"%", "%p"}:
         return f"{cell.label} · {cell.unit}", cell.value
     value = cell.value if cell.value == "—" else f"{cell.value}{head}"
