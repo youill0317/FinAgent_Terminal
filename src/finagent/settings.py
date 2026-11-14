@@ -1,12 +1,4 @@
-"""The saved view: which panels are shown in full, and the chosen AI provider.
-
-This is the only file the app writes. It holds view ids and, once an AI
-provider is picked, that provider's id and model names, the last
-generator-training choices (tickers, dates, GPU, models) and the screening
-criteria that differ from the defaults. It never holds
-fetched data, conversations or API keys. A missing or unreadable file means
-the default view (core rows only) and the default provider.
-"""
+"""터미널 환경설정(자동 갱신·테마·AI 분석 공급자) 로드 및 영속화."""
 
 from __future__ import annotations
 
@@ -14,177 +6,139 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, cast
 
-from finagent import catalog
+from finagent import layout
+from finagent.etf_universe import Product
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-SETTINGS_VERSION: Final = 1
-SCOPES: Final = ("view", "all")
-DEFAULT_SCOPE: Final = "view"
+ETF_PERIOD: Final = "1개월"
 
 
 @dataclass(frozen=True, slots=True)
 class AnalysisChoice:
     provider: str
     models: dict[str, str] = field(default_factory=dict)
-    scope: str = DEFAULT_SCOPE
-    instructions: str = ""  # the user's system prompt
+    instructions: str = ""
+    thread_models: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
-class TrainingChoice:
-    """The 생성 모델 학습 choices; dates are ISO strings, empty for the default."""
-
-    tickers: tuple[str, ...] = ()
-    start: str = ""
-    end: str = ""
-    gpu: str = ""
-    models: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class ScreenChoice:
-    """The 스크리닝 기준 switches flipped from their defaults.
-
-    ``off`` holds the ids; ``screen.criteria`` drops unknown ones.
-    """
-
-    off: tuple[str, ...] = ()
-
-
-def load_view(path: Path) -> tuple[frozenset[str], str | None]:
-    """Return the saved view, or the default view and why the file was skipped."""
-    if not path.is_file():
-        return catalog.CORE_VIEW, None
-    try:
-        raw = cast("object", json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        return catalog.CORE_VIEW, f"설정 파일을 읽지 못해 기본 보기를 씁니다: {error}"
-    deep = cast("dict[str, object]", raw).get("deep") if isinstance(raw, dict) else None
-    if not isinstance(deep, list):
-        return catalog.CORE_VIEW, "설정 파일 형식이 맞지 않아 기본 보기를 씁니다"
-    ids = {item for item in cast("list[object]", deep) if isinstance(item, str)}
-    return frozenset(ids) & catalog.ALL_VIEWS, None
+class EtfChoice:
+    added: tuple[Product, ...] = ()
+    removed: tuple[str, ...] = ()
+    group: str | None = None
+    category: str | None = None
+    period: str = ETF_PERIOD
 
 
 def load_analysis(path: Path) -> AnalysisChoice | None:
-    """The saved AI provider choice, or ``None`` when there is none."""
     raw = _read(path).get("analysis")
     if not isinstance(raw, dict):
         return None
     section = cast("dict[str, object]", raw)
     provider = section.get("provider")
-    models = section.get("models")
     if not isinstance(provider, str):
         return None
-    clean: dict[str, str] = {}
-    if isinstance(models, dict):
-        clean = {
-            key: value
-            for key, value in cast("dict[object, object]", models).items()
-            if isinstance(key, str) and isinstance(value, str)
-        }
-    scope = section.get("scope")
-    if not isinstance(scope, str) or scope not in SCOPES:
-        scope = DEFAULT_SCOPE
     instructions = section.get("instructions")
     if not isinstance(instructions, str):
         instructions = ""
-    return AnalysisChoice(provider, clean, scope, instructions)
+    return AnalysisChoice(
+        provider,
+        _models(section.get("models")),
+        instructions,
+        _models(section.get("thread_models")),
+    )
 
 
-def load_training(path: Path) -> TrainingChoice | None:
-    """The saved training choices, or ``None`` when there are none."""
-    raw = _read(path).get("training")
+def _models(raw: object) -> dict[str, str]:
     if not isinstance(raw, dict):
-        return None
+        return {}
+    return {
+        key: value
+        for key, value in cast("dict[object, object]", raw).items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+
+
+def load_etf(path: Path) -> EtfChoice:
+    raw = _read(path).get("etf")
+    if not isinstance(raw, dict):
+        return EtfChoice()
     section = cast("dict[str, object]", raw)
-
-    def text(key: str) -> str:
-        value = section.get(key)
-        return value if isinstance(value, str) else ""
-
-    def names(key: str) -> tuple[str, ...]:
-        value = section.get(key)
-        if not isinstance(value, list):
-            return ()
-        return tuple(v for v in cast("list[object]", value) if isinstance(v, str))
-
-    return TrainingChoice(
-        names("tickers"), text("start"), text("end"), text("gpu"), names("models")
+    added: list[Product] = []
+    items = section.get("added")
+    for item in cast("list[object]", items) if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        row = cast("dict[str, object]", item)
+        ticker, group, category = (
+            row.get("ticker"),
+            row.get("group"),
+            row.get("category"),
+        )
+        multiple = row.get("multiple", 1)
+        if (
+            isinstance(ticker, str)
+            and isinstance(group, str)
+            and isinstance(category, str)
+            and isinstance(multiple, (int, float))
+        ):
+            added.append(Product(ticker.upper(), group, category, float(multiple)))
+    removed = section.get("removed")
+    group = section.get("group")
+    category = section.get("category")
+    period = section.get("period")
+    return EtfChoice(
+        tuple(added),
+        tuple(v.upper() for v in cast("list[object]", removed) if isinstance(v, str))
+        if isinstance(removed, list)
+        else (),
+        group if isinstance(group, str) else None,
+        category if isinstance(category, str) else None,
+        period if isinstance(period, str) else ETF_PERIOD,
     )
 
 
-def load_screen(path: Path) -> ScreenChoice:
-    """The saved screening switches; ids of other types are dropped."""
-    raw = _read(path).get("screen")
-    if not isinstance(raw, dict):
-        return ScreenChoice()
-    off = cast("dict[str, object]", raw).get("off")
-    if not isinstance(off, list):
-        return ScreenChoice()
-    return ScreenChoice(
-        tuple(v for v in cast("list[object]", off) if isinstance(v, str))
-    )
-
-
-def save_view(path: Path, deep: frozenset[str]) -> None:
-    """Write the view, keeping any saved provider and training choices.
-
-    Raises ``OSError`` if the file cannot be written.
-    """
-    ordered = [view.id for view in catalog.VIEWS if view.id in deep]
-    body: dict[str, object] = {"version": SETTINGS_VERSION, "deep": ordered}
-    _write(path, _kept(body, path, "analysis", "training", "screen"))
-
-
-def save_analysis(path: Path, choice: AnalysisChoice) -> None:
-    """Write the provider choice, keeping the saved view and training choices."""
-    view, _ = load_view(path)
-    ordered = [item.id for item in catalog.VIEWS if item.id in view]
-    body: dict[str, object] = {
-        "version": SETTINGS_VERSION,
-        "deep": ordered,
-        "analysis": {
-            "provider": choice.provider,
-            "models": dict(choice.models),
-            "scope": choice.scope,
-            "instructions": choice.instructions,
-        },
-    }
-    _write(path, _kept(body, path, "training", "screen"))
-
-
-def save_training(path: Path, choice: TrainingChoice) -> None:
-    """Write the training choices, keeping the saved view and provider."""
-    view, _ = load_view(path)
-    ordered = [item.id for item in catalog.VIEWS if item.id in view]
-    body: dict[str, object] = {"version": SETTINGS_VERSION, "deep": ordered}
-    body = _kept(body, path, "analysis")
-    body["training"] = {
-        "tickers": list(choice.tickers),
-        "start": choice.start,
-        "end": choice.end,
-        "gpu": choice.gpu,
-        "models": list(choice.models),
-    }
-    _write(path, _kept(body, path, "screen"))
-
-
-def save_screen(path: Path, choice: ScreenChoice) -> None:
-    """Write the screening criteria, keeping the rest; none clears the section."""
-    view, _ = load_view(path)
-    ordered = [item.id for item in catalog.VIEWS if item.id in view]
-    body: dict[str, object] = {"version": SETTINGS_VERSION, "deep": ordered}
-    body = _kept(body, path, "analysis", "training")
-    if choice.off:
-        body["screen"] = {"off": list(choice.off)}
+def save_etf(path: Path, choice: EtfChoice) -> None:
+    body = _kept({}, path, "analysis")
+    section: dict[str, object] = {}
+    if choice.added:
+        section["added"] = [
+            {
+                "ticker": p.ticker,
+                "group": p.group,
+                "category": p.category,
+                "multiple": p.multiple,
+            }
+            for p in choice.added
+        ]
+    if choice.removed:
+        section["removed"] = list(choice.removed)
+    if choice.group is not None:
+        section["group"] = choice.group
+    if choice.category is not None:
+        section["category"] = choice.category
+    if choice.period != ETF_PERIOD:
+        section["period"] = choice.period
+    if section:
+        body["etf"] = section
     _write(path, body)
 
 
+def save_analysis(path: Path, choice: AnalysisChoice) -> None:
+    body: dict[str, object] = {
+        "analysis": {
+            "provider": choice.provider,
+            "models": dict(choice.models),
+            "thread_models": dict(choice.thread_models),
+            "instructions": choice.instructions,
+        },
+    }
+    _write(path, _kept(body, path, "etf"))
+
+
 def _kept(body: dict[str, object], path: Path, *keys: str) -> dict[str, object]:
-    """``body`` plus the saved sections ``keys``, where the file has them."""
     saved = _read(path)
     for key in keys:
         section = saved.get(key)
@@ -193,20 +147,27 @@ def _kept(body: dict[str, object], path: Path, *keys: str) -> dict[str, object]:
     return body
 
 
+class SettingsError(ValueError):
+    pass
+
+
+def check(path: Path) -> None:
+    _ = _read(path)
+
+
 def _read(path: Path) -> dict[str, object]:
     if not path.is_file():
         return {}
     try:
         raw = cast("object", json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return cast("dict[str, object]", raw) if isinstance(raw, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        msg = f"설정 파일 읽기 실패: {path} ({error})"
+        raise SettingsError(msg) from error
+    if not isinstance(raw, dict):
+        msg = f"설정 파일 JSON 객체 형식 오류: {path}"
+        raise SettingsError(msg)
+    return cast("dict[str, object]", raw)
 
 
 def _write(path: Path, body: dict[str, object]) -> None:
-    """Write atomically; raises ``OSError`` if the file cannot be written."""
-    text = json.dumps(body, ensure_ascii=False, indent=2)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f"{path.name}.tmp")
-    _ = temp.write_text(text + "\n", encoding="utf-8")
-    _ = temp.replace(path)
+    layout.write_text(path, json.dumps(body, ensure_ascii=False, indent=2) + "\n")

@@ -1,37 +1,44 @@
-"""GPT through the OpenAI Responses API with ``OPENAI_API_KEY``.
-
-Stateless: ``store`` is off and the encrypted reasoning items are passed back
-with each tool round, so nothing of the conversation is kept at OpenAI.
-"""
+"""OpenAI Responses API 스트리밍·함수 호출 및 웹 검색 어댑터."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Final, cast
 
 from finagent.analysis.providers.base import (
+    NO_MODEL,
+    TOO_MANY_ROUNDS,
+    TRUNCATED,
+    WEB_STEP_LIMIT,
     ProviderError,
-    ProviderStatus,
     TextDelta,
+    ToolRound,
     Usage,
+    WebFound,
+    WebStep,
     env_value,
-    installed,
+    key_status,
 )
-from finagent.analysis.tools import MAX_TOOL_CALLS
+from finagent.analysis.web import WebSource
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
+    from openai import AsyncOpenAI
     from openai.types.responses import (
-        FunctionToolParam,
         Response,
+        ResponseFunctionWebSearch,
+        ResponseIncludable,
         ResponseInputParam,
         ResponseStreamEvent,
+        ToolParam,
     )
 
     from finagent.analysis.providers.base import (
         ProviderEvent,
         ProviderId,
+        ProviderStatus,
         RunRequest,
     )
 
@@ -44,92 +51,168 @@ class OpenAiApiProvider:
     default_model: str = "gpt-6-astra"
 
     def __init__(self, env: Mapping[str, str]) -> None:
-        """Read keys from ``env`` (the merged .env file and environment)."""
         self._key: str = env_value(env, KEY_ENV)
 
     async def status(self) -> ProviderStatus:
-        if not installed("openai"):
-            return ProviderStatus("not_installed", "uv sync --extra openai")
-        if not self._key:
-            return ProviderStatus("missing_key", f"{KEY_ENV}가 없습니다")
-        return ProviderStatus("ready")
+        return key_status("openai", "openai", self._key, KEY_ENV)
 
     async def stream(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:
-        import openai  # noqa: PLC0415 - optional dependency
+        import openai  # noqa: PLC0415  # 선택적 의존성(openai) 지연 임포트
 
-        client = openai.AsyncOpenAI(api_key=self._key)
-        items: ResponseInputParam = [
-            {
-                "role": "user" if message.role == "user" else "assistant",
-                "content": message.text,
-            }
-            for message in request.conversation.messages()
-        ]
-        tools: list[FunctionToolParam] = [
-            {
-                "type": "function",
-                "name": spec.name,
-                "description": spec.description,
-                "parameters": spec.schema,
-                "strict": False,
-            }
-            for spec in request.tools
-        ]
-        for _ in range(MAX_TOOL_CALLS + 2):
-            stream = await client.responses.create(
-                model=request.model,
-                instructions=request.conversation.system,
-                input=items,
-                tools=tools,
-                stream=True,
-                store=False,
-                include=["reasoning.encrypted_content"],
+        async with openai.AsyncOpenAI(api_key=self._key) as client:
+            try:
+                async for event in _rounds(client, request):
+                    yield event
+            except openai.NotFoundError as error:
+                raise ProviderError(NO_MODEL.format(model=request.model)) from error
+
+
+async def _rounds(
+    client: AsyncOpenAI, request: RunRequest
+) -> AsyncIterator[ProviderEvent]:
+    items: ResponseInputParam = [
+        {
+            "role": "user" if message.role == "user" else "assistant",
+            "content": message.text,
+        }
+        for message in request.conversation.messages()
+    ]
+    include: list[ResponseIncludable] = ["reasoning.encrypted_content"]
+    if request.web:
+        include.append("web_search_call.action.sources")
+    used = 0
+    for _ in range(request.max_rounds + 2):
+        web = request.web and used < WEB_STEP_LIMIT
+        stream = await client.responses.create(
+            model=request.model,
+            instructions=request.conversation.system,
+            input=items,
+            tools=_tools(request, web=web),
+            max_tool_calls=WEB_STEP_LIMIT - used if web else None,
+            stream=True,
+            store=False,
+            include=include,
+        )
+        final: Response | None = None
+        async for event in stream:
+            for found in _stream_events(event):
+                yield found
+            final = _finished(event) or final
+        if final is None:
+            msg = "응답 미완료 종료"
+            raise ProviderError(msg)
+        if final.usage is not None:
+            yield Usage(final.usage.input_tokens, final.usage.output_tokens)
+        if request.web:
+            yield WebFound(_cited(final))
+        used += sum(item.type == "web_search_call" for item in final.output)
+        calls = [item for item in final.output if item.type == "function_call"]
+        if not calls:
+            return
+        items.extend(
+            cast(
+                "ResponseInputParam",
+                [item.model_dump(exclude_none=True) for item in final.output],
             )
-            final: Response | None = None
-            async for event in stream:
-                if event.type == "response.output_text.delta":
-                    yield TextDelta(event.delta)
-                else:
-                    final = _finished(event) or final
-            if final is None:
-                msg = "응답이 끝나지 않았습니다"
-                raise ProviderError(msg)
-            if final.usage is not None:
-                yield Usage(final.usage.input_tokens, final.usage.output_tokens)
-            calls = [item for item in final.output if item.type == "function_call"]
-            if not calls:
-                return
-            items.extend(
-                cast(
-                    "ResponseInputParam",
-                    [item.model_dump(exclude_none=True) for item in final.output],
-                )
+        )
+        results = await asyncio.gather(
+            *(
+                request.run_tool(item.name, _arguments(item.name, item.arguments))
+                for item in calls
             )
-            for item in calls:
-                result = await request.run_tool(item.name, _arguments(item.arguments))
-                items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": item.call_id,
-                        "output": result.text,
-                    }
-                )
-        msg = "도구 왕복이 너무 많아 멈췄습니다"
-        raise ProviderError(msg)
+        )
+        for item, result in zip(calls, results, strict=True):
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item.call_id,
+                    "output": result.text,
+                }
+            )
+        yield ToolRound()
+    raise ProviderError(TOO_MANY_ROUNDS)
 
 
-def _arguments(raw: str | None) -> dict[str, object]:
+def _tools(request: RunRequest, *, web: bool) -> list[ToolParam]:
+    tools: list[ToolParam] = [
+        {
+            "type": "function",
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": spec.schema,
+            "strict": False,
+        }
+        for spec in request.tools
+    ]
+    if web:
+        tools.append({"type": "web_search"})
+    return tools
+
+
+def _stream_events(event: ResponseStreamEvent) -> tuple[ProviderEvent, ...]:
+    if event.type == "response.output_text.delta":
+        return (TextDelta(event.delta),)
+    if event.type == "response.output_item.done" and (
+        event.item.type == "web_search_call"
+    ):
+        return (
+            WebStep(_step(event.item), ok=event.item.status != "failed"),
+            WebFound(_action_sources(event.item)),
+        )
+    return ()
+
+
+def _step(item: ResponseFunctionWebSearch) -> str:
+    action = item.action
+    if item.status == "failed":
+        return "웹 검색 실패: 응답 실패"
+    if action.type == "search":
+        return f"웹 검색: {action.query or ', '.join(action.queries or [])}"
+    if action.type == "open_page":
+        return f"원문 읽기: {action.url or ''}"
+    return f"원문 읽기: {action.url}"
+
+
+def _action_sources(item: ResponseFunctionWebSearch) -> tuple[WebSource, ...]:
+    action = item.action
+    if action.type == "search":
+        return tuple(WebSource(source.url) for source in action.sources or [])
+    if action.url:
+        return (WebSource(action.url),)
+    return ()
+
+
+def _cited(final: Response) -> tuple[WebSource, ...]:
+    return tuple(
+        WebSource(note.url, note.title)
+        for item in final.output
+        if item.type == "message"
+        for part in item.content
+        if part.type == "output_text"
+        for note in part.annotations
+        if note.type == "url_citation"
+    )
+
+
+def _arguments(name: str, raw: str) -> dict[str, object]:
     try:
         parsed = cast("object", json.loads(raw or "{}"))
-    except json.JSONDecodeError:
-        return {}
-    return cast("dict[str, object]", parsed) if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError as error:
+        raise ProviderError(f"{name}: 도구 입력 JSON 파싱 오류") from error
+    if not isinstance(parsed, dict):
+        raise ProviderError(f"{name}: 도구 입력 JSON 객체 형식 오류")
+    return cast("dict[str, object]", parsed)
 
 
 def _finished(event: ResponseStreamEvent) -> Response | None:
-    """The final response from a terminal event; raises if the run failed."""
-    if event.type in {"response.completed", "response.incomplete"}:
-        return cast("Response", getattr(event, "response", None))
+    if event.type == "response.completed":
+        return event.response
+    if event.type == "response.incomplete":
+        details = event.response.incomplete_details
+        reason = details.reason if details is not None else None
+        if reason == "max_output_tokens":
+            raise ProviderError(TRUNCATED)
+        raise ProviderError(f"응답 미완료 종료: {reason}")
     if event.type == "response.failed":
         error = event.response.error
         msg = error.message if error is not None else "응답 실패"

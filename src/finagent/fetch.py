@@ -1,14 +1,22 @@
+"""비동기 HTTP 데이터 수집 컨텍스트 및 중복 요청 병합 제어."""
+
 from __future__ import annotations
 
 import asyncio
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, final
+import threading
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, Final, cast, final
 
 import httpx
 
+from finagent import limits
+from finagent.limits import BACKGROUND_WAIT, LIMITS
+from finagent.limits import (
+    SourceError as SourceError,  # noqa: PLC0414  # 하위 호환 명시적 재노출
+)
+
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
-    from datetime import date
+    from collections.abc import Awaitable, Callable, Mapping
 
     from finagent.models import SourceId
 
@@ -17,37 +25,11 @@ ECOS_KEY_ENV: Final = "ECOS_API_KEY"
 REQUEST_TIMEOUT_SECONDS: Final = 20.0
 USER_AGENT: Final = "finagent/0.2 (local dashboard)"
 RETRY_DELAY_SECONDS: Final = 1.0
-HTTP_TOO_MANY_REQUESTS: Final = 429
 HTTP_CLIENT_ERROR: Final = 400
 HTTP_SERVER_ERROR: Final = 500
 
-# Daily closes for a Yahoo ticker since a start date; blocking, so it runs in
-# a worker thread. ``sources.YahooCloses`` is the real one.
-type Closes = Callable[[str, date], tuple[tuple[date, float], ...]]
 
-# Concurrent requests allowed per source. OECD allows 60 downloads an hour,
-# so it gets one lane; FRED allows about 120 a minute. Yahoo (unofficial,
-# through yfinance) gets one lane too.
-SOURCE_LANES: Final[Mapping[SourceId, int]] = MappingProxyType(
-    {
-        "FRED": 6,
-        "TREASURY": 2,
-        "NYFED": 2,
-        "ECOS": 4,
-        "ECB": 2,
-        "BIS": 2,
-        "OECD": 1,
-        "YAHOO": 1,
-    }
-)
-
-
-class SourceError(Exception):
-    """A source could not deliver a usable series. The message is user-facing."""
-
-
-class MissingKeyError(SourceError):
-    """The source needs an API key, or an optional package, that is not set up."""
+class MissingKeyError(SourceError): ...
 
 
 def new_client() -> httpx.AsyncClient:
@@ -59,38 +41,61 @@ def new_client() -> httpx.AsyncClient:
 
 
 @final
+class SharedWork:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running: dict[str, Future[object]] = {}
+
+    async def run[T](self, key: str, make: Callable[[], Awaitable[T]]) -> T:
+        with self._lock:
+            running = self._running.get(key)
+            mine: Future[object] = Future()
+            if running is None:
+                self._running[key] = mine
+        if running is not None:
+            return cast("T", await asyncio.wrap_future(running))
+        try:
+            result = await make()
+        except BaseException as error:
+            mine.set_exception(error)
+            raise
+        else:
+            mine.set_result(result)
+            return result
+        finally:
+            with self._lock:
+                del self._running[key]
+
+
+@final
 class FetchContext:
-    """One refresh pass: shared client, keys, and per-request de-duplication.
+    __slots__ = ("_client", "_env", "_inflight", "_retry_delay", "_shared", "max_wait")
 
-    Responses live only for the duration of the pass. Nothing is written to
-    disk, except yfinance's own caches when ``yahoo`` is ``YahooCloses``.
-    """
-
-    __slots__ = ("_client", "_env", "_inflight", "_lanes", "_retry_delay", "_yahoo")
-
-    def __init__(  # noqa: D107
+    def __init__(
         self,
         client: httpx.AsyncClient,
         env: Mapping[str, str],
         *,
         retry_delay: float = RETRY_DELAY_SECONDS,
-        yahoo: Closes | None = None,
+        max_wait: float = BACKGROUND_WAIT,
+        shared: SharedWork | None = None,
     ) -> None:
+        self._shared = shared or SharedWork()
         self._client = client
         self._env = env
         self._retry_delay = retry_delay
-        self._yahoo = yahoo
-        self._lanes = {
-            source: asyncio.Semaphore(lanes) for source, lanes in SOURCE_LANES.items()
-        }
+        self.max_wait = max_wait
         self._inflight: dict[
             tuple[str, tuple[tuple[str, str], ...]], asyncio.Task[str]
         ] = {}
 
+    async def shared[T](self, key: str, make: Callable[[], Awaitable[T]]) -> T:
+        return await self._shared.run(key, make)
+
     def key(self, env_name: str) -> str:
         value = self._env.get(env_name, "").strip()
         if value == "":
-            raise MissingKeyError(f"{env_name} 환경변수가 없습니다")
+            raise MissingKeyError(f"{env_name} 환경변수 미설정")
         return value
 
     def has_key(self, env_name: str) -> bool:
@@ -102,7 +107,6 @@ class FetchContext:
         url: str,
         params: Mapping[str, str] | None = None,
     ) -> str:
-        """GET a URL once per pass; concurrent callers share the same request."""
         query = tuple(sorted((params or {}).items()))
         cache_key = (url, query)
         task = self._inflight.get(cache_key)
@@ -111,38 +115,34 @@ class FetchContext:
             self._inflight[cache_key] = task
         return await asyncio.shield(task)
 
-    async def closes(self, ticker: str, start: date) -> tuple[tuple[date, float], ...]:
-        """Yahoo daily closes since ``start``, read in a worker thread."""
-        if self._yahoo is None:
-            raise SourceError("YAHOO 시세를 받을 경로가 없습니다")
-        async with self._lanes["YAHOO"]:
-            return await asyncio.to_thread(self._yahoo, ticker, start)
-
     async def _get(self, source: SourceId, url: str, params: dict[str, str]) -> str:
-        async with self._lanes[source]:
-            try:
-                return await self._attempt(source, url, params)
-            except _RetryableError:
-                await asyncio.sleep(self._retry_delay)
-            try:
-                return await self._attempt(source, url, params)
-            except _RetryableError as error:
-                raise SourceError(str(error)) from error
+        limiter = limits.current()
+        left = LIMITS[source].retries
+        async with limiter.aslot(source, self.max_wait):
+            while True:
+                await limiter.aacquire(source, max_wait=self.max_wait)
+                try:
+                    return await self._attempt(source, url, params)
+                except _RetryableError as error:
+                    if left == 0:
+                        raise SourceError(str(error)) from error
+                    if not error.limited:
+                        await asyncio.sleep(self._retry_delay)
+                left -= 1
 
     async def _attempt(self, source: SourceId, url: str, params: dict[str, str]) -> str:
-        """One GET. Timeouts, connection errors and 5xx may be retried; 4xx not."""
         try:
             response = await self._client.get(url, params=params)
         except httpx.TimeoutException as error:
             raise _RetryableError(f"{source} 응답 시간 초과") from error
         except httpx.HTTPError as error:
-            # The exception text can contain the URL and with it an API key.
             raise _RetryableError(
                 f"{source} 연결 실패 ({type(error).__name__})"
             ) from error
         status = response.status_code
-        if status == HTTP_TOO_MANY_REQUESTS:
-            raise SourceError(f"{source} 요청 한도 초과")
+        if limits.limited(source, response):
+            limits.current().report_limited(source, limits.retry_after(response))
+            raise _RetryableError(f"{source} 요청 한도 초과", limited=True)
         if status >= HTTP_SERVER_ERROR:
             raise _RetryableError(f"{source} HTTP {status}")
         if status >= HTTP_CLIENT_ERROR:
@@ -151,4 +151,6 @@ class FetchContext:
 
 
 class _RetryableError(Exception):
-    """A failure worth one more try; becomes a SourceError if it repeats."""
+    def __init__(self, message: str, *, limited: bool = False) -> None:
+        super().__init__(message)
+        self.limited: bool = limited

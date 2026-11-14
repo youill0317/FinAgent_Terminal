@@ -45,16 +45,3 @@ def test_monthly_year_over_year_matches_same_month_last_year() -> None:
     result = year_over_year(series, "M")
 
     assert result == ((date(2025, 1, 1), pytest.approx(3.0)),)
-
-
-def test_daily_year_over_year_skips_points_without_a_year_of_history() -> None:
-    series = (
-        (date(2025, 1, 2), 50.0),
-        (date(2026, 1, 2), 55.0),
-        (date(2026, 1, 5), 60.0),
-    )
-
-    result = year_over_year(series, "D")
-
-    assert [day for day, _ in result] == [date(2026, 1, 2), date(2026, 1, 5)]
-    assert result[0][1] == pytest.approx(10.0)

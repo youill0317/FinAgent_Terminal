@@ -1,4 +1,4 @@
-"""Local macro dashboard built only on public and open data sources."""
+"""FinAgent 거시경제 및 포트폴리오 분석 패키지."""
 
 from __future__ import annotations
 

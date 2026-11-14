@@ -1,14 +1,36 @@
+"""대시보드 패널·지표 행·수익률 곡선·경제전망(SEP)·발표 일정 불변 데이터 모델."""
+
 from __future__ import annotations
 
 from typing import ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-SourceId = Literal["FRED", "TREASURY", "NYFED", "ECOS", "ECB", "BIS", "OECD", "YAHOO"]
+SourceId = Literal[
+    "FRED",
+    "ECOS",
+    "ECB",
+    "BIS",
+    "OECD",
+    "ALPACA",
+    "YAHOO",
+    "SEC",
+    "OPENFIGI",
+]
 Freq = Literal["D", "W", "M", "Q"]
 RowStatus = Literal["ok", "missing_key", "error"]
 SourceState = Literal["ok", "partial", "missing_key", "error"]
 Tone = Literal["good", "warn", "crit", "neutral"]
+Area = Literal["US", "KR", "EA", "JP", "CN", "GL"]
+
+AREA_LABEL: dict[Area, str] = {
+    "US": "미국",
+    "KR": "한국",
+    "EA": "유로존",
+    "JP": "일본",
+    "CN": "중국",
+    "GL": "글로벌",
+}
 
 
 class Frozen(BaseModel):
@@ -27,6 +49,7 @@ class IndicatorRow(Frozen):
     label: str
     code: str
     source: SourceId
+    area: Area
     copyright: str | None = None
     freq: Freq
     fmt: Fmt
@@ -40,7 +63,7 @@ class IndicatorRow(Frozen):
 
 class Panel(Frozen):
     id: str
-    key: str
+    page: str
     title: str
     note: str
     rows: tuple[IndicatorRow, ...]
@@ -56,9 +79,10 @@ class SourceSummary(Frozen):
 
 
 class RegimeCell(Frozen):
+    source: str
     label: str
+    measure: str
     value: str
-    unit: str
     tone: Tone
     tag: str
     rule: str
@@ -71,6 +95,8 @@ class CurveLine(Frozen):
 
 
 class Curve(Frozen):
+    area: Area
+    label: str
     tenors: tuple[str, ...]
     lines: tuple[CurveLine, ...]
 
@@ -84,6 +110,15 @@ class CalendarEntry(Frozen):
     date: str
     name: str
     source: str
+
+
+class PolicyChange(Frozen):
+    area: Area
+    bank: str
+    date: str
+    rate: float
+    prev: float
+    count_12m: int
 
 
 class ProjectionCell(Frozen):
@@ -109,28 +144,18 @@ class Projections(Frozen):
     message: str | None = None
 
 
-class ViewOption(Frozen):
-    id: str
-    key: str
-    title: str
-    core: int
-    extra: int
-
-
 class Dashboard(Frozen):
-    version: str
     generated_at: str
     elapsed_seconds: float
     demo: bool
     sources: tuple[SourceSummary, ...]
-    tape: tuple[str, ...]
     regime: tuple[RegimeCell, ...]
-    curve: Curve | None
+    curves: tuple[Curve, ...]
     spread: Spread | None
     projections: Projections | None
     panels: tuple[Panel, ...]
     calendar: tuple[CalendarEntry, ...]
-    deep: tuple[str, ...]
-    views: tuple[ViewOption, ...]
-    settings_file: str | None = None
-    settings_error: str | None = None
+    policy_changes: tuple[PolicyChange, ...]
+    fomc_dates: tuple[str, ...]
+    calendar_message: str | None = None
+    fomc_message: str | None = None

@@ -1,4 +1,4 @@
-"""The three API-key AI providers and the demo one."""
+"""AI 분석 공급자(Claude·OpenAI·Gemini·데모) 레지스트리."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ DEFAULT_PROVIDER: Final = "claude_api"
 
 
 def registry(env: Mapping[str, str], *, demo: bool) -> dict[str, Provider]:
-    """Providers in display order. ``--demo`` gets only the scripted one."""
     if demo:
         return {"demo": DemoProvider()}
     providers: tuple[Provider, ...] = (

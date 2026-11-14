@@ -1,17 +1,6 @@
-"""The demo's portfolio: ``portfolio``'s price readers and calculations, canned.
-
-Each function here has the name and result type of the ``portfolio`` one
-the page calls, so the page swaps the module (``calc`` in the app). None of
-them reads a price or computes: the prices have columns and no rows, and
-every result is built at ``VALUE`` (``SHARE`` for shares and returns,
-``COUNT`` for counts), sized only by the names and days it is asked about.
-The bookkeeping on these results (totals, weights, tables) stays the
-page's, which prints each number as ``VALUE`` (``portfolio.demo_value``).
-"""
-
-# pandas ships no complete type stubs.
 # pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false
 # pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
+"""오프라인·데모 모드용 포트폴리오 평가·수익률·시뮬레이션·13F 투자자 합성 계산기."""
 
 from __future__ import annotations
 
@@ -21,17 +10,20 @@ from typing import TYPE_CHECKING, Final, cast
 import numpy as np
 import pandas as pd
 
-from finagent import generative, perf, portfolio, quant
+from finagent import etf, fund_filings, investors, perf, portfolio, quant
 from finagent.demo import COUNT, SHARE, VALUE
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
     from numpy.typing import NDArray
 
-YEARS: Final = 3  # of days every series runs over, for the longest window
-METHODS: Final = ("역사적", "FHS", "EVT")
+YEARS: Final = 3
+FUND: Final = "DEMOB"
+SOURCE: Final = "데모"
+INVESTOR: Final = investors.Investor("0000000999", "데모 투자자")
+REPORTED: Final = (("DEMOA", "DEMOB", "DEMOC"), ("DEMOB", "DEMOC", "DEMOD"))
 
 
 def _today() -> date:
@@ -60,17 +52,53 @@ def _line(days: pd.Index | None = None) -> pd.Series:
     return pd.Series(VALUE, index=_days() if days is None else days, dtype="float64")
 
 
-# ---------------------------------------------------------------- prices
-
-
-def load_prices(root: Path) -> portfolio.Prices:
-    """Columns for every ticker the book needs, and no rows."""
+def load_prices(root: Path, _tickers: object) -> portfolio.Prices:
     names = portfolio.wanted(portfolio.load_book(root))
     empty = pd.DataFrame(columns=names, index=pd.DatetimeIndex([]), dtype="float64")
     return portfolio.Prices(empty, empty.copy())
 
 
-def prices_saved_at(*_: object) -> datetime:
+def _cell(value: object) -> etf.Cell:
+    day = _today().isoformat()
+    return etf.Cell(value, SOURCE, day)
+
+
+def load_funds(*_: object) -> dict[str, dict[str, etf.Cell]]:
+    return {FUND: {"kind": _cell("ETF"), "aum": _cell(VALUE)}}
+
+
+def _row(ticker: str, weight: float, asset: fund_filings.Asset) -> fund_filings.Row:
+    return fund_filings.Row(ticker, None, None, ticker, weight, asset, "US", None)
+
+
+def compositions(names: Sequence[str]) -> dict[str, etf.Composition]:
+    if FUND not in names:
+        return {}
+    rows = (
+        _row("DEMOA", 30.0, "stock"),
+        _row("DEMOC", 25.0, "stock"),
+        _row("DEMOD", 20.0, "stock"),
+        _row("DEMOT", 25.0, "bond"),
+    )
+    return {
+        FUND: etf.Composition(
+            FUND, _today().isoformat(), SOURCE, None, full=True, rows=rows
+        )
+    }
+
+
+def look_sectors(*_: object) -> dict[str, str | None]:
+    return {"DEMOA": "기술", "DEMOC": "헬스케어", "DEMOD": "금융"}
+
+
+def look_returns(
+    adjusted: pd.DataFrame, names: Sequence[str], days: pd.DatetimeIndex
+) -> pd.DataFrame:
+    del adjusted
+    return _flat(names, days)
+
+
+def prices_saved_at(_tickers: object) -> datetime:
     return datetime.now().astimezone()
 
 
@@ -83,26 +111,12 @@ def close_on(close: pd.DataFrame, ticker: str, day: date) -> tuple[float, date]:
     return VALUE, day
 
 
-def convert(*_: object) -> float:
-    return VALUE
-
-
-def long_fx(*_: object) -> pd.Series:
-    return pd.Series(dtype="float64", index=pd.DatetimeIndex([]))
-
-
-def asset_returns(
-    adjusted: pd.DataFrame, names: Sequence[str], base: portfolio.Currency
-) -> pd.DataFrame:
-    del adjusted, base
+def asset_returns(adjusted: pd.DataFrame, names: Sequence[str]) -> pd.DataFrame:
+    del adjusted
     return _flat(names)
 
 
-# ---------------------------------------------------------------- holdings
-
-
 def _positions(p: portfolio.Portfolio) -> dict[str, portfolio.Position]:
-    """Each ticker traded, open unless its last trade sold."""
     trades = portfolio.ordered(p.trades)
     out: dict[str, portfolio.Position] = {}
     for t in trades:
@@ -112,11 +126,9 @@ def _positions(p: portfolio.Portfolio) -> dict[str, portfolio.Position]:
             t.ticker,
             quantity=0.0 if mine[-1].side == "sell" else VALUE,
             cost=VALUE,
-            cost_base=VALUE,
             realized=VALUE,
-            realized_base=VALUE,
-            sold_base=VALUE,
-            bought_base=VALUE,
+            sold=VALUE,
+            bought=VALUE,
             first=mine[0].day,
             opened=mine[0].day,
             last_sell=sells[-1] if sells else None,
@@ -124,10 +136,9 @@ def _positions(p: portfolio.Portfolio) -> dict[str, portfolio.Position]:
     return out
 
 
-def ledger(p: portfolio.Portfolio, *_: object) -> portfolio.Ledger:
-    """The positions and every sell, each held ``COUNT`` days."""
+def ledger(p: portfolio.Portfolio) -> portfolio.Ledger:
     sales = tuple(
-        portfolio.Sale(t, t.day - timedelta(days=COUNT), VALUE, VALUE, VALUE, VALUE)
+        portfolio.Sale(t, t.day - timedelta(days=COUNT), VALUE, VALUE)
         for t in portfolio.ordered(p.trades)
         if t.side == "sell"
     )
@@ -166,51 +177,33 @@ def gap(*_: object) -> perf.Gap:
 
 
 def benchmark_lines(
-    p: portfolio.Portfolio, close: pd.DataFrame, days: pd.DatetimeIndex
+    close: pd.DataFrame, days: pd.DatetimeIndex
 ) -> dict[str, pd.Series]:
-    del p, close
-    names = ("혼합 벤치마크", portfolio.BENCHMARK_LABEL, "KOSPI")
-    return {name: _line(days) for name in names}
-
-
-def blended(
-    p: portfolio.Portfolio, frame: pd.DataFrame, days: pd.DatetimeIndex
-) -> pd.Series:
-    del p, frame
-    return _line(days)
+    del close
+    return {portfolio.BENCHMARK_LABEL: _line(days)}
 
 
 def market_returns(
     adjusted: pd.DataFrame,
-    base: portfolio.Currency,
     days: pd.DatetimeIndex,
     index: str = portfolio.TOTAL_RETURN,
 ) -> pd.Series:
-    del adjusted, base, index
+    del adjusted, index
     return _line(days)
-
-
-def currency_split(*_: object) -> perf.FxSplit:
-    return perf.FxSplit(SHARE, SHARE, SHARE, SHARE)
 
 
 def trading(*_: object) -> portfolio.Trading:
     return portfolio.Trading(VALUE, VALUE, perf.Gap(SHARE, annualised=True))
 
 
-# ---------------------------------------------------------------- statistics
-
-
-def risk_free(
-    rates: pd.Series, index: pd.DatetimeIndex, quote: perf.Quote
-) -> pd.Series:
-    del rates, quote
+def risk_free(rates: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
+    del rates
     return _line(index)
 
 
 def ratios(*_: object) -> portfolio.Ratios:
     under = perf.Underwater(
-        max_drawdown=-SHARE,  # below 0, so the page shows its dates
+        max_drawdown=-SHARE,
         peak=_stamp(3 * COUNT // 2),
         trough=_stamp(COUNT),
         recovery=_stamp(COUNT // 2),
@@ -224,14 +217,9 @@ def ratios(*_: object) -> portfolio.Ratios:
         volatility=SHARE,
         under=under,
         sharpe=VALUE,
-        ci=perf.SharpeCI(VALUE, VALUE, VALUE, VALUE, COUNT),
-        psr=SHARE,
-        min_trl=VALUE,
+        ci=perf.SharpeCI(VALUE, VALUE, VALUE, COUNT),
         sortino=VALUE,
         calmar=VALUE,
-        ulcer=VALUE,
-        upi=VALUE,
-        omega=VALUE,
         cdar=SHARE,
         te=SHARE,
         ir=VALUE,
@@ -242,36 +230,29 @@ def market_beta(*_: object) -> float:
     return VALUE
 
 
-def lineup(book: portfolio.Book, *_: object) -> tuple[pd.DataFrame, list[bool]]:
+def lineup(book: portfolio.Book, *_: object) -> pd.DataFrame:
     names = [p.name for p in book.portfolios if p.trades]
-    frame = _flat([*names, portfolio.BENCHMARK_LABEL])
-    return frame, [False] * len(frame.columns)
+    return _flat([*names, portfolio.BENCHMARK_LABEL])
 
 
-def lagged_correlation(
-    frame: pd.DataFrame, korean_: Sequence[bool]
-) -> portfolio.Correlation:
-    del korean_
+def shrunk_correlation(frame: pd.DataFrame) -> pd.DataFrame:
     names = [str(c) for c in frame.columns]
-    matrix = pd.DataFrame(VALUE, index=names, columns=names)
-    return portfolio.Correlation(matrix, VALUE, SHARE, COUNT)
+    return pd.DataFrame(VALUE, index=names, columns=names)
 
 
-def joint(
-    adjusted: pd.DataFrame, w: pd.Series, base: portfolio.Currency, months: int
-) -> portfolio.Joint:
-    del adjusted, base, months
+def joint(adjusted: pd.DataFrame, w: pd.Series, months: int) -> portfolio.Joint:
+    del adjusted, months
     names = tuple(portfolio.labels(w))
     window = _flat(names)
-    market = _flat([portfolio.BENCHMARK, portfolio.KOSPI])
+    market = _flat([portfolio.BENCHMARK])
     return portfolio.Joint(
         names, w.to_numpy(dtype="float64"), window, window, market, ""
     )
 
 
-def covariance(j: portfolio.Joint) -> tuple[NDArray[np.float64], float, float]:
+def covariance(j: portfolio.Joint) -> NDArray[np.float64]:
     n = len(j.names)
-    return np.full((n, n), VALUE), VALUE, SHARE
+    return np.full((n, n), VALUE)
 
 
 def correlation_frame(cov: NDArray[np.float64], names: Sequence[str]) -> pd.DataFrame:
@@ -281,19 +262,17 @@ def correlation_frame(cov: NDArray[np.float64], names: Sequence[str]) -> pd.Data
 
 def betas(j: portfolio.Joint) -> list[portfolio.Beta]:
     names = (*j.names, portfolio.PORTFOLIO_LABEL)
-    return [portfolio.Beta(name, VALUE, VALUE, VALUE, COUNT) for name in names]
+    return [portfolio.Beta(name, VALUE) for name in names]
 
 
 def diversification(j: portfolio.Joint, cov: NDArray[np.float64]) -> portfolio.Spread:
     del cov
-    return portfolio.Spread(np.full(len(j.names), SHARE), VALUE, VALUE)
+    return portfolio.Spread(np.full(len(j.names), SHARE), VALUE)
 
 
 def style(*_: object) -> portfolio.Style:
     names = (*portfolio.STYLE_PROXIES, portfolio.CASH)
-    return portfolio.Style(
-        names, np.full(len(names), SHARE), SHARE, COUNT, (), SHARE, COUNT
-    )
+    return portfolio.Style(names, np.full(len(names), SHARE), SHARE, (), SHARE)
 
 
 def covered(rets: pd.DataFrame, w: pd.Series) -> tuple[pd.Series, list[str]]:
@@ -304,34 +283,14 @@ def covered(rets: pd.DataFrame, w: pd.Series) -> tuple[pd.Series, list[str]]:
 def added(*_: object) -> portfolio.Added:
     pair = (VALUE, VALUE)
     shares = (SHARE, SHARE)
-    return portfolio.Added(shares, pair, pair, VALUE, VALUE, shares, SHARE)
+    return portfolio.Added(shares, pair, pair, shares, SHARE)
 
 
-# ---------------------------------------------------------------- risk
-
-
-def volatility(j: portfolio.Joint, *_: object) -> quant.Devolatilised:
-    """A GJR-GARCH filter at a flat volatility; the demo never fits one."""
-    days, assets = min(len(j.full), quant.FILTER_DAYS), len(j.names)
-    return quant.Devolatilised(
-        z=np.zeros((days, assets)),
-        sigma=np.full((days, assets), SHARE),
-        now=np.full(assets, SHARE),
-        step=np.zeros((4, assets)),
-        garch=np.ones(assets, dtype=np.bool_),
-    )
-
-
-def vix_regressor(*_: object) -> None:
-    return None
-
-
-def range_proxy(*_: object) -> None:
-    return None
-
-
-def standing(*_: object) -> tuple[float, float]:
-    return VALUE, VALUE
+def added_curve(
+    j: portfolio.Joint, cov: object, ticker: str, fractions: Sequence[float]
+) -> list[portfolio.Mixed]:
+    del j, cov, ticker
+    return [portfolio.Mixed(SHARE, VALUE, VALUE, SHARE)] * len(fractions)
 
 
 def mean_block(*_: object) -> float:
@@ -343,30 +302,23 @@ def per_year(*_: object) -> float:
 
 
 def growth(
-    j: portfolio.Joint, picks: NDArray[np.int64], *_: object, demean: bool = True
+    j: portfolio.Joint,
+    picks: NDArray[np.int64],
+    *_: object,
+    demean: bool = True,
 ) -> NDArray[np.float64]:
     del j, demean
     return np.full((1, picks.shape[1] + 1), VALUE)
 
 
-def normal_paths(mean: float, var: float, days: int) -> NDArray[np.float64]:
-    del mean, var
-    return np.full((1, days + 1), VALUE)
-
-
 def simulation(paths: NDArray[np.float64], *_: object) -> portfolio.Simulation:
-    return simulated(cast("int", paths.shape[1]) - 1)
-
-
-def simulated(days: int) -> portfolio.Simulation:
-    """A fan, histogram, tails and path shares at ``VALUE`` over ``days``."""
     fan = [
         {"day": float(day), **{f"p{q}": VALUE for q in portfolio.PERCENTILES}}
-        for day in range(days + 1)
+        for day in range(cast("int", paths.shape[1]))
     ]
     ends = [{"start": VALUE, "end": VALUE, "count": COUNT}] * portfolio.BINS
     levels = dict.fromkeys(perf.PATH_LEVELS, perf.Reach(SHARE, SHARE, SHARE))
-    paths = perf.PathRisk(levels, levels, COUNT, COUNT, COUNT, SHARE)
+    risk = perf.PathRisk(levels, levels)
     tails = dict.fromkeys(portfolio.END_LEVELS, (SHARE, SHARE))
     reach = [
         {
@@ -379,166 +331,109 @@ def simulated(days: int) -> portfolio.Simulation:
         for side in (-1.0, 1.0)
         for level in (0.0, *perf.PATH_LEVELS)
     ]
-    return portfolio.Simulation(paths, fan, ends, np.ones(COUNT), tails, reach)
+    return portfolio.Simulation(risk, fan, ends, tails, reach)
 
 
 def tails(j: portfolio.Joint, *_: object) -> portfolio.Tails:
-    """VaR and ES rows, backtests and the ES split by holding."""
-    rows = tuple(
-        portfolio.Tail(method, level, SHARE, SHARE, (SHARE, SHARE), (SHARE, SHARE))
-        for method in METHODS
-        for level in portfolio.VAR_LEVELS
-    )
     test = quant.Backtest(
         COUNT, COUNT, VALUE, VALUE, VALUE, "green", VALUE, VALUE, VALUE, VALUE
     )
-    return portfolio.Tails(
-        rows,
-        dict.fromkeys(METHODS, test),
-        quant.BACKTEST_DAYS,
-        len(j.window),
-        len(j.window),
-    )
+    return portfolio.Tails(test, len(j.window))
 
 
-def density(*_: object, drift: object = None, days: int = 0) -> portfolio.Density:
-    del drift, days
+def density(*_: object, days: int = 0) -> portfolio.Density:
+    del days
     return portfolio.Density(quant.Berkowitz(VALUE, VALUE, VALUE, VALUE, VALUE), COUNT)
 
 
-def normal_density(*_: object) -> portfolio.Density:
-    return density()
-
-
-def normal_tails(j: portfolio.Joint, *_: object) -> portfolio.Tails:
-    t = tails(j)
-    test = t.backtests[METHODS[0]]
-    return portfolio.Tails((), {portfolio.NORMAL_METHOD: test}, None, t.days, t.history)
-
-
-def generator(
-    method: generative.Method, tickers: tuple[str, ...]
-) -> generative.Generator:
-    """A generator to choose, without weights: the demo never draws from it."""
-    meta = {"train_start": _ago(COUNT).isoformat(), "train_end": _today().isoformat()}
-    return generative.Generator(method, tickers, None, meta, {})
-
-
-# ---------------------------------------------------------------- stress
-
-
-def scenario_replays(*_: object) -> list[portfolio.Replayed]:
-    return [
-        portfolio.Replayed(
-            s,
-            (s.start, s.end),
-            SHARE,
-            SHARE,
-            SHARE,
-            VALUE,
-            SHARE,
-            SHARE,
-            (),
-            no_fx=False,
-        )
-        for s in portfolio.SCENARIOS
-    ]
-
-
-def bad_print_days(*_: object) -> dict[str, list[date]]:
-    return {}
-
-
-def local_betas(
-    adjusted: pd.DataFrame, names: Sequence[str], months: int
-) -> NDArray[np.float64]:
-    del adjusted, months
-    return np.full(len(names), VALUE)
-
-
-def shocked(*_: object) -> list[tuple[portfolio.Shock, float]]:
-    return [(shock, SHARE) for shock in portfolio.SHOCKS]
-
-
-def reverse(*_: object) -> float:
-    return SHARE
-
-
-def turbulence(*_: object) -> portfolio.Turbulence:
-    return portfolio.Turbulence(_today(), COUNT, VALUE, SHARE, VALUE, SHARE)
-
-
-def trailing_means(
-    j: portfolio.Joint,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    shape = (len(j.full) + 1, len(j.names))
-    return np.zeros(shape), np.ones(shape)
-
-
-def james_stein(j: portfolio.Joint) -> NDArray[np.float64] | None:
-    if len(j.names) < 3:  # noqa: PLR2004
-        return None
-    return np.zeros((len(j.full) + 1, len(j.names)))
-
-
-def bayes_stein(
-    j: portfolio.Joint,
-) -> tuple[NDArray[np.float64], float, NDArray[np.float64]] | None:
-    if len(j.names) < 3:  # noqa: PLR2004
-        return None
-    return np.zeros((len(j.full) + 1, len(j.names))), 0.0, trailing_variance(j)
-
-
-def trailing_variance(j: portfolio.Joint) -> NDArray[np.float64]:
-    return np.full(len(j.full) + 1, SHARE**2)
-
-
-def tradeoff(*_: object) -> portfolio.Tradeoff:
-    return portfolio.Tradeoff(SHARE, SHARE, SHARE, SHARE, SHARE, SHARE, SHARE, SHARE)
-
-
-def momentum_returns(
-    j: portfolio.Joint, rf: pd.Series, lag_months: int
-) -> tuple[NDArray[np.float64], float, int, NDArray[np.float64]]:
-    del rf, lag_months
-    return np.zeros((len(j.full) + 1, len(j.names))), 0.0, COUNT, trailing_variance(j)
-
-
 def load_facts(*_: object) -> dict[str, portfolio.Facts]:
-    """Every demo ticker's figures at ``VALUE``, as if fetched today."""
-    names = ("DEMOA", "DEMOB", "DEMOC", "DEMOK.KS")
+    names = ("DEMOA", "DEMOB", "DEMOC")
     return {
-        name: portfolio.Facts(
-            day=_today(),
-            currency="KRW" if portfolio.korean(name) else "USD",
-            market_cap=VALUE,
-        )
+        name: portfolio.Facts(day=_today(), currency="USD", market_cap=VALUE)
         for name in names
     }
 
 
 def market_weights(
-    _: object, names: Sequence[str], close: object
-) -> NDArray[np.float64]:
-    del close
-    return np.full(len(names), 1.0 / len(names))
+    _: object, names: Sequence[str]
+) -> tuple[NDArray[np.float64], list[str]]:
+    return np.full(len(names), 1.0 / len(names)), []
 
 
-def load_factors(*_: object) -> pd.DataFrame:
-    """One month of zero factors, so the factor model is offered."""
-    columns = [*portfolio.FACTORS, "RF"]
-    return pd.DataFrame([[0.0] * len(columns)], index=_days()[-1:], columns=columns)
+def investor() -> tuple[
+    investors.Filer,
+    list[investors.Quarter],
+    dict[str, investors.Link],
+    dict[str, investors.Sector],
+]:
+    today = _today()
+    last = investors.expected_period(today)
+    tables = [
+        investors.Table(
+            accession=f"{INVESTOR.cik}-{n}",
+            form="13F-HR",
+            filed=period + timedelta(days=investors.DEADLINE_DAYS),
+            period=period,
+            rows=tuple(
+                investors.Row(cusip=name, name=name, shares=VALUE, value=VALUE)
+                for name in names
+            ),
+        )
+        for n, (period, names) in enumerate(
+            zip((last, investors.expected_period(last)), REPORTED, strict=True)
+        )
+    ]
+    filer = investors.Filer(
+        cik=INVESTOR.cik,
+        name=INVESTOR.name,
+        fetched=datetime.now().astimezone(),
+        filings=tuple(
+            investors.Filing(
+                accession=t.accession, form=t.form, filed=t.filed, period=t.period
+            )
+            for t in tables
+        ),
+    )
+    names = sorted({name for group in REPORTED for name in group})
+    return (
+        filer,
+        investors.quarters(tables),
+        {name: investors.Link(ticker=name) for name in names},
+        {
+            name: investors.Sector(sector=sector)
+            for name, sector in look_sectors().items()
+        },
+    )
 
 
-def factor_returns(
-    _: object, names: Sequence[str], w: object, factors: object
-) -> tuple[NDArray[np.float64], float, float]:
-    del w, factors
-    return np.zeros(len(names)), 0.0, 0.0
+def clone(
+    prices: pd.DataFrame, schedule: Sequence[tuple[date, pd.Series]]
+) -> portfolio.Clone:
+    del prices
+    steps = tuple(portfolio.Step(day, len(w), SHARE) for day, w in schedule)
+    w = schedule[-1][1]
+    return portfolio.Clone(_line(), steps, w / float(w.sum()))
+
+
+def rebalanced(*_: object) -> pd.Series:
+    return _line()
+
+
+def cumulative(daily_rets: pd.Series) -> pd.Series:
+    return daily_rets
+
+
+def compounded(*_: object) -> float:
+    return SHARE
+
+
+def peers(series: Mapping[str, pd.Series], *_: object) -> portfolio.Peers:
+    rows = tuple(portfolio.Peer(name, COUNT, SHARE, VALUE, VALUE) for name in series)
+    return portfolio.Peers(rows, len(rows), SHARE)
 
 
 def black_litterman(
     j: portfolio.Joint, *_: object
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     k = len(j.names)
-    return np.zeros(k), np.zeros((k, k))
+    return np.zeros(k), np.zeros(k)

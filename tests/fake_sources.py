@@ -1,37 +1,28 @@
-"""Synthetic responses in each source's real wire format.
-
-Used by the tests only: values are made up and plausible, not real
-observations, so the app (``--demo`` included) never imports them.
-Yahoo is read through yfinance, not HTTP, so ``demo_closes`` stands in for
-``sources.YahooCloses`` instead.
-"""
-
 from __future__ import annotations
 
 import json
 import random
+import threading
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
-from itertools import pairwise
+from itertools import pairwise, product
 from typing import TYPE_CHECKING, Final
 from urllib.parse import unquote
 
 import httpx
 
-from finagent.fetch import SourceError
 from finagent.sources import ecos_period, parse_period
+from tests import fake_calendar
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from finagent.fetch import Closes
     from finagent.models import Freq
-    from finagent.sources import Series
 
 DEMO_KEYS: Final = {"FRED_API_KEY": "demo", "ECOS_API_KEY": "demo"}
 
-type Anchors = tuple[tuple[float, float], ...]  # (years ago, value), oldest first
+type Anchors = tuple[tuple[float, float], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,31 +43,42 @@ def _step(freq: Freq, *anchors: tuple[float, float]) -> Walk:
 
 
 FRED: Final[dict[str, Walk]] = {
-    "A191RL1Q225SBEA": _w(
-        "Q", (4, 2.2), (3, 3.0), (2, 1.6), (1, 2.4), (0, 2.1), vol=0.6
-    ),
-    "INDPRO": _w("M", (4, 102.0), (0, 104.0), vol=0.3),
-    "RSAFS": _w("M", (4, 680000), (0, 745000), vol=2500),
-    "PCEC96": _w("M", (4, 15500), (0, 16600), vol=25),
-    "HOUST": _w("M", (4, 1450), (2, 1350), (0, 1320), vol=40),
-    "CFNAIMA3": _w("M", (4, 0.1), (2, -0.1), (0, -0.1), vol=0.08),
-    "PAYEMS": _w("M", (4, 152000), (0, 160000), vol=40),
-    "UNRATE": _w("M", (4, 3.6), (2, 4.0), (0, 4.3), vol=0.05),
-    "SAHMREALTIME": _w("M", (4, 0.1), (2, 0.4), (1, 0.2), (0, 0.27), vol=0.02),
-    "ICSA": _w("W", (4, 210000), (0, 226000), vol=6000),
-    "CCSA": _w("W", (4, 1700000), (0, 1930000), vol=15000),
-    "JTSJOL": _w("M", (4, 9500), (2, 7600), (0, 7100), vol=100),
-    "CES0500000003": _w("M", (4, 33.0), (0, 37.6), vol=0.03),
+    "A191RO1Q156NBEA": _w("Q", (4, 1.9), (2, 2.9), (1, 2.0), (0, 2.1), vol=0.2),
+    "GDPNOW": _w("Q", (4, 2.0), (2, 2.8), (1, 1.5), (0, 2.4), vol=0.5),
     "CPIAUCSL": _w("M", (4, 290), (0, 327), vol=0.15),
     "CPILFESL": _w("M", (4, 295), (0, 333), vol=0.1),
+    "PCEPI": _w("M", (4, 117), (0, 128), vol=0.05),
     "PCEPILFE": _w("M", (4, 118), (0, 129), vol=0.05),
     "PPIFIS": _w("M", (4, 140), (0, 152), vol=0.2),
     "T5YIE": _w("D", (4, 2.5), (0, 2.3), vol=0.03),
-    "T5YIFR": _w("D", (4, 2.3), (0, 2.25), vol=0.03),
-    "DFEDTARU": _step(
-        "D", (4, 5.5), (2.0, 5.0), (1.8, 4.5), (0.9, 4.25), (0.35, 4.0), (0.08, 3.75)
+    "UNRATE": _w("M", (4, 3.6), (2, 4.0), (0, 4.3), vol=0.05),
+    "SAHMREALTIME": _w("M", (4, 0.1), (2, 0.4), (1, 0.2), (0, 0.27), vol=0.02),
+    "PAYEMS": _w("M", (4, 152000), (0, 160000), vol=40),
+    "ICSA": _w("W", (4, 210000), (0, 226000), vol=6000),
+    "JTSJOL": _w("M", (4, 9500), (2, 7600), (0, 7100), vol=100),
+    "RRSFS": _w("M", (4, 215000), (0, 221500), vol=600),
+    "INDPRO": _w("M", (4, 102.0), (0, 104.0), vol=0.3),
+    "PCEC96": _w("M", (4, 15500), (0, 16600), vol=25),
+    "PNFIC1": _w("Q", (4, 3300), (0, 3600), vol=10),
+    "WM2NS": _w("W", (4, 20800), (0, 22600), vol=20),
+    "LCEAMN01JPM659S": _w("M", (4, 1.5), (2, 3.0), (0, 2.6), vol=0.3),
+    "TOTLL": _w("W", (4, 11900), (0, 12800), vol=15),
+    "A191RL1Q225SBEA": _w(
+        "Q", (4, 2.2), (3, 3.0), (2, 1.6), (1, 2.4), (0, 2.1), vol=0.6
     ),
-    "T10Y3M": _w("D", (4, -1.2), (2, -1.3), (1, 0.1), (0, 0.27), vol=0.04),
+    "CES0500000003": _w("M", (4, 31.0), (0, 36.5), vol=0.03),
+    "GACDFSA066MSFRBPHI": _w("M", (4, -10), (2, 5), (1, -8), (0, 3.5), vol=4),
+    "GACDISA066MSFRBNY": _w("M", (4, -5), (2, 8), (1, -12), (0, 2.0), vol=4),
+    "BOPGSTB": _w("M", (4, -70000), (1, -90000), (0, -65000), vol=3000),
+    "RSAFS": _w("M", (4, 680000), (0, 725000), vol=2000),
+    "TCU": _w("M", (4, 79.5), (0, 77.6), vol=0.2),
+    "NEWORDER": _w("M", (4, 72000), (0, 76000), vol=400),
+    "HOUST": _w("M", (4, 1550), (2, 1350), (0, 1320), vol=40),
+    "TDSP": _w("Q", (4, 9.5), (0, 11.3), vol=0.05),
+    "DRCCLACBS": _w("Q", (4, 1.7), (0, 3.1), vol=0.05),
+    "DRBLACBS": _w("Q", (4, 1.0), (0, 1.3), vol=0.03),
+    "DFII10": _w("D", (4, 1.5), (2, 2.2), (0, 1.8), vol=0.03),
+    "BOPGEXP": _w("M", (4, 165000), (0, 180000), vol=2500),
     "T10Y2Y": _w(
         "D",
         (10.8, 1.25),
@@ -94,88 +96,33 @@ FRED: Final[dict[str, Walk]] = {
         (0, 0.57),
         vol=0.04,
     ),
-    "DFII10": _w("D", (4, 1.0), (2, 2.2), (1, 2.0), (0, 1.8), vol=0.03),
-    "MORTGAGE30US": _w("W", (4, 6.5), (2, 7.0), (1, 6.8), (0, 6.18), vol=0.05),
-    "NFCI": _w("W", (4, -0.3), (2, -0.5), (0, -0.52), vol=0.02),
-    "BAMLH0A0HYM2": _w("D", (3, 4.5), (1.5, 3.2), (0.5, 3.6), (0, 3.05), vol=0.05),
-    "BAA10Y": _w("D", (4, 2.0), (0, 1.62), vol=0.03),
     "VIXCLS": _w("D", (4, 20), (1.5, 15), (0.5, 24), (0, 16.8), vol=1.5),
-    "DTWEXBGS": _w("D", (4, 121), (1.7, 128), (0.8, 121), (0, 120.4), vol=0.4),
+    "NFCI": _w("W", (4, -0.3), (2, -0.5), (0, -0.52), vol=0.02),
+    "SP500": _w("D", (4, 4300), (2, 5200), (1, 5900), (0, 6650), vol=40),
+    "NIKKEI225": _w("D", (4, 27500), (2, 38500), (1, 39000), (0, 48500), vol=350),
     "WALCL": _w("W", (4, 8300000), (0, 6550000), vol=5000),
-    "WRESBAL": _w("W", (4, 3300), (0, 3180), vol=40),
-    "RRPONTSYD": Walk("D", ((4, 2200), (2, 500), (1, 100), (0, 28)), 10, floor=0),
-    "WTREGEN": _w("W", (4, 700), (0, 820), vol=40),
-    "M2SL": _w("M", (4, 20800), (0, 22600), vol=20),
-    "MTSDS133FMS": _w("M", (4, -140000), (0, -150000), vol=90000),
+    "BAMLH0A0HYM2": _w("D", (3, 4.5), (1.5, 3.2), (0.5, 3.6), (0, 3.05), vol=0.05),
+    "BAMLHE00EHYIOAS": _w("D", (3, 5.0), (1.5, 3.8), (0.5, 3.4), (0, 3.0), vol=0.05),
+    "DRTSCILM": _w("Q", (4, 40), (2, 8), (1, -2), (0, 5), vol=3),
+    "DTWEXBGS": _w("D", (4, 121), (1.7, 128), (0.8, 121), (0, 120.4), vol=0.4),
+    "DEXJPUS": _w("D", (4, 145), (2, 155), (1, 150), (0, 152), vol=0.8),
+    "DEXCHUS": _w("D", (4, 7.2), (1.5, 7.28), (0, 7.12), vol=0.01),
     "DCOILWTICO": _w("D", (4, 80), (1, 70), (0, 64.2), vol=1.2),
-    "DCOILBRENTEU": _w("D", (4, 85), (1, 74), (0, 67.9), vol=1.2),
+    "DCOILBRENTEU": _w("D", (4, 84), (1, 74), (0, 67.5), vol=1.2),
     "DHHNGSP": _w("D", (4, 2.5), (1, 3.2), (0, 3.0), vol=0.15),
     "PCOPPUSDM": _w("M", (4, 8500), (0, 9840), vol=150),
-    "A191RO1Q156NBEA": _w("Q", (4, 1.9), (2, 2.9), (1, 2.0), (0, 2.1), vol=0.2),
-    "DFEDTARL": _step(
-        "D", (4, 5.25), (2.0, 4.75), (1.8, 4.25), (0.9, 4.0), (0.35, 3.75), (0.08, 3.5)
-    ),
-    "GDPNOW": _w("Q", (4, 2.0), (2, 2.8), (1, 1.5), (0, 2.4), vol=0.5),
-    "TCU": _w("M", (4, 79.8), (2, 78.5), (0, 77.6), vol=0.2),
-    "NEWORDER": _w("M", (4, 72000), (0, 74500), vol=500),
-    "DGORDER": _w("M", (4, 275000), (0, 300000), vol=6000),
-    "ISRATIO": _w("M", (4, 1.33), (2, 1.38), (0, 1.37), vol=0.005),
-    "TOTALSA": _w("M", (4, 14.8), (2, 15.6), (0, 16.1), vol=0.3),
-    "GACDFSA066MSFRBPHI": _w("M", (4, -8), (2, -5), (1, 10), (0, 2), vol=6),
-    "GACDINA066MNFRBNY": _w("M", (4, -5), (2, -10), (1, 3), (0, -2), vol=6),
-    "W875RX1": _w("M", (4, 15600), (0, 16400), vol=15),
-    "PSAVERT": _w("M", (4, 4.0), (2, 4.8), (0, 4.5), vol=0.2),
     "UMCSENT": _w("M", (4, 62), (2, 72), (1, 55), (0, 58), vol=2),
-    "TOTALSL": _w("M", (4, 4800000), (0, 5150000), vol=3000),
-    "DRCCLACBS": _w("Q", (4, 2.9), (2, 3.2), (0, 3.05), vol=0.03),
-    "U6RATE": _w("M", (4, 6.8), (2, 7.5), (0, 8.0), vol=0.08),
-    "CIVPART": _w("M", (4, 62.7), (2, 62.6), (0, 62.3), vol=0.05),
-    "LNS11300060": _w("M", (4, 83.2), (2, 83.6), (0, 83.4), vol=0.1),
-    "LNS12300060": _w("M", (4, 80.7), (2, 80.8), (0, 80.4), vol=0.1),
-    "JTSQUR": _w("M", (4, 2.3), (2, 2.1), (0, 2.0), vol=0.03),
-    "ECIALLCIV": _w("Q", (4, 158), (0, 178), vol=0.1),
-    "ULCNFB": _w("Q", (4, 118), (0, 126), vol=0.2),
-    "PCEPI": _w("M", (4, 121), (0, 131), vol=0.05),
-    "MEDCPIM158SFRBCLE": _w("M", (4, 5.5), (2, 3.6), (0, 3.2), vol=0.4),
-    "STICKCPIM159SFRBATL": _w("M", (4, 4.8), (2, 3.5), (0, 3.1), vol=0.05),
-    "PCETRIM12M159SFRBDAL": _w("M", (4, 4.1), (2, 2.8), (0, 2.6), vol=0.03),
-    "CUSR0000SAH1": _w("M", (4, 360), (0, 420), vol=0.2),
-    "CUSR0000SASLE": _w("M", (4, 400), (0, 455), vol=0.2),
-    "CUSR0000SACL1E": _w("M", (4, 161), (2, 160), (0, 163), vol=0.15),
-    "T10YIE": _w("D", (4, 2.35), (0, 2.3), vol=0.02),
-    "MICH": _w("M", (4, 4.0), (2, 3.0), (1, 4.6), (0, 4.0), vol=0.2),
-    "IORB": _step(
-        "D", (4, 5.4), (2.0, 4.9), (1.8, 4.4), (0.9, 4.15), (0.35, 3.9), (0.08, 3.65)
-    ),
-    "STLFSI4": _w("W", (4, 0.2), (2, -0.6), (0, -0.7), vol=0.1),
-    "BAMLC0A0CM": _w("D", (3, 1.3), (1.5, 0.9), (0.5, 1.0), (0, 0.82), vol=0.02),
-    "HQMCB10YR": _w("M", (4, 5.6), (2, 5.3), (0, 5.4), vol=0.08),
-    "DRTSCILM": _w("Q", (4, 40), (2, 8), (1, -2), (0, 5), vol=3),
-    "TOTBKCR": _w("W", (4, 17200), (0, 18300), vol=20),
-    "BUSLOANS": _w("M", (4, 2780), (0, 2860), vol=5),
-    "SP500": _w("D", (4, 4300), (2, 5200), (1, 5900), (0, 6650), vol=40),
-    "NASDAQCOM": _w("D", (4, 13200), (2, 16500), (1, 19300), (0, 22400), vol=150),
-    "NASDAQ100": _w("D", (4, 11500), (2, 17500), (1, 20500), (0, 24600), vol=170),
-    "DJIA": _w("D", (4, 33000), (2, 38500), (1, 42500), (0, 46500), vol=250),
-    "NIKKEI225": _w("D", (4, 27500), (2, 38500), (1, 39000), (0, 48500), vol=350),
-    "TREAST": _w("W", (4, 5300000), (0, 4200000), vol=3000),
-    "WSHOMCB": _w("W", (4, 2450000), (0, 2050000), vol=2000),
-    "GFDEGDQ188S": _w("Q", (4, 118), (0, 121), vol=0.5),
-    "PERMIT": _w("M", (4, 1500), (2, 1450), (0, 1330), vol=30),
-    "HSN1F": _w("M", (4, 680), (2, 690), (0, 670), vol=25),
-    "MSACSR": _w("M", (4, 7.8), (2, 8.6), (0, 9.2), vol=0.3),
-    "USSTHPI": _w("Q", (4, 640), (0, 720), vol=1),
-    "CSUSHPISA": _w("M", (4, 305), (0, 330), vol=0.3),
-    "DRSFRMACBS": _w("Q", (4, 1.7), (2, 1.8), (0, 1.85), vol=0.02),
-    "DEXCHUS": _w("D", (4, 7.2), (1.5, 7.28), (0, 7.12), vol=0.01),
-    "DTWEXEMEGS": _w("D", (4, 128), (1.5, 131), (0, 127), vol=0.3),
-    "PALUMUSDM": _w("M", (4, 2250), (0, 2600), vol=50),
-    "PIORECRUSDM": _w("M", (4, 120), (1, 100), (0, 104), vol=4),
-    "PWHEAMTUSDM": _w("M", (4, 330), (1, 240), (0, 230), vol=8),
-    "PALLFNFINDEXM": _w("M", (4, 175), (1, 165), (0, 168), vol=2),
+    "JPNGDPRQPSMEI": _w("Q", (4, 1.6), (2, 0.5), (0, 0.7), vol=0.3),
+    "JPNSLRTTO01GYSAM": _w("M", (4, 1.0), (0, 1.5), vol=1.0),
+    "JPNPRINTO01GYSAM": _w("M", (4, -2.0), (0, 2.2), vol=1.0),
+    "JPNRGDPPC": _w("Q", (4, 300000), (0, 310000), vol=800),
+    "NFIRSAXDCJPQ": _w("Q", (4, 38000000), (0, 39500000), vol=150000),
+    "XTEXVA01JPM667S": _w("M", (4, 60e9), (0, 69e9), vol=1.5e9),
+    "XTIMVA01JPM667S": _w("M", (4, 65e9), (0, 73e9), vol=1.5e9),
+    "XTEXVA01CNM667S": _w("M", (4, 300e9), (0, 430e9), vol=8e9),
+    "XTIMVA01CNM667S": _w("M", (4, 220e9), (0, 290e9), vol=6e9),
 }
 
-# Treasury curve: (tenor series, 1 year ago, 1 month ago, latest).
 _CURVE: Final = (
     ("DGS1MO", 4.20, 4.18, 3.92),
     ("DGS3MO", 4.02, 4.06, 3.85),
@@ -189,78 +136,115 @@ _CURVE: Final = (
     ("DGS20", 4.60, 4.66, 4.62),
     ("DGS30", 4.62, 4.71, 4.68),
 )
+
+
+def _curve_walk(year: float, month: float, now: float) -> Walk:
+    return _w("D", (4, year + 0.4), (1, year), (1 / 12, month), (0, now), vol=0.02)
+
+
 for _series_id, _year, _month, _now in _CURVE:
-    FRED[_series_id] = _w(
-        "D", (4, _year + 0.4), (1, _year), (1 / 12, _month), (0, _now), vol=0.02
-    )
-
-FISCAL: Final[dict[str, Walk]] = {
-    "debt_to_penny/tot_pub_debt_out_amt": _w(
-        "D", (4, 31.5e12), (0, 38.12e12), vol=2e10
-    ),
-    "debt_to_penny/debt_held_public_amt": _w("D", (4, 24.8e12), (0, 30.9e12), vol=2e10),
-    "avg_interest_rates/avg_interest_rate_amt": _w("M", (4, 2.2), (0, 3.39), vol=0.01),
-}
-
-NYFED: Final[dict[str, Walk]] = {
-    "effr": _step(
-        "D",
-        (4, 5.33),
-        (2.0, 4.83),
-        (1.8, 4.33),
-        (0.9, 4.08),
-        (0.35, 3.88),
-        (0.08, 3.63),
-    ),
-    "sofr": _w(
-        "D",
-        (4, 5.31),
-        (2.0, 4.85),
-        (1.8, 4.32),
-        (0.9, 4.1),
-        (0.35, 3.9),
-        (0, 3.61),
-        vol=0.02,
-    ),
-    "obfr": _w("D", (4, 5.31), (2.0, 4.82), (0.9, 4.07), (0, 3.62), vol=0.01),
-    "tgcr": _w("D", (4, 5.30), (2.0, 4.83), (0.9, 4.08), (0, 3.58), vol=0.02),
-}
+    FRED[_series_id] = _curve_walk(_year, _month, _now)
 
 ECOS: Final[dict[str, Walk]] = {
-    "722Y001/0101000": _step(
-        "D", (4, 3.5), (1.6, 3.25), (1.3, 3.0), (0.9, 2.75), (0.6, 2.5)
-    ),
-    "817Y002/010200000": _w("D", (4, 3.3), (2, 3.4), (1, 2.6), (0, 2.55), vol=0.02),
-    "817Y002/010210000": _w("D", (4, 3.4), (2, 3.5), (1, 2.8), (0, 2.86), vol=0.02),
+    "817Y002/010300000": _w("D", (4, 4.3), (2, 3.9), (1, 3.1), (0, 2.95), vol=0.02),
     "731Y001/0000001": _w(
         "D", (4, 1300), (2, 1340), (1.5, 1470), (1, 1400), (0, 1385), vol=8
     ),
-    "901Y009/0": _w("M", (4, 108), (0, 118.5), vol=0.1),
-    "901Y118/T002": _w("M", (4, 55000), (0, 62000), vol=2500),
-    "901Y027/I61BC": _w("M", (4, 2.8), (0, 2.7), vol=0.1),
-    "901Y067/I16D": _w("M", (4, 100.2), (1, 98.6), (0, 98.9), vol=0.1),
-    "511Y002/FME": _w("M", (4, 100), (1.8, 93), (0, 104), vol=1.2),
-    "817Y002/010101000": _w("D", (4, 3.5), (1, 2.8), (0, 2.52), vol=0.02),
-    "817Y002/010502000": _w("D", (4, 3.7), (1, 2.9), (0, 2.6), vol=0.02),
-    "817Y002/010300000": _w("D", (4, 4.3), (2, 3.9), (1, 3.1), (0, 2.95), vol=0.02),
-    "731Y001/0000002": _w("D", (4, 960), (1.5, 870), (0, 940), vol=6),
-    "732Y001/99": _w("M", (4, 420000000), (1, 410000000), (0, 422000000), vol=1e6),
-    "161Y006/BBHA00": _w("M", (4, 3800000), (0, 4300000), vol=4000),
-    "151Y001/1000000": _w("Q", (4, 1860000), (0, 1960000), vol=3000),
-    "200Y102/10111": _w("Q", (4, 0.6), (2, 0.3), (1, -0.1), (0, 0.6), vol=0.3),
-    "901Y010/QB": _w("M", (4, 105), (0, 113), vol=0.1),
-    "404Y014/*AA": _w("M", (4, 118), (0, 121), vol=0.2),
-    "901Y118/T004": _w("M", (4, 57000), (0, 53000), vol=2500),
-    "301Y017/SA000": _w("M", (4, 2500), (1, 8000), (0, 9500), vol=1500),
-    "901Y027/I61E": _w("M", (4, 62.5), (0, 63.0), vol=0.1),
-    "901Y067/I16E": _w("M", (4, 99.5), (1, 100.2), (0, 100.8), vol=0.1),
-    "513Y001/E2000": _w("M", (4, 95), (1.5, 88), (0, 95), vol=1),
     "802Y001/0001000": _w("D", (4, 2400), (1.5, 2650), (1, 2500), (0, 3500), vol=25),
-    "802Y001/0089000": _w("D", (4, 800), (1.5, 850), (1, 690), (0, 860), vol=8),
+    "200Y102/10211": _w("Q", (4, 3.0), (2, 1.0), (0, 3.4), vol=0.3),
+    "200Y102/10222": _w("Q", (4, 2.5), (1, 1.0), (0, 1.8), vol=0.4),
+    "200Y102/10223": _w("Q", (4, 3.0), (1, -2.0), (0, 2.5), vol=1.5),
+    "901Y009/0": _w("M", (4, 108), (0, 118.5), vol=0.1),
+    "901Y010/DB": _w("M", (4, 105), (0, 113), vol=0.1),
+    "404Y014/*AA": _w("M", (4, 118), (0, 121), vol=0.2),
+    "902Y008/JP": _w("M", (4, 102), (0, 114), vol=0.2),
+    "902Y008/CN": _w("M", (4, 102), (0, 104), vol=0.2),
+    "901Y027/I61BC/I28B": _w("M", (4, 2.8), (0, 2.7), vol=0.1),
+    "902Y021/JPN": _w("M", (4, 2.7), (0, 2.5), vol=0.05),
+    "901Y100/G0/T2": _w("M", (4, 102), (0, 104), vol=1.0),
+    "901Y118/T002": _w("M", (4, 52000000), (0, 58000000), vol=2500000),
+    "901Y118/T004": _w("M", (4, 50000000), (0, 53000000), vol=2000000),
+    "200Y102/10111": _w("Q", (4, 0.8), (2, -0.2), (0, 1.0), vol=0.3),
+    "200Y102/10224": _w("Q", (4, 2.0), (1, -3.0), (0, -0.7), vol=0.8),
+    "511Y003/FMB": _w("M", (4, 3.5), (2, 3.0), (0, 2.7), vol=0.05),
+    "901Y027/I61BA/I28B": _w("M", (4, 28300), (0, 28985), vol=15),
+    "901Y027/I61E/I28B": _w("M", (4, 62.0), (0, 62.9), vol=0.1),
+    "512Y013/99988/AA": _w("M", (4, 72), (2, 80), (0, 78), vol=1.5),
+    "403Y001/3091AA": _w("M", (4, 95), (2, 140), (0, 185), vol=4),
+    "901Y025/I31A": _w("M", (4, 76.0), (0, 71.2), vol=0.6),
+    "151Y005/1110000": _w("M", (4, 1180000), (0, 1316613), vol=2000),
+    "901Y067/I16E": _w("M", (4, 99.0), (2, 102.0), (0, 104.1), vol=0.1),
+    "141Y004/1A0000/X00": _w("M", (4, 1300000), (0, 1512951), vol=3000),
+    "104Y016/BDCA1": _w("M", (4, 2300000), (0, 2586900), vol=4000),
+    "901Y033/AB00/2": _w("M", (4, 112.0), (0, 124.8), vol=1.5),
+    "161Y005/BBHS00": _w("M", (4, 3800000), (0, 4350000), vol=4000),
+    "902Y023/IRLT/JPN": _w("M", (4, 0.5), (1, 1.0), (0, 1.65), vol=0.05),
+    "902Y023/IRLT/CHN": _w("M", (4, 2.8), (1, 1.9), (0, 1.8), vol=0.05),
+    "514Y001/AA": _w("Q", (4, -15), (1, -5), (0, 3), vol=3),
+    "902Y003/040101": _w("M", (4, 1800), (2, 1950), (1, 2600), (0, 4300), vol=40),
+    "511Y002/FME/99988": _w("M", (4, 100), (1.8, 93), (0, 104), vol=1.2),
+    "902Y015/JPN": _w("Q", (4, 0.3), (2, -0.4), (0, 0.4), vol=0.3),
 }
 
+_KTB: Final = (
+    ("010190000", 2.95, 2.45, 2.40),
+    ("010195000", 2.95, 2.50, 2.45),
+    ("010200000", 2.95, 2.55, 2.55),
+    ("010200001", 3.00, 2.70, 2.68),
+    ("010210000", 3.05, 2.85, 2.86),
+    ("010220000", 3.00, 2.80, 2.82),
+    ("010230000", 2.95, 2.75, 2.76),
+    ("010240000", 2.90, 2.70, 2.70),
+)
+for _item, _year, _month, _now in _KTB:
+    ECOS[f"817Y002/{_item}"] = _curve_walk(_year, _month, _now)
+
 SDMX: Final[dict[str, Walk]] = {
-    "FM/B.U2.EUR.4F.KR.DFR.LEV": _step(
+    "HICP/M.U2.N.000000.4D0.ANR": _w(
+        "M", (4, 5.0), (2, 2.4), (1, 2.2), (0, 2.1), vol=0.1
+    ),
+    "HICP/M.U2.N.XEF000.4D0.ANR": _w("M", (4, 5.0), (2, 2.7), (0, 2.3), vol=0.1),
+    "STBS/M.I10.N.PRIN.NS0020.4D0.GY.IX": _w(
+        "M", (4, 30.0), (3, -5.0), (1, 1.0), (0, 2.0), vol=0.5
+    ),
+    "STBS/M.I10.W.PROD.NS0020.4D0.GY.IX": _w(
+        "M", (4, -3.0), (2, -2.0), (1, 1.0), (0, 1.2), vol=0.8
+    ),
+    "STBS/M.I10.Y.TOVV.NS4701.4D0.N.IX": _w("M", (4, 105), (0, 107), vol=0.4),
+    "MNA/Q.Y.I10.W2.S1.S1.B.B1GQ._Z._Z._Z.EUR.LR.GY": _w(
+        "Q", (4, 3.5), (2, 0.4), (0, 1.3), vol=0.2
+    ),
+    "MNA/Q.Y.I10.W0.S1M.S1.D.P31._Z._Z._T.EUR.LR.GY": _w(
+        "Q", (4, 2.0), (2, 0.8), (0, 1.2), vol=0.2
+    ),
+    "MNA/Q.Y.I10.W0.S1.S1.D.P51G.N11G._T._Z.EUR.LR.GY": _w(
+        "Q", (4, 1.5), (2, -1.0), (0, 1.8), vol=0.8
+    ),
+    "LFSI/M.I10.S.UNEHRT.TOTAL0.15_74.T": _w(
+        "M", (4, 6.6), (2, 6.4), (0, 6.3), vol=0.05
+    ),
+    "BSI/M.U2.Y.V.M30.X.I.U2.2300.Z01.A": _w(
+        "M", (4, -0.5), (2, 1.5), (1, 3.5), (0, 2.9), vol=0.2
+    ),
+    "ILM/W.U2.C.T000000.Z5.Z01": _w("W", (4, 8700000), (0, 5935000), vol=8000),
+    "BLS/Q.U2.ALL.O.E.Z.B3.ST.S.WFNET": _w("Q", (4, 25), (2, 5), (0, 4), vol=3),
+    "EXR/D.USD.EUR.SP00.A": _w(
+        "D", (4, 1.0), (1.5, 1.08), (0.8, 1.04), (0.3, 1.17), (0, 1.164), vol=0.004
+    ),
+    "TRD/M.I10.N.X.TTT.J10.4.VAL": _w("M", (4, 235000000), (0, 258000000), vol=8000000),
+    "CISS/D.U2.Z0Z.4F.EC.SS_CIN.IDX": _w(
+        "D", (4, 0.15), (1.5, 0.06), (0.5, 0.1), (0, 0.05), vol=0.01
+    ),
+    "WS_CBPOL/D.US/all": _step(
+        "D",
+        (4, 5.375),
+        (2.0, 4.875),
+        (1.8, 4.375),
+        (0.9, 4.125),
+        (0.35, 3.875),
+        (0.08, 3.625),
+    ),
+    "WS_CBPOL/D.XM/all": _step(
         "D",
         (4, 4.0),
         (1.9, 3.75),
@@ -272,106 +256,80 @@ SDMX: Final[dict[str, Walk]] = {
         (0.5, 2.25),
         (0.35, 2.0),
     ),
-    "HICP/M.U2.N.000000.4D0.ANR": _w(
-        "M", (4, 5.0), (2, 2.4), (1, 2.2), (0, 2.1), vol=0.1
+    "WS_CBPOL/D.JP/all": _step(
+        "D", (4, -0.1), (2.5, 0.1), (2.2, 0.25), (1.7, 0.5), (0.8, 0.75)
     ),
-    "EXR/D.USD.EUR.SP00.A": _w(
-        "D", (4, 1.0), (1.5, 1.08), (0.8, 1.04), (0.3, 1.17), (0, 1.164), vol=0.004
+    "WS_CBPOL/D.CN/all": _step("D", (4, 3.55), (1.3, 3.35), (1.1, 3.1), (0.4, 3.0)),
+    "WS_CBPOL/D.KR/all": _step(
+        "D", (4, 3.5), (1.6, 3.25), (1.3, 3.0), (0.9, 2.75), (0.6, 2.5)
     ),
-    "EXR/D.JPY.EUR.SP00.A": _w(
-        "D", (4, 140), (1.5, 162), (0.8, 160), (0, 173.7), vol=0.6
+    "WS_TC/Q.US.H.A.M.770.A/all": _w("Q", (4, 75), (0, 69), vol=0.2),
+    "WS_DSR/Q.KR.H.367/all": _w("Q", (4, 12.5), (0, 11.5), vol=0.05),
+    "WS_DSR/Q.JP.H.367/all": _w("Q", (4, 7.3), (0, 7.5), vol=0.03),
+    "WS_CREDIT_GAP/Q.US.P.A.C.770/all": _w("Q", (4, -2.0), (0, -11.3), vol=0.3),
+    "WS_CREDIT_GAP/Q.KR.P.A.C.770/all": _w("Q", (4, 5.0), (0, -15.1), vol=0.5),
+    "WS_CREDIT_GAP/Q.XM.P.A.C.770/all": _w("Q", (4, -8.0), (0, -17.1), vol=0.3),
+    "WS_CREDIT_GAP/Q.JP.P.A.C.770/all": _w("Q", (4, 10.0), (0, 5.7), vol=0.3),
+    "WS_CREDIT_GAP/Q.CN.P.A.C.770/all": _w("Q", (4, 3.0), (0, -5.1), vol=0.4),
+    "WS_SPP/Q.US.R.771/all": _w("Q", (4, 8.0), (2, 1.0), (0, -2.6), vol=0.4),
+    "WS_SPP/Q.KR.R.771/all": _w("Q", (4, 5.0), (2, -6.0), (0, -0.5), vol=0.4),
+    "WS_SPP/Q.XM.R.771/all": _w("Q", (4, 4.0), (2, -3.0), (0, 1.0), vol=0.3),
+    "WS_SPP/Q.JP.R.771/all": _w("Q", (4, 3.0), (0, 2.4), vol=0.3),
+    "WS_SPP/Q.CN.R.771/all": _w("Q", (4, 1.0), (2, -4.0), (0, -7.0), vol=0.4),
+    "MNA/Q.Y.I10.W2.S1.S1.B.B1GQ._Z._Z._Z.EUR.LR.G1": _w(
+        "Q", (4, 0.3), (0, 0.4), vol=0.15
     ),
-    "WS_CBPOL/M.JP/all": _step(
-        "M", (4, -0.1), (2.5, 0.1), (2.2, 0.25), (1.7, 0.5), (0.8, 0.75)
+    "MNA/Q.Y.I10.W2.S1.S1._Z.EMP._Z._T._Z.PS._Z.N": _w(
+        "Q", (4, 168000), (0, 176500), vol=100
     ),
-    "WS_CBPOL/M.GB/all": _step(
-        "M",
-        (4, 5.25),
-        (2.1, 5.0),
-        (1.9, 4.75),
-        (1.6, 4.5),
-        (1.3, 4.25),
-        (1.0, 4.0),
-        (0.5, 3.75),
-        (0.2, 3.5),
-    ),
+    "TRD/M.I10.N.M.TTT.J10.4.VAL": _w("M", (4, 230000000), (0, 243000000), vol=4000000),
+    "BSI/M.U2.Y.U.A20.A.I.U2.2250.Z01.A": _w("M", (4, 1.0), (0, 3.1), vol=0.1),
+    "BSI/M.U2.Y.U.A20.A.I.U2.2240.Z01.A": _w("M", (4, 0.5), (0, 4.3), vol=0.15),
+    "SPF/Q.U2.HICP.POINT.LT.Q.AVG": _w("Q", (4, 2.1), (0, 2.0), vol=0.02),
+    "WS_TC/Q.KR.H.A.M.770.A/all": _w("Q", (4, 102), (0, 90), vol=0.3),
+    "WS_TC/Q.XM.H.A.M.770.A/all": _w("Q", (4, 58), (0, 50), vol=0.2),
+    "WS_TC/Q.JP.H.A.M.770.A/all": _w("Q", (4, 64), (0, 61), vol=0.2),
+    "WS_TC/Q.CN.H.A.M.770.A/all": _w("Q", (4, 62), (0, 58), vol=0.2),
+    "WS_TC/Q.US.N.A.M.770.A/all": _w("Q", (4, 78), (0, 72), vol=0.2),
+    "WS_TC/Q.KR.N.A.M.770.A/all": _w("Q", (4, 118), (0, 107), vol=0.5),
+    "WS_TC/Q.XM.N.A.M.770.A/all": _w("Q", (4, 110), (0, 103), vol=0.4),
+    "WS_TC/Q.JP.N.A.M.770.A/all": _w("Q", (4, 118), (0, 113), vol=0.4),
+    "WS_TC/Q.CN.N.A.M.770.A/all": _w("Q", (4, 160), (0, 146), vol=0.5),
 }
-SDMX.update(
-    {
-        "FM/B.U2.EUR.4F.KR.MRR_FR.LEV": _step(
-            "D", (4, 4.5), (1.9, 4.25), (1.1, 3.4), (0.9, 3.15), (0.35, 2.15)
-        ),
-        "EST/B.EU000A2X2A25.WT": _w(
-            "D", (4, 3.9), (1.9, 3.65), (0.9, 2.66), (0.35, 1.92), (0, 1.93), vol=0.01
-        ),
-        "YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y": _w(
-            "D", (4, 2.6), (2, 2.4), (1, 2.5), (0, 2.7), vol=0.03
-        ),
-        "YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SRS_10Y_3M": _w(
-            "D", (4, -0.9), (2, -0.6), (1, 0.4), (0, 0.8), vol=0.03
-        ),
-        "HICP/M.U2.N.XEF000.4D0.ANR": _w("M", (4, 5.0), (2, 2.7), (0, 2.3), vol=0.1),
-        "HICP/M.U2.N.SERV00.4D0.ANR": _w("M", (4, 4.5), (2, 4.0), (0, 3.1), vol=0.1),
-        "BSI/M.U2.Y.V.M30.X.I.U2.2300.Z01.A": _w(
-            "M", (4, -0.5), (2, 1.5), (1, 3.5), (0, 2.9), vol=0.2
-        ),
-        "BSI/M.U2.Y.U.A20T.A.I.U2.2240.Z01.A": _w(
-            "M", (4, 2.0), (2, 0.5), (1, 1.5), (0, 2.8), vol=0.1
-        ),
-        "LFSI/M.I9.S.UNEHRT.TOTAL0.15_74.T": _w(
-            "M", (4, 6.6), (2, 6.4), (0, 6.3), vol=0.05
-        ),
-        "STBS/M.I10.W.PROD.NS0020.4D0.GY.IX": _w(
-            "M", (4, -3.0), (2, -2.0), (1, 1.0), (0, 1.2), vol=0.8
-        ),
-        "CISS/D.U2.Z0Z.4F.EC.SS_CIN.IDX": _w(
-            "D", (4, 0.15), (1.5, 0.06), (0.5, 0.1), (0, 0.05), vol=0.01
-        ),
-        "EXR/M.E03.EUR.EN00.A": _w("M", (4, 120), (1, 123), (0, 128), vol=0.4),
-        "WS_CBPOL/M.CN/all": _step("M", (4, 3.55), (1.3, 3.35), (1.1, 3.1), (0.4, 3.0)),
-        "WS_CBPOL/M.CA/all": _step(
-            "M", (4, 5.0), (1.4, 4.5), (1.0, 3.25), (0.6, 2.75), (0.1, 2.5)
-        ),
-        "WS_CBPOL/M.AU/all": _step("M", (4, 4.35), (0.7, 4.1), (0.4, 3.6)),
-        "WS_CBPOL/M.CH/all": _step("M", (4, 1.75), (1.5, 1.0), (0.8, 0.25), (0.3, 0.0)),
-        "WS_TC/Q.KR.H.A.M.770.A/all": _w("Q", (4, 102), (0, 90), vol=0.3),
-        "WS_TC/Q.KR.P.A.M.770.A/all": _w("Q", (4, 222), (0, 205), vol=0.6),
-        "WS_TC/Q.CN.P.A.M.770.A/all": _w("Q", (4, 215), (0, 205), vol=0.6),
-        "WS_TC/Q.US.H.A.M.770.A/all": _w("Q", (4, 75), (0, 69), vol=0.2),
-        "WS_CREDIT_GAP/Q.KR.P.A.C/all": _w("Q", (4, 8), (0, -8), vol=0.5),
-        "WS_CREDIT_GAP/Q.CN.P.A.C/all": _w("Q", (4, 5), (0, 2), vol=0.5),
-        "WS_SPP/Q.KR.R.628/all": _w("Q", (4, 110), (2, 98), (0, 99), vol=0.4),
-        "WS_SPP/Q.US.R.628/all": _w("Q", (4, 160), (0, 163), vol=0.4),
-        "WS_SPP/Q.CN.R.628/all": _w("Q", (4, 108), (0, 92), vol=0.4),
-        "WS_EER/M.R.B.KR/all": _w("M", (4, 102), (1, 96), (0, 98), vol=0.4),
-        "WS_EER/M.R.B.US/all": _w("M", (4, 115), (1, 118), (0, 113), vol=0.4),
-    }
-)
 
-# (measure, area) for the OECD DF_CLI dataflow.
+_EA_CURVE: Final = (
+    ("3M", 2.10, 1.95, 1.92),
+    ("1Y", 2.05, 1.95, 1.95),
+    ("2Y", 2.05, 2.00, 2.02),
+    ("3Y", 2.10, 2.10, 2.12),
+    ("5Y", 2.25, 2.30, 2.33),
+    ("7Y", 2.40, 2.50, 2.52),
+    ("10Y", 2.60, 2.75, 2.78),
+    ("20Y", 2.95, 3.15, 3.18),
+    ("30Y", 3.00, 3.20, 3.22),
+)
+for _tenor, _year, _month, _now in _EA_CURVE:
+    SDMX[f"YC/B.U2.EUR.4F.G_N_A.SV_C_YM.SR_{_tenor}"] = _curve_walk(_year, _month, _now)
+
 OECD_DEMO: Final[dict[tuple[str, str], Walk]] = {
     ("LI", "USA"): _w("M", (4, 99.0), (0, 100.3), vol=0.05),
-    ("LI", "CHN"): _w("M", (4, 99.5), (0, 100.1), vol=0.05),
     ("LI", "KOR"): _w("M", (4, 98.8), (0, 100.6), vol=0.05),
     ("LI", "JPN"): _w("M", (4, 100.2), (0, 100.4), vol=0.05),
-    ("LI", "DEU"): _w("M", (4, 98.5), (0, 100.0), vol=0.05),
-    ("LI", "GBR"): _w("M", (4, 98.9), (0, 100.2), vol=0.05),
+    ("LI", "CHN"): _w("M", (4, 99.5), (0, 100.1), vol=0.05),
     ("BCICP", "USA"): _w("M", (4, 99.0), (0, 99.6), vol=0.1),
-    ("BCICP", "CHN"): _w("M", (4, 99.4), (0, 99.0), vol=0.1),
     ("BCICP", "KOR"): _w("M", (4, 98.6), (0, 98.9), vol=0.1),
-    ("BCICP", "DEU"): _w("M", (4, 97.5), (0, 98.2), vol=0.1),
-    ("CCICP", "USA"): _w("M", (4, 97.5), (0, 97.9), vol=0.1),
-    ("CCICP", "KOR"): _w("M", (4, 98.0), (0, 100.4), vol=0.1),
-    ("CCICP", "DEU"): _w("M", (4, 97.0), (0, 98.0), vol=0.1),
+    ("BCICP", "EA20"): _w("M", (4, 98.0), (0, 100.2), vol=0.1),
+    ("BCICP", "JPN"): _w("M", (4, 100.5), (0, 101.7), vol=0.1),
+    ("BCICP", "CHN"): _w("M", (4, 99.4), (0, 99.0), vol=0.1),
+    ("CCICP", "EA20"): _w("M", (4, 96.5), (0, 98.3), vol=0.1),
+    ("CCICP", "JPN"): _w("M", (4, 97.5), (0, 98.5), vol=0.1),
+    ("CCICP", "CHN"): _w("M", (4, 99.0), (0, 97.0), vol=0.1),
+    ("MABM", "JPN"): _w("M", (4, 3.0), (0, 1.4), vol=0.1),
+    ("B1GQ_Q", "CHN"): _w("Q", (4, 5.4), (0, 4.5), vol=0.2),
+    ("MABM", "CHN"): _w("M", (4, 260000000), (0, 356000000), vol=500000),
+    ("CPI", "JPN"): _w("M", (4, 2.8), (2, 2.0), (0, 2.2), vol=0.1),
 }
 
-# Yahoo tickers.
-YAHOO: Final[dict[str, Walk]] = {
-    "GC=F": _w("D", (4, 1750), (2, 2050), (1, 2700), (0, 4100), vol=25),
-}
-
-# FOMC SEP medians by years after the latest release year: (latest, prior).
-# The September SEP adds a year, so the prior vintage is one year shorter.
 SEP_DAYS_AGO: Final = (27, 118)
 DEMO_SEP: Final[dict[str, tuple[tuple[float, ...], tuple[float, ...]]]] = {
     "FEDTARMD": ((3.6, 3.4, 3.1, 3.1), (3.9, 3.6, 3.4)),
@@ -398,9 +356,6 @@ DEMO_RELEASES: Final = (
 )
 
 
-# ---------------------------------------------------------------- generation
-
-
 def _dates(freq: Freq, start: date, today: date) -> list[date]:
     if freq == "D":
         end = today - timedelta(days=1)
@@ -417,7 +372,7 @@ def _dates(freq: Freq, start: date, today: date) -> list[date]:
             out.append(last)
             last -= timedelta(days=7)
         return out[::-1]
-    lag_days, step = (120, 3) if freq == "Q" else (40, 1)
+    lag_days, step = {"Q": (120, 3), "A": (300, 12)}.get(freq, (40, 1))
     last_day = today - timedelta(days=lag_days)
     month = last_day.month - (last_day.month - 1) % step
     year = last_day.year
@@ -449,7 +404,7 @@ def _level(walk: Walk, years_ago: float) -> float:
 def generate(
     key: str, walk: Walk, start: date, today: date
 ) -> list[tuple[date, float]]:
-    rng = random.Random(zlib.crc32(key.encode()))  # noqa: S311 - demo data only
+    rng = random.Random(zlib.crc32(key.encode()))  # noqa: S311
     points: list[tuple[date, float]] = []
     days = _dates(walk.freq, start, today)
     for index, day in enumerate(days):
@@ -462,40 +417,58 @@ def generate(
     return points
 
 
-# ---------------------------------------------------------------- wire formats
+@dataclass(slots=True)
+class FakeClock:
+    now: float = 1_800_000_000.0
+    slept: list[float] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            self.slept.append(seconds)
+            self.now += max(seconds, 0.0)
+
+    async def asleep(self, seconds: float) -> None:
+        self.sleep(seconds)
 
 
-def demo_transport(today: date) -> httpx.MockTransport:
-    """A transport that answers every source the dashboard calls."""
+_ANSWERS: Final[dict[tuple[httpx.URL, date], tuple[int, bytes]]] = {}
+
+
+def demo_handler(request: httpx.Request, today: date) -> httpx.Response:
+    key = (request.url, today)
+    if key not in _ANSWERS:
+        answer = _answer(request, today)
+        _ANSWERS[key] = (answer.status_code, answer.content)
+    status, content = _ANSWERS[key]
+    return httpx.Response(status, content=content)
+
+
+def _answer(request: httpx.Request, today: date) -> httpx.Response:
     routes: dict[str, Callable[[httpx.Request, date], httpx.Response]] = {
         "api.stlouisfed.org": _fred,
-        "api.fiscaldata.treasury.gov": _fiscal,
-        "markets.newyorkfed.org": _nyfed,
         "ecos.bok.or.kr": _ecos,
         "data-api.ecb.europa.eu": _sdmx,
         "stats.bis.org": _sdmx,
         "sdmx.oecd.org": _oecd,
     }
+    special = fake_calendar.handle(request, today)
+    if special is not None:
+        return special
+    route = routes.get(request.url.host)
+    if route is None:
+        return httpx.Response(404)
+    return route(request, today)
 
+
+def demo_transport(today: date) -> httpx.MockTransport:
     def handle(request: httpx.Request) -> httpx.Response:
-        route = routes.get(request.url.host)
-        if route is None:
-            return httpx.Response(404)
-        return route(request, today)
+        return demo_handler(request, today)
 
     return httpx.MockTransport(handle)
-
-
-def demo_closes(today: date) -> Closes:
-    """Yahoo daily closes, as ``sources.YahooCloses`` returns them."""
-
-    def closes(ticker: str, start: date) -> Series:
-        walk = YAHOO.get(ticker)
-        if walk is None:
-            raise SourceError(f"YAHOO {ticker}: 관측값 없음")
-        return tuple(generate(ticker, walk, start, today))
-
-    return closes
 
 
 def _param(request: httpx.Request, name: str, default: str = "") -> str:
@@ -581,7 +554,6 @@ def _fred_vintages(series_id: str, today: date) -> httpx.Response:
     if series_id in DEMO_SEP:
         new, old = DEMO_SEP[series_id]
         base = latest.year
-        # A past target year stays in every vintage and must not become a column.
         rows.append((prior.isoformat(), "9999-12-31", date(base - 1, 1, 1), new[0]))
         rows += [
             (latest.isoformat(), "9999-12-31", date(base + offset, 1, 1), value)
@@ -614,40 +586,6 @@ def _fred_vintages(series_id: str, today: date) -> httpx.Response:
     )
 
 
-def _fiscal(request: httpx.Request, today: date) -> httpx.Response:
-    name = request.url.path.rstrip("/").rsplit("/", 1)[-1]
-    field = _param(request, "fields", "record_date,value").split(",")[1]
-    walk = FISCAL.get(f"{name}/{field}")
-    if walk is None:
-        return httpx.Response(404)
-    start = today - timedelta(days=365 * 4)
-    rows = [
-        {"record_date": day.isoformat(), field: f"{value:.2f}"}
-        for day, value in reversed(generate(name, walk, start, today))
-    ]
-    return _json({"data": rows, "meta": {"count": len(rows)}})
-
-
-def _nyfed(request: httpx.Request, today: date) -> httpx.Response:
-    name = request.url.path.split("/rates/", 1)[-1].split("/")[1]
-    if name not in NYFED:
-        return httpx.Response(404)
-    start = today - timedelta(days=365 * 4)
-    points = generate(name, NYFED[name], start, today)
-    return _json(
-        {
-            "refRates": [
-                {
-                    "effectiveDate": day.isoformat(),
-                    "type": name.upper(),
-                    "percentRate": value,
-                }
-                for day, value in reversed(points)
-            ]
-        }
-    )
-
-
 def _ecos(request: httpx.Request, today: date) -> httpx.Response:
     parts = request.url.path.strip("/").split("/")
     if parts[1] == "StatisticTableList":
@@ -674,9 +612,9 @@ def _ecos(request: httpx.Request, today: date) -> httpx.Response:
         return _json(
             {"StatisticItemList": {"list_total_count": len(rows), "row": rows}}
         )
-    # api/StatisticSearch/{key}/json/kr/{from}/{to}/{stat}/{cycle}/{start}/{end}/{item1}
     stat, cycle, start_text, item1 = parts[7], parts[8], parts[9], parts[11]
-    walk = ECOS.get(f"{stat}/{item1}")
+    key = "/".join([stat, *parts[11:]])
+    walk = ECOS.get(key)
     if walk is None:
         return _json(
             {"RESULT": {"CODE": "INFO-200", "MESSAGE": "해당하는 데이터가 없습니다."}}
@@ -689,7 +627,7 @@ def _ecos(request: httpx.Request, today: date) -> httpx.Response:
             "TIME": ecos_period(day, cycle),
             "DATA_VALUE": f"{value}",
         }
-        for day, value in generate(f"{stat}/{item1}", walk, start, today)
+        for day, value in generate(key, walk, start, today)
     ]
     return _json({"StatisticSearch": {"list_total_count": len(rows), "row": rows}})
 
@@ -706,7 +644,6 @@ STRUCTURE_NS: Final = " ".join(
 
 
 def _structure(flows: list[str], keys: list[str]) -> httpx.Response:
-    """A small SDMX-ML structure message: dataflows, or one flow's dimensions."""
     parts = [f"<m:Structure {STRUCTURE_NS}><m:Structures><s:Dataflows>"]
     for flow in flows:
         parts.append(f'<s:Dataflow id="{flow}" agencyID="DEMO" version="1.0">')
@@ -748,35 +685,187 @@ def _sdmx(request: httpx.Request, today: date) -> httpx.Response:
     if "/dataflow" in path:
         return _sdmx_structure(path)
     marker = "/service/data/" if "/service/data/" in path else "/api/v1/data/"
-    flow_key = path.split(marker, 1)[-1]
-    walk = SDMX.get(flow_key)
-    if walk is None:
-        return httpx.Response(404)
+    flow, key = path.split(marker, 1)[-1].split("/", 1)
+    bis = key.endswith("/all")
     start = _start(request, "startPeriod", 4, today)
-    lines = ["KEY,FREQ,TIME_PERIOD,OBS_VALUE"]
-    lines += [
-        f"{flow_key},{walk.freq},{_csv_period(day, walk.freq)},{value}"
-        for day, value in generate(flow_key, walk, start, today)
-    ]
+    lines = ["KEY,REF_AREA,BORROWERS_CTY,TC_BORROWERS,FREQ,TIME_PERIOD,OBS_VALUE"]
+    parts = key.removesuffix("/all").split(".")
+    for dims in product(*(dim.split("+") for dim in parts)):
+        single = ".".join(dims)
+        walk = SDMX.get(f"{flow}/{single}/all" if bis else f"{flow}/{single}")
+        if walk is None:
+            continue
+        area = dims[1] if len(dims) > 1 else ""
+        sector = dims[2] if len(dims) > 2 else ""
+        head = f"{flow}.{single},{area},{area},{sector},{walk.freq}"
+        lines += [
+            f"{head},{_csv_period(day, walk.freq)},{value}"
+            for day, value in generate(f"{flow}/{single}", walk, start, today)
+        ]
+    if len(lines) == 1:
+        return httpx.Response(404)
     return httpx.Response(200, content="\n".join(lines).encode())
 
 
 def _oecd(request: httpx.Request, today: date) -> httpx.Response:
-    if "/dataflow" in request.url.path:
-        tail = unquote(request.url.path).split("/dataflow/", 1)[-1].split("/")
+    path = unquote(request.url.path)
+    if "/dataflow" in path:
+        tail = path.split("/dataflow/", 1)[-1].split("/")
         if len(tail) < 2:
             return _structure(["DSD_STES@DF_CLI"], [])
         return _structure([tail[1]], ["USA.M.LI", "KOR.M.BCICP"])
     start = _start(request, "startPeriod", 4, today)
-    key = unquote(request.url.path).rsplit("/", 1)[-1].split(".")
-    areas, measures = key[0].split("+"), key[2].split("+")
-    flow = "OECD.SDD.STES:DSD_STES@DF_CLI"
+    flow, key = path.split("/data/", 1)[-1].replace(",", ":").rsplit("/", 1)
+    dims = [dim.split("+") for dim in key.split(".")]
+    areas = set(dims[0])
+    tokens = {token for dim in dims[1:] for token in dim}
     lines = ["DATAFLOW,REF_AREA,FREQ,MEASURE,TIME_PERIOD,OBS_VALUE"]
-    for (measure, area), walk in OECD_DEMO.items():
-        if area not in areas or measure not in measures:
+    for (token, area), walk in OECD_DEMO.items():
+        if area not in areas or token not in tokens:
             continue
         lines += [
-            f"{flow},{area},M,{measure},{_csv_period(day, 'M')},{value}"
-            for day, value in generate(f"{measure}/{area}", walk, start, today)
+            f"{flow},{area},{walk.freq},{token},{_csv_period(day, walk.freq)},{value}"
+            for day, value in generate(f"{token}/{area}", walk, start, today)
         ]
     return httpx.Response(200, content="\n".join(lines).encode())
+
+
+ALPACA_DIVIDENDS: Final = {
+    "corporate_actions": {
+        "cash_dividends": [
+            {"symbol": "EWT", "ex_date": "2025-12-16", "rate": 1.802131},
+            {"symbol": "EWT", "ex_date": "2025-12-16", "rate": 1.014019},
+            {"symbol": "VGT", "ex_date": "2025-12-17", "rate": 0.757},
+            {"symbol": "VGT", "ex_date": "2026-03-24", "rate": 0.7438},
+            {"symbol": "VGT", "ex_date": "2026-06-24", "rate": 0.1384},
+            {"symbol": "VGT", "ex_date": "2026-09-23", "rate": 0.1465},
+        ]
+    }
+}
+ALPACA_SPLITS: Final = {
+    "corporate_actions": {
+        "forward_splits": [
+            {"symbol": "VGT", "ex_date": "2026-04-21", "new_rate": 8, "old_rate": 1},
+            {"symbol": "SOXX", "ex_date": "2026-11-05", "new_rate": 3, "old_rate": 1},
+        ]
+    }
+}
+
+type NportRow = tuple[str, str, str, float, str | None, str | None, str, str | None]
+
+
+def _nport_row(row: NportRow) -> str:
+    name, cusip, isin, pct, asset, issuer, country, maturity = row
+    debt = "" if maturity is None else f"<debtSec><maturityDt>{maturity}</maturityDt>"
+    debt += "" if maturity is None else "<couponKind>Fixed</couponKind></debtSec>"
+    ids = f'<identifiers><isin value="{isin}"/></identifiers>'
+    head = f"<invstOrSec><name>{name}</name><cusip>{cusip}</cusip>{ids}"
+    return (
+        f"{head}<pctVal>{pct}</pctVal>"
+        + ("" if asset is None else f"<assetCat>{asset}</assetCat>")
+        + ("" if issuer is None else f"<issuerCat>{issuer}</issuerCat>")
+        + f"<invCountry>{country}</invCountry>{debt}</invstOrSec>"
+    )
+
+
+def nport(as_of: str, rows: list[NportRow]) -> str:
+    body = "".join(_nport_row(row) for row in rows)
+    head = '<?xml version="1.0" encoding="UTF-8"?>'
+    root = '<edgarSubmission xmlns="http://www.sec.gov/edgar/nport">'
+    info = (
+        f"<formData><genInfo><repPdDate>{as_of}</repPdDate></genInfo>"
+        "<fundInfo><netAssets>22300000000.00</netAssets></fundInfo>"
+    )
+    tail = "</invstOrSecs></formData></edgarSubmission>"
+    return f"{head}{root}{info}<invstOrSecs>{body}{tail}"
+
+
+NPORT_TLT: Final = nport(
+    "2026-08-31",
+    [
+        (
+            "United States of America",
+            "912810UK2",
+            "US912810UK24",
+            49.0,
+            "DBT",
+            "UST",
+            "US",
+            "2055-08-15",
+        ),
+        (
+            "United States of America",
+            "912810TT5",
+            "US912810TT51",
+            49.15,
+            "DBT",
+            "UST",
+            "US",
+            "2045-08-15",
+        ),
+        (
+            "BlackRock Cash Funds",
+            "066922519",
+            "US0669225197",
+            1.09,
+            "STIV",
+            "RF",
+            "US",
+            None,
+        ),
+    ],
+)
+NPORT_EWY: Final = nport(
+    "2026-08-31",
+    [
+        (
+            "Samsung Electronics Co., Ltd.",
+            "N/A",
+            "KR7005930003",
+            22.13,
+            "EC",
+            "CORP",
+            "KR",
+            None,
+        ),
+        ("SK hynix Inc.", "N/A", "KR7000660001", 20.96, "EC", "CORP", "KR", None),
+        (
+            "SK Square Co., Ltd.",
+            "Y8T6X4107",
+            "KR7402340004",
+            55.23,
+            "EC",
+            "CORP",
+            "KR",
+            None,
+        ),
+        ("Hyundai Motor Pref", "N/A", "KR7005381009", 0.78, "EP", "CORP", "KR", None),
+        (
+            "BlackRock Cash Funds",
+            "066922519",
+            "US0669225197",
+            5.48,
+            "STIV",
+            "RF",
+            "US",
+            None,
+        ),
+        ("KRW", "N/A", "N/A", 0.51, None, None, "KR", None),
+    ],
+)
+NPORT_FUND_OF_FUNDS: Final = nport(
+    "2026-07-31",
+    [
+        (
+            "Vanguard Real Estate II Index Fund",
+            "922031695",
+            "US9220316957",
+            14.5,
+            "EC",
+            "RF",
+            "US",
+            None,
+        ),
+        ("Welltower Inc", "95040Q104", "US95040Q1040", 87.0, "EC", "CORP", "US", None),
+    ],
+)

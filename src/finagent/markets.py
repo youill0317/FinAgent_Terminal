@@ -1,65 +1,44 @@
-"""Alpaca daily bars and Massive reference data, under their free plans' limits.
-
-Alpaca's Basic plan answers 200 historical requests a minute and serves the
-consolidated (SIP) tape for queries ending at least 15 minutes ago, from
-2016; one request carries many symbols. Massive's Basic plan answers 5
-requests a minute; its ticker overview has the market cap, currency and
-type. Neither has Korean listings, indices or exchange rates: those stay
-with Yahoo. Keys come from the env (``.env``); without them the callers
-keep Yahoo for everything.
-"""
-
-# pandas ships no type stubs.
 # pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false
 # pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
 # pyright: reportAny=false
+"""Alpaca Market Data API(미국 주식 일봉·액면분할·배당) 클라이언트."""
 
 from __future__ import annotations
 
-import threading
-import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Final, cast, final
+from typing import TYPE_CHECKING, Final, cast
 from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
 
+from finagent import limits
+from finagent.limits import BACKGROUND_WAIT
+
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Generator, Mapping, Sequence
 
 ALPACA_KEY_ENV: Final = "ALPACA_API_KEY_ID"
-ALPACA_SECRET_ENV: Final = "ALPACA_API_SECRET_KEY"  # noqa: S105 - its name
-MASSIVE_KEY_ENV: Final = "MASSIVE_API_KEY"
+ALPACA_SECRET_ENV: Final = "ALPACA_API_SECRET_KEY"  # noqa: S105  # 환경변수 키 이름 상수(시크릿 리터럴 아님)
 
 ALPACA_BARS: Final = "https://data.alpaca.markets/v2/stocks/bars"
-MASSIVE_TICKER: Final = "https://api.massive.com/v3/reference/tickers/"
+ALPACA_ACTIONS: Final = "https://data.alpaca.markets/v1/corporate-actions"
 
-ALPACA_PER_MINUTE: Final = 200  # Basic plan, historical requests
-MASSIVE_PER_MINUTE: Final = 5  # Basic plan
-ALPACA_PAGE: Final = 10_000  # bars per page, across all symbols (the maximum)
-ALPACA_SYMBOLS: Final = 100  # symbols per request: none documented, kept short
-SIP_DELAY: Final = timedelta(minutes=16)  # free SIP queries end 15+ minutes back
+ALPACA_PAGE: Final = 10_000
+ALPACA_ACTIONS_PAGE: Final = 1000
+SPLIT_TYPES: Final = "forward_split,reverse_split,stock_dividend"
+ALPACA_SYMBOLS: Final = 100
+SIP_DELAY: Final = timedelta(minutes=30)
+ALPACA_START: Final = date(2016, 1, 1)
 TIMEOUT: Final = 30.0
-RETRIES: Final = 3  # 429s waited out before giving up
-RETRY_SECONDS: Final = 60.0  # when a 429 names no wait
-TOO_MANY_REQUESTS: Final = 429
-NOT_FOUND: Final = 404
 NEW_YORK: Final = ZoneInfo("America/New_York")
-
-
-class RateLimitedError(RuntimeError):
-    """A provider kept answering 429 after ``RETRIES`` waits."""
 
 
 @dataclass(frozen=True, slots=True)
 class Keys:
-    """The keys found in the env; empty strings where missing."""
-
     alpaca_id: str = ""
     alpaca_secret: str = ""
-    massive: str = ""
 
     @property
     def alpaca(self) -> bool:
@@ -70,34 +49,10 @@ def keys(env: Mapping[str, str]) -> Keys:
     return Keys(
         env.get(ALPACA_KEY_ENV, "").strip(),
         env.get(ALPACA_SECRET_ENV, "").strip(),
-        env.get(MASSIVE_KEY_ENV, "").strip(),
     )
 
 
-@final
-class Pace:
-    """One pace per provider in this process: request starts ``interval`` apart."""
-
-    def __init__(self, per_minute: int) -> None:
-        """Requests at most ``per_minute``, evenly spaced."""
-        self.interval = 60 / per_minute
-        self._lock = threading.Lock()
-        self._last = float("-inf")
-
-    def wait(self, sleep: Callable[[float], None] = time.sleep) -> None:
-        with self._lock:
-            gap = self._last + self.interval - time.monotonic()
-            if gap > 0:
-                sleep(gap)
-            self._last = time.monotonic()
-
-
-ALPACA_PACE: Final = Pace(ALPACA_PER_MINUTE)
-MASSIVE_PACE: Final = Pace(MASSIVE_PER_MINUTE)
-
-
 def provider_symbol(ticker: str) -> str:
-    """The app's (Yahoo's) ``BRK-B`` is Alpaca's and Massive's ``BRK.B``."""
     return ticker.replace("-", ".")
 
 
@@ -106,44 +61,30 @@ def app_symbol(symbol: str) -> str:
 
 
 def us_listed(ticker: str) -> bool:
-    """A US stock or ETF: not an index (``^``), rate (``=X``) or Korean listing."""
-    return not (
-        ticker.startswith("^") or ticker.endswith(("=X", ".KS", ".KQ")) or "=" in ticker
-    )
+    return not (ticker.startswith("^") or "=" in ticker or "." in ticker)
 
 
 def _get(
     client: httpx.Client,
     url: str,
     params: Mapping[str, str],
-    pace: Pace,
-    sleep: Callable[[float], None],
+    headers: Mapping[str, str],
+    max_wait: float,
 ) -> httpx.Response:
-    """GET at ``pace``; a 429 waits its ``Retry-After`` (or a minute) and retries."""
-    for _ in range(RETRIES):
-        pace.wait(sleep)
-        response = client.get(url, params=params)
-        if response.status_code != TOO_MANY_REQUESTS:
-            _ = response.raise_for_status()
-            return response
-        after = str(response.headers.get("retry-after", ""))
-        sleep(float(after) if after.isdigit() else RETRY_SECONDS)
-    raise RateLimitedError(f"{httpx.URL(url).host}: 요청 한도 초과")
+    response = limits.send(
+        "ALPACA", lambda: client.get(url, params=params, headers=headers), max_wait
+    )
+    _ = response.raise_for_status()
+    return response
 
 
 def bar_end(last: date, now: datetime) -> str:
-    """Alpaca's inclusive ``end`` for daily bars through ``last``, SIP-delayed.
-
-    A daily bar is stamped at midnight New York, so the day's end in New
-    York keeps ``last``'s bar; free SIP queries end ``SIP_DELAY`` before now.
-    """
     close = datetime.combine(last + timedelta(days=1), datetime.min.time(), NEW_YORK)
     end = min(close - timedelta(seconds=1), now - SIP_DELAY)
     return end.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_bars(payload: Mapping[str, object]) -> pd.DataFrame:
-    """One page of ``/v2/stocks/bars`` as rows of ticker, date, o, h, l, c, v."""
     bars = cast("Mapping[str, list[Mapping[str, object]]]", payload.get("bars") or {})
     rows = [
         {
@@ -167,11 +108,9 @@ def parse_bars(payload: Mapping[str, object]) -> pd.DataFrame:
 
 @dataclass(slots=True)
 class Alpaca:
-    """Daily bars for many US symbols per request (``/v2/stocks/bars``)."""
-
     keys: Keys
     client: httpx.Client | None = None
-    sleep: Callable[[float], None] = time.sleep
+    max_wait: float = BACKGROUND_WAIT
 
     def bars(
         self,
@@ -181,91 +120,102 @@ class Alpaca:
         adjustment: str,
         now: datetime | None = None,
     ) -> pd.DataFrame:
-        """Rows of ticker, date and OHLCV from ``start`` through ``last``.
+        params = {
+            "timeframe": "1Day",
+            "start": start.isoformat(),
+            "end": bar_end(last, now or datetime.now(UTC)),
+            "adjustment": adjustment,
+            "feed": "sip",
+            "limit": str(ALPACA_PAGE),
+        }
+        pages = [parse_bars(page) for page in self._pages(ALPACA_BARS, params, tickers)]
+        return pd.concat(pages, ignore_index=True) if pages else parse_bars({})
 
-        ``adjustment`` is Alpaca's: ``split`` (as Yahoo's Close) or ``all``
-        (splits and dividends, as Yahoo's Adj Close).
-        """
-        client = self.client or httpx.Client(timeout=TIMEOUT)
-        client.headers.update(
-            {
-                "APCA-API-KEY-ID": self.keys.alpaca_id,
-                "APCA-API-SECRET-KEY": self.keys.alpaca_secret,
-            }
+    def splits(self, tickers: Sequence[str], start: date, end: date) -> pd.DataFrame:
+        return _split_table(self._actions(tickers, SPLIT_TYPES, start, end))
+
+    def payouts(
+        self, tickers: Sequence[str], start: date, end: date
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        pages = self._actions(tickers, f"cash_dividend,{SPLIT_TYPES}", start, end)
+        paid = [row for page in pages for row in parse_cash_dividends(page)]
+        return (
+            pd.DataFrame(paid, columns=["ticker", "ex_date", "rate"]),
+            _split_table(pages),
         )
-        end = bar_end(last, now or datetime.now(UTC))
-        pages: list[pd.DataFrame] = []
+
+    def _actions(
+        self, tickers: Sequence[str], types: str, start: date, end: date
+    ) -> list[Mapping[str, object]]:
+        params = {
+            "types": types,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "limit": str(ALPACA_ACTIONS_PAGE),
+        }
+        return list(self._pages(ALPACA_ACTIONS, params, tickers))
+
+    def _pages(
+        self, url: str, params: Mapping[str, str], tickers: Sequence[str]
+    ) -> Generator[Mapping[str, object]]:
+        client = self.client or httpx.Client(timeout=TIMEOUT)
+        headers = {
+            "APCA-API-KEY-ID": self.keys.alpaca_id,
+            "APCA-API-SECRET-KEY": self.keys.alpaca_secret,
+        }
         try:
             for i in range(0, len(tickers), ALPACA_SYMBOLS):
                 chunk = tickers[i : i + ALPACA_SYMBOLS]
-                params = {
-                    "symbols": ",".join(provider_symbol(t) for t in chunk),
-                    "timeframe": "1Day",
-                    "start": start.isoformat(),
-                    "end": end,
-                    "adjustment": adjustment,
-                    "feed": "sip",
-                    "limit": str(ALPACA_PAGE),
-                }
+                ask = {**params, "symbols": ",".join(provider_symbol(t) for t in chunk)}
                 while True:
                     payload = cast(
                         "Mapping[str, object]",
-                        _get(
-                            client, ALPACA_BARS, params, ALPACA_PACE, self.sleep
-                        ).json(),
+                        _get(client, url, ask, headers, self.max_wait).json(),
                     )
-                    pages.append(parse_bars(payload))
+                    yield payload
                     token = payload.get("next_page_token")
                     if not token:
                         break
-                    params = {**params, "page_token": str(token)}
+                    ask = {**ask, "page_token": str(token)}
         finally:
             if self.client is None:
                 client.close()
-        return pd.concat(pages, ignore_index=True) if pages else parse_bars({})
 
 
-@dataclass(frozen=True, slots=True)
-class Overview:
-    """Massive's ticker overview: market cap in ``currency``, NaN where none."""
-
-    market_cap: float
-    currency: str
-    kind: str  # Massive's type: CS (common stock), ETF, ADRC, ...
+def _split_table(pages: Sequence[Mapping[str, object]]) -> pd.DataFrame:
+    rows = [row for page in pages for row in parse_splits(page)]
+    return pd.DataFrame(rows, columns=["ticker", "ex_date", "ratio"])
 
 
-@dataclass(slots=True)
-class Massive:
-    """Reference data, one ticker per request (``/v3/reference/tickers/{t}``)."""
+def parse_splits(payload: Mapping[str, object]) -> list[dict[str, object]]:
+    actions = cast(
+        "Mapping[str, list[Mapping[str, object]]]",
+        payload.get("corporate_actions") or {},
+    )
+    return [
+        {
+            "ticker": app_symbol(str(item["symbol"])),
+            "ex_date": str(item["ex_date"]),
+            "ratio": float(cast("float", item["rate"]))
+            if kind == "stock_dividends"
+            else float(cast("float", item["new_rate"]))
+            / float(cast("float", item["old_rate"])),
+        }
+        for kind in ("forward_splits", "reverse_splits", "stock_dividends")
+        for item in actions.get(kind) or []
+    ]
 
-    keys: Keys
-    client: httpx.Client | None = None
-    sleep: Callable[[float], None] = time.sleep
 
-    def overview(self, ticker: str) -> Overview | None:
-        """``ticker``'s overview; None for a ticker Massive does not know."""
-        client = self.client or httpx.Client(timeout=TIMEOUT)
-        client.headers["Authorization"] = f"Bearer {self.keys.massive}"
-        try:
-            response = _get(
-                client,
-                MASSIVE_TICKER + provider_symbol(ticker),
-                {},
-                MASSIVE_PACE,
-                self.sleep,
-            )
-        except httpx.HTTPStatusError as error:
-            if error.response.status_code == NOT_FOUND:
-                return None
-            raise
-        finally:
-            if self.client is None:
-                client.close()
-        payload = cast("Mapping[str, object]", response.json())
-        result = cast("Mapping[str, object]", payload.get("results") or {})
-        cap = result.get("market_cap")
-        return Overview(
-            float(cap) if isinstance(cap, int | float) and cap > 0 else float("nan"),
-            str(result.get("currency_name") or "").upper(),
-            str(result.get("type") or ""),
-        )
+def parse_cash_dividends(payload: Mapping[str, object]) -> list[dict[str, object]]:
+    actions = cast(
+        "Mapping[str, list[Mapping[str, object]]]",
+        payload.get("corporate_actions") or {},
+    )
+    return [
+        {
+            "ticker": app_symbol(str(item["symbol"])),
+            "ex_date": str(item["ex_date"]),
+            "rate": float(cast("float", item["rate"])),
+        }
+        for item in actions.get("cash_dividends") or []
+    ]

@@ -1,38 +1,8 @@
-"""Well-known investors' 13F holdings from SEC EDGAR, kept under ``data/investors/``.
-
-Like the screener and the portfolio page, this module is an exception to the
-dashboard's data rules (``tests/test_guardrails.py``): it contacts SEC EDGAR
-(``data.sec.gov``, ``www.sec.gov``) and OpenFIGI (``api.openfigi.com``),
-imports ``yfinance`` for sectors, and writes files, all under
-``data/investors/`` in the folder the app runs from. Of the other finagent
-modules it imports only the pure math in ``perf`` and the shared SEC pace
-``sec_pace``; prices come from the
-portfolio page's store (``app.py`` glues the two). Nothing is fetched until
-a ``Fetcher`` thread is started.
-
-Stored files:
-
-- ``investors.json``: CIKs the user added (only once one is added).
-- ``<CIK>/filings.json``: the filer's name and its 13F-HR(/A) filings in the
-  last ``QUARTERS`` reporting periods.
-- ``<CIK>/<accession>.json``: one parsed information table, rows summed per
-  CUSIP. Filings never change, so a saved one is not fetched again.
-- ``cusips.json``: CUSIP → ticker from OpenFIGI, misses included with the
-  date they were tried, so they are retried only after ``MISS_RETRY_DAYS``.
-- ``sectors.json``: ticker → yfinance sector, misses likewise.
-
-Values: filings made on or after ``DOLLARS_FROM`` (the SEC's 2023 Form 13F
-compliance date) report dollars, earlier ones thousands of dollars.
-Amendments: a 13F-HR/A marked RESTATEMENT replaces its quarter, one marked
-NEW HOLDINGS adds to it; one with neither (or no information table) is
-counted but not applied.
-"""
-
-# pandas and yfinance ship no type stubs; JSON from the web is untyped.
 # pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false
 # pyright: reportUnknownVariableType=false, reportUnknownArgumentType=false
 # pyright: reportAny=false, reportExplicitAny=false
 # pyright: reportImplicitStringConcatenation=false
+"""SEC 13F 기관투자자 공시 수집·CUSIP-티커 매핑 및 복제 포트폴리오 백테스트."""
 
 from __future__ import annotations
 
@@ -40,11 +10,10 @@ import json
 import math
 import re
 import threading
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as clock
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Protocol, cast, final
 from xml.etree import ElementTree as ET
 
@@ -52,61 +21,88 @@ import httpx
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-# The guardrail test reads this dotted form as the math module.
-import finagent.perf as perf  # noqa: PLR0402
-from finagent import sec_pace
+import finagent.perf as perf  # noqa: PLR0402  # 도메인 네임스페이스 명시적 참조
+from finagent import layout, limits, memory, sec, yahoo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
+    from pathlib import Path
 
-DATA_DIR: Final = Path("data") / "investors"
-LIST_FILE: Final = "investors.json"
-FILINGS_FILE: Final = "filings.json"
-CUSIP_FILE: Final = "cusips.json"
-SECTOR_FILE: Final = "sectors.json"
-YFINANCE_CACHE: Final = ".yfinance"
+LIST_FILE: Final = layout.USER_DIR / "investors.json"
 AGENT_KEY: Final = "SEC_USER_AGENT"
-SUBMISSIONS_URL: Final = "https://data.sec.gov/submissions/{name}"
-ARCHIVE_URL: Final = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{name}"
+FIGI_KEY: Final = "OPENFIGI_API_KEY"
+FIGI_HEADER: Final = "X-OPENFIGI-APIKEY"
 OPENFIGI_URL: Final = "https://api.openfigi.com/v3/mapping"
 FORMS: Final = ("13F-HR", "13F-HR/A")
-NOTICES: Final = ("13F-NT", "13F-NT/A")  # holdings reported by another manager
+NOTICES: Final = ("13F-NT", "13F-NT/A")
 QUARTERS: Final = 8
-MARKET_CLOSE: Final = clock(16, 0)  # New York; acceptance at or after: next day
-DEADLINE_DAYS: Final = 45  # a 13F is due this long after its quarter end
-STALE_QUARTERS: Final = 2  # periods behind the expected one: 보고 중단
-COVER_SHARE: Final = 0.90  # prices and sectors for the largest holdings up to this
-COVER_MAX: Final = 100  # ... or this many positions per quarter, whichever first
+MARKET_CLOSE: Final = clock(16, 0)
+DEADLINE_DAYS: Final = 45
+STALE_QUARTERS: Final = 2
+COVER_SHARE: Final = 0.90
+COVER_MAX: Final = 100
 DOLLARS_FROM: Final = date(2023, 1, 3)
-FIGI_JOBS: Final = 10  # OpenFIGI without a key: 10 jobs a request
-FIGI_PAUSE: Final = 2.5  # and 25 requests a minute
-FIGI_RETRIES: Final = 3
-FIGI_WAIT: Final = 60.0  # after a 429 without Retry-After
-YAHOO_PAUSE: Final = 0.2
-YAHOO_FAILURES: Final = 5  # sector misses in a row that stop the stage
-MISS_RETRY_DAYS: Final = 30
+FIGI_JOBS: Final = 10
+FIGI_KEYED_JOBS: Final = 100
+YAHOO_FAILURES: Final = 5
 TIMEOUT: Final = 30.0
 NOT_FOUND: Final = 404
-TOO_MANY: Final = 429
-CONVICTION: Final = 10  # holdings in the top-weights clone
+CONVICTION: Final = 10
 UNKNOWN: Final = "미확인"
-EXCLUDED: Final = "미포함"  # outside the covered holdings
+EXCLUDED: Final = "미포함"
 CHANGES: Final = ("신규", "증가", "감소", "유지")
-SOLD: Final = "청산"
 CIK_PATTERN: Final = re.compile(r"\d{1,10}")
 TICKER_PATTERN: Final = re.compile(r"[A-Z0-9][A-Z0-9-]{0,9}")
 OPTION_TYPES: Final = frozenset({"PUT", "CALL"})
+ISIN_LENGTH: Final = 12
+HK_DIGITS: Final = 4
+EXCHANGE_SUFFIX: Final[Mapping[str, tuple[str, str]]] = {
+    "KS": ("KR", ".KS"),
+    "KQ": ("KR", ".KQ"),
+    "TT": ("TW", ".TW"),
+    "JT": ("JP", ".T"),
+    "HK": ("HK", ".HK"),
+    "CG": ("CN", ".SS"),
+    "CS": ("CN", ".SZ"),
+    "IS": ("IN", ".NS"),
+    "LN": ("GB", ".L"),
+    "GY": ("DE", ".DE"),
+    "FP": ("FR", ".PA"),
+    "NA": ("NL", ".AS"),
+    "SE": ("CH", ".SW"),
+    "SM": ("ES", ".MC"),
+    "IM": ("IT", ".MI"),
+    "SS": ("SE", ".ST"),
+    "DC": ("DK", ".CO"),
+    "FH": ("FI", ".HE"),
+    "NO": ("NO", ".OL"),
+    "BB": ("BE", ".BR"),
+    "ID": ("IE", ".IR"),
+    "PL": ("PT", ".LS"),
+    "AV": ("AT", ".VI"),
+    "CT": ("CA", ".TO"),
+    "AT": ("AU", ".AX"),
+    "BS": ("BR", ".SA"),
+    "MM": ("MX", ".MX"),
+    "SP": ("SG", ".SI"),
+    "TB": ("TH", ".BK"),
+    "IJ": ("ID", ".JK"),
+    "MK": ("MY", ".KL"),
+    "PM": ("PH", ".PS"),
+    "AB": ("SA", ".SR"),
+    "IT": ("IL", ".TA"),
+    "SJ": ("ZA", ".JO"),
+}
 
 Amendment = Literal["", "RESTATEMENT", "NEW HOLDINGS", "UNKNOWN"]
 
 
-class InvestorError(ValueError):
-    """A request the page cannot take; the message is shown on the page."""
+class InvestorError(ValueError): ...
 
 
 @dataclass(frozen=True, slots=True)
 class Investor:
-    cik: str  # ten digits
+    cik: str
     name: str
     manager: str = ""
 
@@ -115,9 +111,6 @@ class Investor:
         return f"{self.name} ({self.manager})" if self.manager else self.name
 
 
-# Each CIK was checked on EDGAR (13F-HR filings) on 2026-10-22. Greenlight's
-# 13F-HR moved to DME Capital Management in 2024 (same EDGAR business address
-# and phone as Greenlight Capital Inc); Scion's last is for 2025-09.
 PRESETS: Final = (
     Investor("0001067983", "Berkshire Hathaway", "버핏"),
     Investor("0001336528", "Pershing Square", "애크먼"),
@@ -132,44 +125,34 @@ PRESETS: Final = (
 )
 
 
-# ---------------------------------------------------------------- stored shapes
-
-
 class _Frozen(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
 
 
 class Filing(_Frozen):
-    accession: str  # 0001067983-26-000004
+    accession: str
     form: str
     filed: date
-    period: date  # periodOfReport
-    accepted: datetime | None = None  # EDGAR acceptance, New York wall clock
+    period: date
+    accepted: datetime | None = None
 
 
 class Filer(_Frozen):
-    """``<CIK>/filings.json``."""
-
     cik: str
     name: str
     fetched: datetime
     filings: tuple[Filing, ...] = ()
-    notice: Filing | None = None  # the newest 13F-NT, if any
+    notice: Filing | None = None
 
 
 class Row(_Frozen):
-    """One CUSIP in a filing, its manager rows summed."""
-
     cusip: str
     name: str
-    title: str = ""
     shares: float
-    value: float  # dollars
+    value: float
 
 
 class Table(_Frozen):
-    """``<CIK>/<accession>.json``: one filing's equity rows and what was left out."""
-
     accession: str
     form: str
     filed: date
@@ -179,46 +162,34 @@ class Table(_Frozen):
     rows: tuple[Row, ...] = ()
     options: int = 0
     options_value: float = 0.0
-    principal: int = 0  # rows in principal amount (notes), not shares
+    principal: int = 0
     principal_value: float = 0.0
 
 
 class Link(_Frozen):
-    ticker: str | None  # Yahoo form; None for a miss
-    name: str = ""
-    at: date
+    ticker: str | None
 
 
 class Sector(_Frozen):
     sector: str | None
-    at: date
 
 
 class Added(_Frozen):
-    """``investors.json``."""
-
-    version: int = 1
-    added: tuple[tuple[str, str], ...] = ()  # (cik, name)
-
-
-# ---------------------------------------------------------------- parsing
+    added: tuple[tuple[str, str], ...] = ()
 
 
 def clean_cik(text: str) -> str:
-    """Ten digits; raises ``InvestorError`` otherwise."""
     digits = text.strip().upper().removeprefix("CIK").strip()
     if not CIK_PATTERN.fullmatch(digits) or int(digits) == 0:
-        raise InvestorError("CIK는 숫자 10자리 이내입니다.")
+        raise InvestorError("CIK는 숫자 10자리 이내입니다")
     return digits.zfill(10)
 
 
 def value_unit(filed: date) -> int:
-    """Dollars per reported unit: thousands before ``DOLLARS_FROM``."""
     return 1 if filed >= DOLLARS_FROM else 1000
 
 
 def yahoo_ticker(ticker: str) -> str | None:
-    """OpenFIGI's ``BRK/B`` as Yahoo's ``BRK-B``; None for one Yahoo would not know."""
     text = ticker.strip().upper().replace("/", "-").replace(".", "-")
     return text if TICKER_PATTERN.fullmatch(text) else None
 
@@ -226,7 +197,6 @@ def yahoo_ticker(ticker: str) -> str | None:
 def filings_from(
     arrays: Mapping[str, Any], forms: Sequence[str] = FORMS
 ) -> list[Filing]:
-    """Filings of ``forms`` in a submissions ``recent`` block or page."""
     out: list[Filing] = []
     kinds = cast("list[str]", arrays.get("form", []))
     accepted = cast("list[object]", arrays.get("acceptanceDateTime", []))
@@ -249,10 +219,6 @@ def filings_from(
 
 
 def acceptance(value: object) -> datetime | None:
-    """``2026-08-14T16:05:23.000Z`` as a naive New York time, None if unreadable.
-
-    EDGAR stamps acceptance in Eastern time; the trailing Z is not UTC.
-    """
     text = str(value or "").strip().removesuffix("Z")
     try:
         return datetime.fromisoformat(text).replace(tzinfo=None) if text else None
@@ -261,12 +227,6 @@ def acceptance(value: object) -> datetime | None:
 
 
 def buy_day(filing: Filing) -> date:
-    """The day whose close a follower could first trade at; later days roll on.
-
-    Accepted before the 16:00 New York close: that day. At or after it, or
-    with no acceptance time: the next day. Weekends and holidays roll to the
-    next trading day where the prices are (``rebalanced``).
-    """
     if filing.accepted is None:
         return filing.filed + timedelta(days=1)
     day = filing.accepted.date()
@@ -279,12 +239,10 @@ def buy_days(filer: Filer | None) -> dict[str, date]:
 
 
 def untimed(filer: Filer | None) -> int:
-    """Kept filings without an acceptance time (bought the next day)."""
     return sum(f.accepted is None for f in filer.filings) if filer else 0
 
 
 def notice(filer: Filer | None) -> Filing | None:
-    """The newest 13F-NT when it is newer than the newest 13F-HR."""
     if filer is None or filer.notice is None:
         return None
     last = max((f.filed for f in filer.filings), default=None)
@@ -292,14 +250,12 @@ def notice(filer: Filer | None) -> Filing | None:
 
 
 def _quarter_end(day: date) -> date:
-    """The last quarter end on or before ``day``."""
     ends = [date(day.year, m, d) for m, d in ((3, 31), (6, 30), (9, 30), (12, 31))]
     past = [end for end in ends if end <= day]
     return past[-1] if past else date(day.year - 1, 12, 31)
 
 
 def expected_period(today: date) -> date:
-    """The newest quarter end whose 13F deadline has passed."""
     end = _quarter_end(today)
     while end + timedelta(days=DEADLINE_DAYS) > today:
         end = _quarter_end(end - timedelta(days=1))
@@ -311,7 +267,6 @@ def _index(day: date) -> int:
 
 
 def stale(filer: Filer | None, today: date) -> date | None:
-    """The last reported period when it is ``STALE_QUARTERS`` or more behind."""
     if filer is None or not filer.filings:
         return None
     last = max(f.period for f in filer.filings)
@@ -324,7 +279,6 @@ def recent_periods(filings: Iterable[Filing], quarters: int = QUARTERS) -> list[
 
 
 def kept(filings: Iterable[Filing], quarters: int = QUARTERS) -> list[Filing]:
-    """Every filing for the newest ``quarters`` periods, oldest first."""
     filings = list(filings)
     periods = set(recent_periods(filings, quarters))
     unique = {f.accession: f for f in filings if f.period in periods}
@@ -336,7 +290,6 @@ def _local(tag: str) -> str:
 
 
 def _parse(text: str) -> ET.Element:
-    # SEC documents; expat refuses entity expansion attacks since 2.4.1.
     return ET.fromstring(text.encode("utf-8"))  # noqa: S314
 
 
@@ -365,7 +318,6 @@ class Parsed:
 
 
 def parse_table(text: str, filed: date) -> Parsed:
-    """Equity rows summed per CUSIP, in dollars; options and notes counted apart."""
     unit = value_unit(filed)
     sums: dict[str, dict[str, Any]] = {}
     options = principal = 0
@@ -394,7 +346,6 @@ def parse_table(text: str, filed: date) -> Parsed:
             {
                 "cusip": cusip,
                 "name": _text(_child(entry, "nameOfIssuer")),
-                "title": _text(_child(entry, "titleOfClass")),
                 "shares": 0.0,
                 "value": 0.0,
             },
@@ -408,7 +359,6 @@ def parse_table(text: str, filed: date) -> Parsed:
 
 
 def parse_amendment(text: str) -> Amendment:
-    """RESTATEMENT or NEW HOLDINGS from a 13F-HR/A cover page, else UNKNOWN."""
     try:
         root = _parse(text)
     except ET.ParseError:
@@ -423,7 +373,6 @@ def parse_amendment(text: str) -> Amendment:
 
 
 def table_files(index: Mapping[str, Any]) -> list[str]:
-    """XML documents in a filing's ``index.json`` that may be the info table."""
     items = cast("list[dict[str, Any]]", index.get("directory", {}).get("item", []))
     names = [
         (str(i.get("name", "")), float(i.get("size") or 0))
@@ -435,40 +384,57 @@ def table_files(index: Mapping[str, Any]) -> list[str]:
     return [name for name, _ in names]
 
 
-def pick_ticker(result: Mapping[str, Any]) -> tuple[str | None, str] | None:
-    """(ticker, name) from one OpenFIGI job; None when it errored (retry later)."""
+def _equity(result: Mapping[str, Any]) -> list[dict[str, Any]] | None:
     if "error" in result and "data" not in result:
         message = str(result["error"]).lower()
-        return (None, "") if "no identifier" in message else None
+        return [] if "no identifier" in message else None
     data = cast("list[dict[str, Any]]", result.get("data") or [])
-    equity = [d for d in data if d.get("marketSector") == "Equity"] or data
+    return [d for d in data if d.get("marketSector") == "Equity"] or data
+
+
+def pick_ticker(result: Mapping[str, Any]) -> str | None:
+    equity = _equity(result)
+    if equity is None:
+        return None
     for item in equity:
         ticker = yahoo_ticker(str(item.get("ticker") or ""))
         if ticker:
-            return ticker, str(item.get("name") or "")
-    return None, ""
+            return ticker
+    return ""
 
 
-# ---------------------------------------------------------------- storage
-
-
-def _write(path: Path, text: str) -> None:
-    """Write next to ``path`` and rename, so readers never see half a file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f"{path.name}.tmp")
-    _ = temp.write_text(text, encoding="utf-8")
-    _ = temp.replace(path)
-
-
-def _read_json(path: Path) -> object:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+def pick_listing(isin: str, result: Mapping[str, Any]) -> str | None:
+    equity = _equity(result)
+    if equity is None:
         return None
+    for item in equity:
+        code = str(item.get("exchCode") or "").split(" ", 1)[0]
+        found = EXCHANGE_SUFFIX.get(code)
+        symbol = str(item.get("ticker") or "").strip().upper()
+        if found is None or found[0] != isin[:2] or not symbol:
+            continue
+        if code == "HK":
+            symbol = symbol.zfill(HK_DIGITS)
+        return f"{symbol}{found[1]}"
+    return ""
+
+
+def figi_job(code: str) -> dict[str, str]:
+    if len(code) != ISIN_LENGTH:
+        return {"idType": "ID_CUSIP", "idValue": code, "exchCode": "US"}
+    if code.startswith("US"):
+        return {"idType": "ID_ISIN", "idValue": code, "exchCode": "US"}
+    return {"idType": "ID_ISIN", "idValue": code}
+
+
+def _picked(code: str, result: Mapping[str, Any]) -> str | None:
+    if len(code) == ISIN_LENGTH and not code.startswith("US"):
+        return pick_listing(code, result)
+    return pick_ticker(result)
 
 
 def save_model(path: Path, model: BaseModel) -> None:
-    _write(path, model.model_dump_json(indent=1) + "\n")
+    layout.write_text(path, model.model_dump_json(indent=1) + "\n")
 
 
 def load_added(root: Path) -> Added:
@@ -482,7 +448,6 @@ def load_added(root: Path) -> Added:
 
 
 def roster(root: Path) -> list[Investor]:
-    """The presets, then the CIKs the user added."""
     known = {i.cik for i in PRESETS}
     extra = [Investor(c, n) for c, n in load_added(root).added if c not in known]
     return [*PRESETS, *extra]
@@ -495,100 +460,49 @@ def add_investor(root: Path, cik: str, name: str) -> None:
     save_model(root / LIST_FILE, Added(added=(*old.added, (cik, name))))
 
 
-def folder(root: Path, cik: str) -> Path:
-    return root / cik
+def remove_investor(root: Path, cik: str) -> None:
+    kept_rows = tuple(row for row in load_added(root).added if row[0] != cik)
+    save_model(root / LIST_FILE, Added(added=kept_rows))
 
 
-def load_filer(root: Path, cik: str) -> Filer | None:
-    path = folder(root, cik) / FILINGS_FILE
-    if not path.is_file():
-        return None
-    try:
-        return Filer.model_validate_json(path.read_bytes())
-    except (OSError, ValidationError):
-        return None
+def load_filer(cik: str) -> Filer | None:
+    return memory.current().filers.get(cik)
 
 
-def load_tables(root: Path, filer: Filer) -> list[Table]:
-    """Saved tables of the filer's kept filings, oldest filing first."""
-    out: list[Table] = []
-    for filing in filer.filings:
-        path = folder(root, filer.cik) / f"{filing.accession}.json"
-        if not path.is_file():
-            continue
-        try:
-            out.append(Table.model_validate_json(path.read_bytes()))
-        except (OSError, ValidationError):
-            continue
-    return out
+def load_tables(filer: Filer) -> list[Table]:
+    saved = memory.current().filings
+    return [t for f in filer.filings if (t := saved.get(f.accession)) is not None]
 
 
-def load_cusips(root: Path) -> dict[str, Link]:
-    raw = _read_json(root / CUSIP_FILE)
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, Link] = {}
-    for key, value in cast("dict[str, object]", raw).items():
-        try:
-            out[key] = Link.model_validate(value)
-        except ValidationError:
-            continue
-    return out
+def load_cusips() -> dict[str, Link]:
+    return memory.current().cusips.rows()
 
 
-def save_cusips(root: Path, cache: Mapping[str, Link]) -> None:
-    body = {k: v.model_dump(mode="json") for k, v in sorted(cache.items())}
-    _write(root / CUSIP_FILE, json.dumps(body, ensure_ascii=False, indent=0) + "\n")
+def save_cusips(cache: Mapping[str, Link]) -> None:
+    memory.current().cusips.update(cache)
 
 
-def load_sectors(root: Path) -> dict[str, Sector]:
-    raw = _read_json(root / SECTOR_FILE)
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, Sector] = {}
-    for key, value in cast("dict[str, object]", raw).items():
-        try:
-            out[key] = Sector.model_validate(value)
-        except ValidationError:
-            continue
-    return out
+def load_sectors() -> dict[str, Sector]:
+    return memory.current().sectors.rows()
 
 
-def save_sectors(root: Path, cache: Mapping[str, Sector]) -> None:
-    body = {k: v.model_dump(mode="json") for k, v in sorted(cache.items())}
-    _write(root / SECTOR_FILE, json.dumps(body, ensure_ascii=False, indent=0) + "\n")
-
-
-def due(at: date | None, hit: bool, today: date) -> bool:
-    """A cache entry to fetch: none yet, or a miss older than ``MISS_RETRY_DAYS``."""
-    if at is None:
-        return True
-    return not hit and (today - at).days >= MISS_RETRY_DAYS
-
-
-def stamp(root: Path, cik: str) -> tuple[tuple[str, int], ...]:
-    """Modification times of everything the investor view reads."""
-    paths = [root / CUSIP_FILE, root / SECTOR_FILE]
-    if folder(root, cik).is_dir():
-        paths += sorted(folder(root, cik).glob("*.json"))
-    return tuple((p.name, p.stat().st_mtime_ns) for p in paths if p.is_file())
-
-
-# ---------------------------------------------------------------- quarters
+def stamp() -> tuple[int, ...]:
+    found = memory.current()
+    tables = (found.filers, found.filings, found.cusips, found.sectors)
+    return tuple(table.version for table in tables)
 
 
 @dataclass(frozen=True, slots=True)
 class Quarter:
     period: date
-    filed: date  # the first filing for the period
-    rows: tuple[Row, ...]  # after the amendments
-    amended: tuple[date, ...]  # amendments applied
-    ignored: int  # amendments of unknown type or without a table
+    filed: date
+    rows: tuple[Row, ...]
+    amended: tuple[date, ...]
+    ignored: int
     options: int
     options_value: float
     principal: int
     principal_value: float
-    # holdings after each filing: (accession, filed, rows)
     versions: tuple[tuple[str, date, tuple[Row, ...]], ...]
 
     @property
@@ -611,7 +525,6 @@ def _add(rows: Iterable[Row], more: Iterable[Row]) -> tuple[Row, ...]:
 
 
 def quarters(tables: Iterable[Table]) -> list[Quarter]:
-    """Each period's holdings after its amendments, newest period first."""
     by: dict[date, list[Table]] = {}
     for t in tables:
         by.setdefault(t.period, []).append(t)
@@ -631,7 +544,7 @@ def quarters(tables: Iterable[Table]) -> list[Quarter]:
             if original or t.amendment == "RESTATEMENT":
                 rows = t.rows
                 counts = [t.options, t.options_value, t.principal, t.principal_value]
-            else:  # NEW HOLDINGS
+            else:
                 rows = _add(rows, t.rows)
                 counts = [
                     counts[0] + t.options,
@@ -664,7 +577,6 @@ def quarters(tables: Iterable[Table]) -> list[Quarter]:
 def weights(
     rows: Iterable[Row], cusips: Mapping[str, Link], total: float | None = None
 ) -> pd.Series:
-    """Ticker → share of ``total`` (by default the rows' value); unmapped left out."""
     rows = list(rows)
     total = sum(r.value for r in rows) if total is None else total
     out: dict[str, float] = {}
@@ -677,24 +589,23 @@ def weights(
     return pd.Series(out, dtype="float64").sort_values(ascending=False)
 
 
-def covered(rows: Sequence[Row]) -> tuple[Row, ...]:
-    """The largest holdings up to ``COVER_SHARE`` of the value or ``COVER_MAX``.
-
-    Only these get prices and sectors; the rest are 미포함.
-    """
-    total = sum(r.value for r in rows)
-    out: list[Row] = []
+def cover[T](ranked: Sequence[T], size: Callable[[T], float]) -> tuple[T, ...]:
+    total = sum(size(item) for item in ranked)
+    out: list[T] = []
     held = 0.0
-    for r in sorted(rows, key=lambda r: (-r.value, r.cusip)):
+    for item in ranked:
         if len(out) >= COVER_MAX or (total > 0 and held >= COVER_SHARE * total):
             break
-        out.append(r)
-        held += r.value
+        out.append(item)
+        held += size(item)
     return tuple(out)
 
 
+def covered(rows: Sequence[Row]) -> tuple[Row, ...]:
+    return cover(sorted(rows, key=lambda r: (-r.value, r.cusip)), lambda r: r.value)
+
+
 def excluded_share(rows: Sequence[Row]) -> float:
-    """Share of the value outside ``covered``: 미포함 비중."""
     total = sum(r.value for r in rows)
     if total <= 0:
         return math.nan
@@ -702,7 +613,6 @@ def excluded_share(rows: Sequence[Row]) -> float:
 
 
 def analysis_weights(rows: Sequence[Row], cusips: Mapping[str, Link]) -> pd.Series:
-    """Covered, mapped holdings as shares of the whole reported value."""
     return weights(covered(rows), cusips, total=sum(r.value for r in rows))
 
 
@@ -711,12 +621,6 @@ def filed_schedule(
     cusips: Mapping[str, Link],
     days: Mapping[str, date],
 ) -> list[tuple[date, pd.Series]]:
-    """Weights as a follower knew them, from each filing's ``buy_day``.
-
-    ``days`` maps accessions to buy days; one missing is bought the day after
-    filing. A filing for an older period than one already public (a late
-    amendment) is left out, so the newest quarter is never replaced.
-    """
     events = sorted(
         (
             (days.get(accession, filed + timedelta(days=1)), q.period, rows)
@@ -738,7 +642,6 @@ def filed_schedule(
 def period_schedule(
     found: Sequence[Quarter], cusips: Mapping[str, Link]
 ) -> list[tuple[date, pd.Series]]:
-    """Final weights from each quarter end: theoretical, no filing delay."""
     return [
         (q.period, analysis_weights(q.rows, cusips)) for q in sorted(found, key=_period)
     ]
@@ -750,7 +653,6 @@ def top_schedule(
     *,
     equal: bool = False,
 ) -> list[tuple[date, pd.Series]]:
-    """Each set cut to its ``n`` largest weights (``perf.top_weights``), same days."""
     return [
         (day, perf.top_weights(w, n, equal=equal) if not w.empty else w)
         for day, w in schedule
@@ -762,7 +664,6 @@ def _period(q: Quarter) -> date:
 
 
 def change_labels(now: Quarter, before: Quarter | None) -> dict[str, str]:
-    """CUSIP → 신규, 증가, 감소 or 유지 by shares against the previous quarter."""
     if before is None:
         return {}
     old = {r.cusip: r.shares for r in before.rows}
@@ -780,22 +681,10 @@ def change_labels(now: Quarter, before: Quarter | None) -> dict[str, str]:
 
 
 def sold_out(now: Quarter, before: Quarter | None) -> list[Row]:
-    """Rows of the previous quarter that are gone now."""
     if before is None:
         return []
     held = {r.cusip for r in now.rows}
     return [r for r in before.rows if r.cusip not in held]
-
-
-def unmapped_share(rows: Iterable[Row], cusips: Mapping[str, Link]) -> float:
-    rows = list(rows)
-    total = sum(r.value for r in rows)
-    if total <= 0:
-        return math.nan
-    lost = sum(
-        r.value for r in rows if not (r.cusip in cusips and cusips[r.cusip].ticker)
-    )
-    return lost / total
 
 
 def top_share(rows: Sequence[Row], count: int = 10) -> float:
@@ -811,7 +700,6 @@ def holdings_frame(
     cusips: Mapping[str, Link],
     sectors: Mapping[str, Sector],
 ) -> pd.DataFrame:
-    """One row per CUSIP: ticker (or empty), name, sector, shares, value, weight."""
     labels = change_labels(q, before)
     total = q.value
     inside = {r.cusip for r in covered(q.rows)}
@@ -820,9 +708,10 @@ def holdings_frame(
         hit = cusips.get(r.cusip)
         ticker = hit.ticker if hit is not None and hit.ticker else ""
         found = sectors.get(ticker) if ticker else None
-        sector = found.sector if found and found.sector else None
-        if sector is None:
-            sector = UNKNOWN if r.cusip in inside else EXCLUDED
+        if r.cusip not in inside:
+            sector = EXCLUDED
+        else:
+            sector = found.sector if found and found.sector else UNKNOWN
         rows.append(
             {
                 "ticker": ticker,
@@ -848,7 +737,6 @@ def sector_weights(frame: pd.DataFrame) -> pd.Series:
 
 
 def weight_history(found: Sequence[Quarter], cusip: str) -> list[tuple[date, float]]:
-    """The CUSIP's weight in each quarter, oldest first (0 when not held)."""
     out: list[tuple[date, float]] = []
     for q in sorted(found, key=_period):
         total = q.value
@@ -858,7 +746,6 @@ def weight_history(found: Sequence[Quarter], cusip: str) -> list[tuple[date, flo
 
 
 def overlap(theirs: pd.Series, mine: pd.Series) -> list[tuple[str, float, float]]:
-    """Tickers in both with each side's weight, largest combined first."""
     common = set(map(str, theirs.index)) & set(map(str, mine.index))
     rows = [(t, _at(theirs, t), _at(mine, t)) for t in common]
     return sorted(rows, key=lambda it: (-(it[1] + it[2]), it[0]))
@@ -869,7 +756,6 @@ def _at(series: pd.Series, key: str) -> float:
 
 
 def tickers(found: Iterable[Quarter], cusips: Mapping[str, Link]) -> list[str]:
-    """Every mapped ticker among each quarter's ``covered`` holdings."""
     out = {
         cusips[r.cusip].ticker
         for q in found
@@ -879,35 +765,25 @@ def tickers(found: Iterable[Quarter], cusips: Mapping[str, Link]) -> list[str]:
     return sorted(t for t in out if t)
 
 
-# ---------------------------------------------------------------- fetching
-
-
 class Source(Protocol):
-    def sec(self, url: str) -> str:
-        """The body of an SEC URL; raises on an HTTP error."""
-        ...
+    def sec(self, url: str) -> str: ...
 
-    def figi(self, jobs: Sequence[Mapping[str, str]]) -> list[dict[str, Any]]:
-        """One OpenFIGI mapping request."""
-        ...
+    def figi(self, jobs: Sequence[Mapping[str, str]]) -> list[dict[str, Any]]: ...
 
-    def sector(self, ticker: str) -> str | None:
-        """The yfinance sector ("ETF" for funds), None when there is none."""
-        ...
+    def sector(self, ticker: str) -> str | None: ...
 
 
 type Report = Callable[[str, int, int], None]
 
 
 def submissions(source: Source, cik: str) -> dict[str, Any]:
-    raw = json.loads(source.sec(SUBMISSIONS_URL.format(name=f"CIK{cik}.json")))
+    raw = json.loads(source.sec(sec.submissions_url(f"CIK{cik}.json")))
     return cast("dict[str, Any]", raw) if isinstance(raw, dict) else {}
 
 
 def filer_filings(
     source: Source, cik: str, quarters: int = QUARTERS
 ) -> tuple[str, list[Filing], Filing | None]:
-    """The name, 13F-HR(/A) filings (older pages if needed), newest 13F-NT."""
     body = submissions(source, cik)
     name = str(body.get("name") or cik)
     history = cast("dict[str, Any]", body.get("filings") or {})
@@ -918,29 +794,26 @@ def filer_filings(
     pages = cast("list[dict[str, Any]]", history.get("files") or [])
     for page in pages:
         if len(recent_periods(found, quarters + 1)) > quarters:
-            break  # one more period than kept: no later amendment is missed
-        raw = json.loads(source.sec(SUBMISSIONS_URL.format(name=page["name"])))
+            break
+        raw = json.loads(source.sec(sec.submissions_url(page["name"])))
         found += filings_from(cast("dict[str, Any]", raw))
     return name, found, newest
 
 
 def check(source: Source, cik: str) -> str:
-    """The filer's name; raises ``InvestorError`` if it has filed no 13F-HR."""
     try:
         name, found, _ = filer_filings(source, cik, quarters=1)
     except httpx.HTTPStatusError as error:
         if error.response.status_code == NOT_FOUND:
-            raise InvestorError("EDGAR에 없는 CIK입니다.") from error
+            raise InvestorError("EDGAR에 없는 CIK입니다") from error
         raise
     if not found:
-        raise InvestorError(f"{name}: 13F-HR 제출 기록이 없습니다.")
+        raise InvestorError(f"{name}: 13F-HR 제출 기록이 없습니다")
     return name
 
 
 def fetch_table(source: Source, cik: str, filing: Filing) -> Table:
-    """One filing's information table (and amendment type) from the archive."""
-    folder_name = filing.accession.replace("-", "")
-    url = partial_url(cik, folder_name)
+    url = partial_url(cik, filing.accession)
     index = json.loads(source.sec(url("index.json")))
     amendment: Amendment = ""
     if filing.form != "13F-HR":
@@ -971,116 +844,88 @@ def fetch_table(source: Source, cik: str, filing: Filing) -> Table:
     return head
 
 
-def partial_url(cik: str, folder_name: str) -> Callable[[str], str]:
+def partial_url(cik: str, accession: str) -> Callable[[str], str]:
     def url(name: str) -> str:
-        return ARCHIVE_URL.format(cik=int(cik), folder=folder_name, name=name)
+        return sec.archive_url(cik, accession, name)
 
     return url
 
 
-def map_cusips(  # noqa: PLR0913 - one stage's inputs
-    source: Source,
-    root: Path,
-    cusips: Sequence[str],
-    today: date,
-    report: Report,
-    sleep: Callable[[float], None],
-) -> int:
-    """Map the due CUSIPs, saving after each request; returns how many were asked."""
-    cache = load_cusips(root)
-    todo = [
-        c
-        for c in dict.fromkeys(cusips)
-        if due(
-            cache[c].at if c in cache else None,
-            c in cache and cache[c].ticker is not None,
-            today,
-        )
-    ]
-    for i in range(0, len(todo), FIGI_JOBS):
+_figi_key = ""
+
+
+def set_figi_key(key: str) -> None:
+    global _figi_key  # noqa: PLW0603
+    _figi_key = key
+
+
+def map_cusips(source: Source, cusips: Sequence[str], report: Report) -> int:
+    cache = load_cusips()
+    todo = [c for c in dict.fromkeys(cusips) if c not in cache]
+    size = FIGI_KEYED_JOBS if _figi_key else FIGI_JOBS
+    for i in range(0, len(todo), size):
         report("티커 연결", i, len(todo))
-        batch = todo[i : i + FIGI_JOBS]
-        jobs = [{"idType": "ID_CUSIP", "idValue": c, "exchCode": "US"} for c in batch]
-        results = source.figi(jobs)
+        batch = todo[i : i + size]
+        results = source.figi([figi_job(c) for c in batch])
         for cusip, result in zip(batch, results, strict=False):
-            picked = pick_ticker(result)
+            picked = _picked(cusip, result)
             if picked is not None:
-                cache[cusip] = Link(ticker=picked[0], name=picked[1], at=today)
-        save_cusips(root, cache)
-        if i + FIGI_JOBS < len(todo):
-            sleep(FIGI_PAUSE)
+                cache[cusip] = Link(ticker=picked or None)
+        save_cusips(cache)
     return len(todo)
 
 
-def fetch_sectors(  # noqa: PLR0913 - one stage's inputs
-    source: Source,
-    root: Path,
-    names: Sequence[str],
-    today: date,
-    report: Report,
-    sleep: Callable[[float], None],
-) -> int:
-    """Fetch the due sectors, saving as it goes; returns the tickers not answered."""
-    cache = load_sectors(root)
-    todo = [
-        t
-        for t in dict.fromkeys(names)
-        if due(
-            cache[t].at if t in cache else None,
-            t in cache and cache[t].sector is not None,
-            today,
-        )
-    ]
+def fetch_sectors(source: Source, names: Sequence[str], report: Report) -> int:
+    cache = load_sectors()
+    todo = [t for t in dict.fromkeys(names) if t not in cache]
+    table = memory.current().sectors
+    fresh: dict[str, Sector] = {}
     failed = streak = 0
-    for i, ticker in enumerate(todo):
-        report("섹터", i, len(todo))
-        try:
-            cache[ticker] = Sector(sector=source.sector(ticker), at=today)
-            streak = 0
-        except Exception:  # noqa: BLE001 - left for the next update
-            failed += 1
-            streak += 1
-            if streak >= YAHOO_FAILURES:
-                failed += len(todo) - i - 1
-                break
-        if i % 20 == 19 or i == len(todo) - 1:  # noqa: PLR2004 - save every 20
-            save_sectors(root, cache)
-        sleep(YAHOO_PAUSE)
+    with ThreadPoolExecutor(yahoo.WORKERS) as pool:
+        jobs = {pool.submit(source.sector, ticker): ticker for ticker in todo}
+        for i, job in enumerate(as_completed(jobs)):
+            report("섹터", i, len(todo))
+            try:
+                fresh[jobs[job]] = Sector(sector=job.result())
+                streak = 0
+            except Exception:  # noqa: BLE001
+                failed += 1
+                streak += 1
+                if streak == YAHOO_FAILURES:
+                    for other in jobs:
+                        _ = other.cancel()
+            if i % 20 == 19:  # noqa: PLR2004
+                table.update(fresh)
     if todo:
-        save_sectors(root, cache)
+        table.update(fresh)
     return failed
 
 
-def update(  # noqa: PLR0913 - one investor's inputs
+def update(
     source: Source,
-    root: Path,
     cik: str,
     now: datetime,
     report: Report,
-    sleep: Callable[[float], None] = time.sleep,
 ) -> str:
-    """Fetch the investor's new filings, their tickers and sectors; one-line summary."""
     report("제출 목록", 0, 0)
     name, found, newest = filer_filings(source, cik)
     keep = kept(found)
-    save_model(
-        folder(root, cik) / FILINGS_FILE,
-        Filer(cik=cik, name=name, fetched=now, filings=tuple(keep), notice=newest),
+    memory.current().filers.put(
+        cik, Filer(cik=cik, name=name, fetched=now, filings=tuple(keep), notice=newest)
     )
-    new = [f for f in keep if not (folder(root, cik) / f"{f.accession}.json").is_file()]
+    new = [f for f in keep if memory.current().filings.get(f.accession) is None]
     for i, filing in enumerate(new):
         report("13F 문서", i, len(new))
-        table = fetch_table(source, cik, filing)
-        save_model(folder(root, cik) / f"{filing.accession}.json", table)
-    filer = load_filer(root, cik)
-    tables = load_tables(root, filer) if filer is not None else []
+        memory.current().filings.put(filing.accession, fetch_table(source, cik, filing))
+    filer = load_filer(cik)
+    tables = load_tables(filer) if filer is not None else []
     cusips = [r.cusip for t in tables for r in t.rows]
-    asked = map_cusips(source, root, cusips, now.date(), report, sleep)
-    mapping = load_cusips(root)
+    asked = map_cusips(source, cusips, report)
+    mapping = load_cusips()
     names = tickers(quarters(tables), mapping)
-    missed = fetch_sectors(source, root, names, now.date(), report, sleep)
+    missed = fetch_sectors(source, names, report)
     linked = len({c for c in cusips if c in mapping and mapping[c].ticker})
-    note = f" · 섹터 받지 못함 {missed}" if missed else ""
+    note = f" · 섹터 미수신 {missed}" if missed else ""
     return (
         f"{name} · {len(recent_periods(keep))}개 분기 · 새 문서 {len(new)}"
         f" · CUSIP 조회 {asked} · 티커 연결 {linked}/{len(set(cusips))}{note}"
@@ -1089,46 +934,27 @@ def update(  # noqa: PLR0913 - one investor's inputs
 
 @final
 class Web:
-    """The real source: SEC with the user's User-Agent, OpenFIGI, yfinance."""
-
-    def __init__(
-        self, agent: str, root: Path, sleep: Callable[[float], None] = time.sleep
-    ) -> None:
-        """``agent`` goes to the SEC only; yfinance's caches go under ``root``."""
-        self._sec = httpx.Client(
-            headers={"User-Agent": agent, "Accept-Encoding": "gzip, deflate"},
-            timeout=TIMEOUT,
-            follow_redirects=True,
-        )
-        self._figi = httpx.Client(timeout=TIMEOUT)
-        self._root = root
-        self._sleep = sleep
-        self._yahoo = False
+    def __init__(self, agent: str) -> None:
+        self._sec = sec.Client(agent)
+        headers = {FIGI_HEADER: _figi_key} if _figi_key else {}
+        self._figi = httpx.Client(timeout=TIMEOUT, headers=headers)
 
     def sec(self, url: str) -> str:
-        sec_pace.wait(self._sleep)
-        response = self._sec.get(url)
-        _ = response.raise_for_status()
-        return response.text
+        return self._sec.text(url)
 
     def figi(self, jobs: Sequence[Mapping[str, str]]) -> list[dict[str, Any]]:
-        for _ in range(FIGI_RETRIES):
-            response = self._figi.post(OPENFIGI_URL, json=list(jobs))
-            if response.status_code != TOO_MANY:
-                _ = response.raise_for_status()
-                return cast("list[dict[str, Any]]", response.json())
-            wait = response.headers.get("retry-after", "")
-            self._sleep(float(wait) if wait.isdigit() else FIGI_WAIT)
-        raise InvestorError("OpenFIGI가 요청을 제한했습니다. 잠시 뒤 다시 갱신하세요.")
+        try:
+            response = limits.send(
+                "OPENFIGI", lambda: self._figi.post(OPENFIGI_URL, json=list(jobs))
+            )
+        except limits.LimitReached as error:
+            message = "OpenFIGI 요청 한도 초과: 잠시 후 재시도 필요"
+            raise InvestorError(message) from error
+        _ = response.raise_for_status()
+        return cast("list[dict[str, Any]]", response.json())
 
     def sector(self, ticker: str) -> str | None:
-        import yfinance as yf  # noqa: PLC0415 - optional dependency
-
-        if not self._yahoo:
-            self._root.mkdir(parents=True, exist_ok=True)
-            yf.set_tz_cache_location(str(self._root / YFINANCE_CACHE))
-            self._yahoo = True
-        info = cast("Mapping[str, object]", yf.Ticker(ticker).info or {})
+        info = yahoo.info(ticker)
         sector = info.get("sector")
         if isinstance(sector, str) and sector:
             return sector
@@ -1150,33 +976,11 @@ class Progress:
     failed: bool = False
 
 
-type Build = Callable[[str, Path], Source]
-
-
-def _web(agent: str, root: Path) -> Source:
-    return Web(agent, root)
-
-
 @final
 class Fetcher:
-    """Fetches one investor at a time in a background thread; pages poll ``progress``.
+    __slots__ = ("_lock", "_progress", "_tried")
 
-    A CIK started once is not started again on its own; the header's 갱신
-    button fetches it again.
-    """
-
-    __slots__ = ("_build", "_lock", "_progress", "_sleep", "_tried", "root")
-
-    def __init__(
-        self,
-        root: Path,
-        build: Build = _web,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        """Save under ``root``; ``build`` makes the source from the User-Agent."""
-        self.root = root
-        self._build = build
-        self._sleep = sleep
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._progress = Progress()
         self._tried: set[str] = set()
@@ -1191,7 +995,6 @@ class Fetcher:
             return cik in self._tried
 
     def start(self, cik: str, agent: str) -> bool:
-        """Fetch ``cik`` unless a fetch is running or there is no User-Agent."""
         with self._lock:
             if self._progress.running or not agent.strip():
                 return False
@@ -1206,14 +1009,14 @@ class Fetcher:
         return True
 
     def check(self, cik: str, agent: str) -> str:
-        """The filer's name, in the calling thread; raises ``InvestorError``."""
         if not agent.strip():
-            raise InvestorError(f"`.env`에 {AGENT_KEY}를 넣으세요.")
-        source = self._build(agent.strip(), self.root)
+            raise InvestorError(f"`.env` 내 {AGENT_KEY} 미설정")
+        source: Web | None = None
         try:
+            source = Web(agent.strip())
             return check(source, cik)
-        except httpx.HTTPError as error:
-            raise InvestorError(f"EDGAR에 묻지 못했습니다: {error}") from error
+        except (httpx.HTTPError, UnicodeEncodeError) as error:
+            raise InvestorError(f"EDGAR 공시 서버 조회 실패: {error}") from error
         finally:
             _close(source)
 
@@ -1224,18 +1027,17 @@ class Fetcher:
             )
 
     def _run(self, cik: str, agent: str) -> None:
-        source = self._build(agent, self.root)
+        source: Web | None = None
         try:
+            source = Web(agent)
             message = update(
                 source,
-                self.root,
                 cik,
                 datetime.now().astimezone(),
                 lambda s, d, t: self._report(cik, s, d, t),
-                self._sleep,
             )
-        except Exception as error:  # noqa: BLE001 - shown on the page, not lost
-            self._finish(cik, f"받지 못했습니다: {type(error).__name__}: {error}")
+        except Exception as error:  # noqa: BLE001  # 백그라운드 스레드 최상위 예외 포착
+            self._finish(cik, f"수신 실패: {type(error).__name__}: {error}")
         else:
             self._finish(cik, message, failed=False)
         finally:
@@ -1246,17 +1048,12 @@ class Fetcher:
             self._progress = Progress(cik=cik, message=message, failed=failed)
 
 
-def _close(source: Source) -> None:
-    close = getattr(source, "close", None)
-    if callable(close):
-        _ = close()
-
-
-# ---------------------------------------------------------------- text
+def _close(source: Web | None) -> None:
+    if source is not None:
+        source.close()
 
 
 def dollars(value: float) -> str:
-    """Dollars in B/M above a million."""
     if not math.isfinite(value):
         return UNKNOWN
     for size, unit in ((1e9, "B"), (1e6, "M")):
@@ -1266,7 +1063,6 @@ def dollars(value: float) -> str:
 
 
 def latest(filer: Filer | None) -> Filing | None:
-    """The newest period's first filing."""
     if filer is None or not filer.filings:
         return None
     period = max(f.period for f in filer.filings)

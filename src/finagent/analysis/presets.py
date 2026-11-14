@@ -1,52 +1,23 @@
-"""Starting points for the analysis box.
-
-A preset starts a run with its text. ``panels`` are deep panels fetched for
-that run only (the saved view does not change).
-The texts live in ``text/preset_<id>.txt``.
-"""
+"""매크로·종목·ETF 정밀 분석 프리셋 정의 및 프롬프트 로더."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from importlib.resources import files
-from typing import Final
+from typing import Final, Literal
 
-TEXT: Final = files("finagent.analysis") / "text"
+from finagent.analysis import prompt
 
 
 @dataclass(frozen=True, slots=True)
 class Preset:
-    id: str
+    id: Literal["macro", "stock", "etf"]
     title: str
-    panels: tuple[str, ...] = ()
 
     @property
     def text(self) -> str:
-        return (TEXT / f"preset_{self.id}.txt").read_text(encoding="utf-8").strip()
+        return prompt.text(f"preset_{self.id}.txt")
 
 
-PRESETS: Final = (
-    Preset(
-        "macro",
-        "매크로 분석",
-        (
-            "growth",
-            "labor",
-            "cycle",
-            "inflation",
-            "rates",
-            "fincon",
-            "liquidity",
-            "household",
-            "korea",
-            "korea_real",
-            "euro",
-            "global",
-            "markets",
-            "commodities",
-            "credit",
-            "housing",
-        ),
-    ),
-)
-PRESET_BY_ID: Final = {preset.id: preset for preset in PRESETS}
+MACRO: Final = Preset("macro", "매크로 분석")
+STOCK: Final = Preset("stock", "종목 분석")
+ETF: Final = Preset("etf", "ETF 분석")

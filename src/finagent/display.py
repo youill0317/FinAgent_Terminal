@@ -1,19 +1,20 @@
-"""Text for the page: number formats, table rows and the analysis log.
-
-Nothing here touches Streamlit, so it is tested with plain pytest.
-"""
-
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Final, Literal, cast
 
+from finagent import catalog
+from finagent.analysis import web
+from finagent.fetch import ECOS_KEY_ENV, FRED_KEY_ENV
+from finagent.models import AREA_LABEL
+
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from finagent.analysis.service import Event
+    from finagent.limits import LimitState
     from finagent.models import (
         Dashboard,
         Fmt,
@@ -27,98 +28,8 @@ if TYPE_CHECKING:
 type Color = Literal["red", "orange", "yellow", "blue", "green", "violet", "gray"]
 
 KEY_HELP: Final = {
-    "FRED": ("FRED_API_KEY", "https://fredaccount.stlouisfed.org/apikeys"),
-    "ECOS": ("ECOS_API_KEY", "https://ecos.bok.or.kr/api/#/AuthKeyApply"),
-}
-TAPE_LABELS: Final = {
-    "us_fftu": "연준 상단",
-    "us_2y": "UST 2Y",
-    "us_10y": "UST 10Y",
-    "us_10y3m": "10Y−3M",
-    "us_hy_oas": "HY 스프레드",
-    "kr_base": "한은 기준",
-    "kr_ktb3": "KTB 3Y",
-    "kr_ktb10": "KTB 10Y",
-    "us_sp500": "S&P 500",
-    "us_nasdaq": "나스닥",
-    "us_nasdaq100": "나스닥 100",
-    "us_dow": "다우",
-    "us_vix": "VIX",
-    "kr_kospi": "KOSPI",
-    "kr_kosdaq": "KOSDAQ",
-    "nikkei": "닛케이 225",
-    "us_dollar": "달러 광의",
-    "kr_usdkrw": "USD/KRW",
-    "usdjpy": "USD/JPY",
-    "eurusd": "EUR/USD",
-    "usdcny": "USD/CNY",
-    "wti": "WTI",
-    "henryhub": "천연가스",
-    "gold": "금",
-}
-# The overview's market groups, by tape id; eight each, so every row is full.
-TAPE_GROUPS: Final = (
-    (
-        "금리",
-        (
-            "us_fftu",
-            "us_2y",
-            "us_10y",
-            "us_10y3m",
-            "us_hy_oas",
-            "kr_base",
-            "kr_ktb3",
-            "kr_ktb10",
-        ),
-    ),
-    (
-        "주식",
-        (
-            "us_sp500",
-            "us_nasdaq",
-            "us_nasdaq100",
-            "us_dow",
-            "us_vix",
-            "kr_kospi",
-            "kr_kosdaq",
-            "nikkei",
-        ),
-    ),
-    (
-        "환율·원자재",
-        (
-            "us_dollar",
-            "kr_usdkrw",
-            "usdjpy",
-            "eurusd",
-            "usdcny",
-            "wti",
-            "henryhub",
-            "gold",
-        ),
-    ),
-)
-# The market groups' heading help, by title.
-TAPE_HELP: Final = {
-    "금리": (
-        "**정의** 미국·한국 정책금리, 국채 수익률, 장단기 금리차, 하이일드"
-        " 스프레드 · 변화는 직전 관측치 대비(%p)\n\n**기준** 상승 빨강 · 하락 파랑"
-    ),
-    "주식": (
-        "**정의** 미국·한국·일본 주가지수와 VIX(S&P 500 내재 변동성) · 변화는"
-        " 직전 관측치 대비\n\n**기준** 상승 빨강 · 하락 파랑"
-    ),
-    "환율·원자재": (
-        "**정의** 달러 지수, 주요 환율, 원유·천연가스·금 가격 · 변화는"
-        " 직전 관측치 대비\n\n**기준** 상승 빨강 · 하락 파랑"
-    ),
-}
-# The indicator each regime cell judges, for its trend line.
-REGIME_SOURCE: Final = {
-    "물가": "us_core_pce",
-    "고용": "us_sahm",
-    "금리곡선": "us_10y2y",
-    "금융여건": "us_nfci",
+    "FRED": (FRED_KEY_ENV, "https://fredaccount.stlouisfed.org/apikeys"),
+    "ECOS": (ECOS_KEY_ENV, "https://ecos.bok.or.kr/api/#/AuthKeyApply"),
 }
 SOURCE_COLOR: Final[dict[str, Color]] = {
     "ok": "green",
@@ -137,41 +48,34 @@ STATUS_TEXT: Final = {
     "missing_key": "키 없음",
     "not_installed": "설치 안 됨",
 }
-# Korean convention: up is red, down is blue. Mid-tones that read on both themes.
-UP_COLOR: Final = "#e5484d"
-DOWN_COLOR: Final = "#3b82f6"
-NUMBER_COLOR: Final = {"ok": "green", "mismatch": "red", "unsupported": "orange"}
-# Menu pages for the indicator panels: url path, title, icon, panel ids.
-PANEL_PAGES: Final = (
-    (
-        "us",
-        "미국 경제",
-        ":material/flag:",
-        ("growth", "household", "labor", "inflation", "housing"),
+STATUS_HELP: Final = {
+    "missing_key": (
+        "{message}  \n환경변수 API 키 등록 또는 설정에서 대체 공급자 선택 시 실행 가능"
     ),
-    (
-        "rates",
-        "금리·금융",
-        ":material/percent:",
-        ("rates", "fincon", "markets", "liquidity"),
+    "not_installed": (
+        "공급자 패키지 미설치  \n`{message}` 설치 또는 설정에서 대체 공급자"
+        " 선택 시 실행 가능"
     ),
-    ("korea", "한국", ":material/location_on:", ("korea", "korea_real")),
-    (
-        "world",
-        "글로벌",
-        ":material/public:",
-        ("euro", "global", "cycle", "credit", "commodities"),
-    ),
-)
+}
 WEEKDAYS: Final = "월화수목금토일"
-STOPPED: Final = "중지했습니다. 이 턴은 대화에 남지 않습니다."
-CUT_SHORT: Final = "응답이 끝나기 전에 실행이 끝났습니다."
-# Citation marks ``[[id, id]]`` are hidden while the answer streams in.
+STATE_TEXT: Final = {
+    "working": "작업 중",
+    "done": "완료",
+    "failed": "실패",
+    "stopped": "중지",
+}
+STOPPED: Final = "중지 완료"
+STOPPED_HELP: Final = (
+    "이 턴은 대화 기록에 미저장  \n다음 질문은 이 턴이 없던 것처럼 이어짐"
+)
+SUMMARY_HELP: Final = (
+    "이 턴의 데이터 도구 호출 횟수 및 웹 검색·원문 조회 횟수\n\n"
+    "빨간색 `?` 표시 인용은 수신 데이터에 없는 지표 ID 또는 미수신 웹 출처"
+)
 LIVE_MARK: Final = re.compile(r"\s?\[\[[^\]]*\]\]")
 OPEN_MARK: Final = re.compile(r"\s?\[\[[^\]]*$")
-
-
-# ---------------------------------------------------------------- numbers
+LIVE_LIMIT: Final = 6000
+PERCENT_DEC: Final = 2
 
 
 def number(value: float, dec: int) -> str:
@@ -181,12 +85,14 @@ def number(value: float, dec: int) -> str:
 def fmt(value: float | None, f: Fmt) -> str:
     if value is None:
         return "—"
-    sign = "−" if value < 0 else ("+" if f.signed and value > 0 else "")
-    return f"{sign}{f.pre}{number(abs(value), f.dec)}{f.suf}"
+    text = number(abs(value), f.dec)
+    sign = "-" if value < 0 else ("+" if f.signed and value > 0 else "")
+    if not any(digit in text for digit in "123456789"):
+        sign = ""
+    return f"{sign}{f.pre}{text}{f.suf}"
 
 
 def share(value: float) -> str:
-    """A simulated share in whole percent; a possible outcome never shows 0% or 100%."""
     text = f"{value:.0%}"
     if text == "0%" and value > 0:
         return "<1%"
@@ -195,12 +101,18 @@ def share(value: float) -> str:
     return text
 
 
+def percent(row: IndicatorRow) -> bool:
+    return catalog.BY_ID[row.id].change == "pct"
+
+
 def change(row: IndicatorRow) -> float | None:
-    """Latest minus previous, ``0.0`` when it rounds away, ``None`` if unknown."""
     if row.value is None or row.prev is None:
         return None
-    diff = row.value - row.prev
-    return 0.0 if abs(diff) < 10**-row.fmt.dec / 2 else diff
+    if percent(row):
+        diff, dec = (row.value / row.prev - 1) * 100, PERCENT_DEC
+    else:
+        diff, dec = row.value - row.prev, row.fmt.dec
+    return 0.0 if abs(diff) < 10**-dec / 2 else diff
 
 
 def change_text(row: IndicatorRow) -> str:
@@ -209,15 +121,17 @@ def change_text(row: IndicatorRow) -> str:
         return ""
     if diff == 0:
         return "—"
-    return f"{'▲' if diff > 0 else '▼'} {number(abs(diff), row.fmt.dec)}"
+    arrow = "▲" if diff > 0 else "▼"
+    if percent(row):
+        return f"{arrow} {number(abs(diff), PERCENT_DEC)}%"
+    return f"{arrow} {number(abs(diff), row.fmt.dec)}"
 
 
-def arrow_color(text: str) -> str | None:
-    """The CSS color for a cell holding a ▲ or ▼, else ``None``."""
+def arrow_dir(text: str) -> Literal["up", "down"] | None:
     if "▲" in text:
-        return UP_COLOR
+        return "up"
     if "▼" in text:
-        return DOWN_COLOR
+        return "down"
     return None
 
 
@@ -229,21 +143,21 @@ def metric_color(row: IndicatorRow) -> Literal["red", "blue", "off"]:
 
 
 def unit(f: Fmt) -> str:
-    """The unit a value is shown in, for a chart title: ``%``, ``$B``, ``원``."""
     return f"{f.pre}{f.suf}"
 
 
 def metric_delta(row: IndicatorRow) -> str | None:
-    """A signed delta for ``st.metric``, which colors by the leading sign.
-
-    The unit follows the value's, except that a change in % is in %p.
-    """
     diff = change(row)
     if diff is None:
         return None
-    text = f"{diff:+,.{row.fmt.dec}f}"
-    suf = "%p" if row.fmt.suf == "%" else row.fmt.suf
-    return f"{text[0]}{row.fmt.pre}{text[1:]}{suf}"
+    if percent(row):
+        pre, dec, suf = "", PERCENT_DEC, "%"
+    else:
+        pre, dec = row.fmt.pre, row.fmt.dec
+        suf = "%p" if row.fmt.suf == "%" else row.fmt.suf
+    text = f"{diff:+,.{dec}f}"
+    sign = "" if diff == 0 else text[0]
+    return f"{sign}{pre}{text[1:]}{suf}"
 
 
 def short_date(row: IndicatorRow) -> str:
@@ -263,95 +177,43 @@ def weekday(day: str) -> str:
     return f"{day[5:].replace('-', '/')} {WEEKDAYS[date.fromisoformat(day).weekday()]}"
 
 
-# ---------------------------------------------------------------- view
-
-
-def view_label(d: Dashboard) -> str:
-    if not d.deep:
-        return "핵심"
-    if len(d.deep) == len(d.views):
-        return "전체"
-    return f"핵심 + 심화 {len(d.deep)}"
-
-
-def view_note(core: int, extra: int, *, curve: bool) -> str:
-    if curve:
-        return f"차트 · 시리즈 {extra}개"
-    if not extra:
-        return f"모두 핵심 {core}개"
-    return f"핵심 {core} · 심화 +{extra}" if core else f"기본 숨김 · 켜면 {extra}개"
-
-
-def view_summary(d: Dashboard, on: frozenset[str]) -> str:
-    panels = [view for view in d.views if view.id != "curve"]
-    total = sum(view.core + view.extra for view in panels)
-    shown = sum(view.core + (view.extra if view.id in on else 0) for view in panels)
-    curve = " · 수익률 곡선 차트" if "curve" in on else ""
-    return f"표시 지표 {shown} / {total}개{curve}"
-
-
-def row_count(d: Dashboard) -> int:
-    return sum(len(panel.rows) for panel in d.panels)
-
-
 def rows_by_id(d: Dashboard) -> dict[str, IndicatorRow]:
     return {row.id: row for panel in d.panels for row in panel.rows}
 
 
-def tape_groups(
-    tape: Sequence[str], rows: Mapping[str, IndicatorRow]
-) -> list[tuple[str, list[IndicatorRow]]]:
-    """The tape's rows by market; ids without a row are skipped."""
-    groups = [
-        (title, [rows[i] for i in ids if i in tape and i in rows])
-        for title, ids in TAPE_GROUPS
-    ]
-    return [(title, found) for title, found in groups if found]
+def area_name(row: IndicatorRow) -> str:
+    return AREA_LABEL[row.area]
 
 
 def trend(row: IndicatorRow | None) -> list[float] | None:
-    """The row's history for a metric sparkline, ``None`` when it has none."""
     if row is None:
         return None
     return [value for _, value in row.history] or None
 
 
 def regime_card(cell: RegimeCell) -> tuple[str, str]:
-    """A 국면 요약 card's label and value.
-
-    A leading % or %p in ``cell.unit`` joins the value, like every other
-    card's unit; the rest (what is measured) joins the label.
-    """
-    head, _, rest = cell.unit.partition(" ")
-    if not cell.unit:
-        return cell.label, cell.value
-    if head not in {"%", "%p"}:
-        return f"{cell.label} · {cell.unit}", cell.value
-    value = cell.value if cell.value == "—" else f"{cell.value}{head}"
-    return (f"{cell.label} · {rest}" if rest else cell.label), value
+    return f"{cell.label} · {cell.measure}", cell.value
 
 
 def panel_of(d: Dashboard) -> dict[str, str]:
-    """Indicator id to the panel it is shown in, for citation links."""
     return {row.id: panel.id for panel in d.panels for row in panel.rows}
 
 
-# ---------------------------------------------------------------- tables
-
-
-def panel_table(panel: Panel) -> dict[str, list[object]]:
+def panel_table(rows: Sequence[IndicatorRow]) -> dict[str, list[object]]:
     table: dict[str, list[object]] = {
         "지표": [],
+        "국가": [],
         "최신": [],
         "변화": [],
         "추이": [],
         "기준": [],
     }
-    for row in panel.rows:
-        label = f"{row.label} © {row.copyright}" if row.copyright else row.label
+    for row in rows:
+        label = row.label
         ok = row.status == "ok"
-        missing = "키 없음" if row.status == "missing_key" else "받지 못함"
+        missing = "키 없음" if row.status == "missing_key" else "수신 실패"
         table["지표"].append(label)
+        table["국가"].append(area_name(row))
         table["최신"].append(fmt(row.value, row.fmt) if ok else missing)
         table["변화"].append(change_text(row) if ok else "")
         table["추이"].append([value for _, value in row.history] if ok else [])
@@ -367,37 +229,36 @@ def panel_problems(panel: Panel) -> list[str]:
     ]
 
 
-# ---------------------------------------------------------------- detail view
+def panel_stale(panel: Panel) -> list[str]:
+    return [
+        f"{row.code}: {row.message}"
+        for row in panel.rows
+        if row.status == "ok" and row.message
+    ]
 
-# Months shown by a chart's range control (2s10s, indicator detail); 0 means
-# the whole span.
-CHART_RANGES: Final = {"2Y": 24, "5Y": 60, "전체": 0}
+
+CHART_RANGES: Final = {"2Y": 24, "5Y": 60, "10Y": 120}
 
 
 def label_day(label: str) -> date:
-    """The first day of a history label such as ``2025-03`` or ``2025Q2``."""
     if "Q" in label:
         year, quarter = label.split("Q")
         return date(int(year), (int(quarter) - 1) * 3 + 1, 1)
-    parts = [int(part) for part in label.split("-")]
-    return date(parts[0], parts[1], parts[2] if len(parts) > 2 else 1)  # noqa: PLR2004
+    year, month = label.split("-")
+    return date(int(year), int(month), 1)
 
 
 def history_series(row: IndicatorRow) -> tuple[tuple[date, float], ...]:
-    """The row's short history as dated points, for when no longer one is kept."""
     return tuple((label_day(label), value) for label, value in row.history)
 
 
-def detail_points(
-    series: Sequence[tuple[date, float]], months: int
-) -> list[dict[str, str | float]]:
-    """Chart rows for the last ``months`` months of ``series`` (0 keeps all)."""
-    if months and series:
-        last = series[-1][0]
-        count = last.year * 12 + last.month - months
-        cutoff = date(count // 12, count % 12 + 1, 1)
-        series = [point for point in series if point[0] >= cutoff]
-    return [{"day": day.isoformat(), "value": value} for day, value in series]
+def clip(series: Sequence[tuple[date, float]], months: int) -> list[tuple[date, float]]:
+    if not series:
+        return list(series)
+    last = series[-1][0]
+    count = last.year * 12 + last.month - months
+    cutoff = date(count // 12, count % 12 + 1, 1)
+    return [point for point in series if point[0] >= cutoff]
 
 
 def sep_value(cell: ProjectionCell | None) -> str:
@@ -412,13 +273,12 @@ def sep_change(cell: ProjectionCell | None) -> str:
     if cell.prev is None:
         return "신규"
     diff = cell.value - cell.prev
-    if abs(diff) < 0.05:  # noqa: PLR2004 - half of the one decimal shown
+    if abs(diff) < 0.05:  # noqa: PLR2004
         return "—"
     return f"{'▲' if diff > 0 else '▼'} {number(abs(diff), 1)}"
 
 
 def sep_change_key(name: str) -> str:
-    """The unique column key of the change beside ``name`` (shown as Δ)."""
     return f"{name}Δ"
 
 
@@ -432,7 +292,7 @@ def sep_table(p: Projections) -> dict[str, list[str]]:
     for row in p.rows:
         table["지표"].append(row.label)
         current = "—" if row.current is None else number(row.current, row.current_dec)
-        table["현재"].append(f"{current} {row.current_note}".strip())
+        table["현재"].append(current)
         cells: dict[str, ProjectionCell | None] = dict(
             zip(p.years, row.years, strict=False)
         )
@@ -444,34 +304,34 @@ def sep_table(p: Projections) -> dict[str, list[str]]:
     return table
 
 
-# ---------------------------------------------------------------- analysis text
-
-
 def md(text: str) -> str:
-    """Escape what ``st.markdown`` would read as LaTeX."""
-    return text.replace("$", "\\$")
+    return text.replace("$", "\\$").replace("~", "\\~")
 
 
 def live_text(raw: str) -> str:
     return md(OPEN_MARK.sub("", LIVE_MARK.sub("", raw)))
 
 
+def live_tail(raw: str, limit: int = LIVE_LIMIT) -> str:
+    if len(raw) <= limit:
+        return live_text(raw)
+    _, _, whole_lines = raw[-limit:].partition("\n")
+    return live_text(whole_lines)
+
+
 def _piece(piece: Mapping[str, object], links: Mapping[str, str]) -> str:
     if "t" in piece:
         return md(str(piece["t"]))
-    if "n" in piece:
-        shown = md(str(piece["n"]))
-        status = str(piece.get("s"))
-        actual = piece.get("a")
-        color = NUMBER_COLOR.get(status, "gray")
-        if status == "mismatch" and actual:
-            return f":{color}[{shown}] :gray[(실제 {md(str(actual))})]"
-        return f":{color}[{shown}]"
     ids = cast("list[str]", piece.get("c", []))
     known = cast("list[bool]", piece.get("k", []))
+    urls = cast("list[str]", piece.get("u", []))
     out: list[str] = []
-    for cite, ok in zip(ids, known, strict=False):
-        if not ok:
+    for index, (cite, ok) in enumerate(zip(ids, known, strict=False)):
+        url = urls[index] if index < len(urls) else ""
+        if web.is_web(cite):
+            name = md(web.label(cite))
+            out.append(f"([{name}]({url}))" if ok and url else f":red[`{name}?`]")
+        elif not ok:
             out.append(f":red[`{cite}?`]")
         elif cite in links:
             out.append(f"[`{cite}`](#{links[cite]})")
@@ -481,7 +341,6 @@ def _piece(piece: Mapping[str, object], links: Mapping[str, str]) -> str:
 
 
 def answer_markdown(lines: Sequence[object], links: Mapping[str, str]) -> str:
-    """The verified answer: numbers colored by check, citations as links."""
     return "\n".join(
         "".join(
             _piece(cast("Mapping[str, object]", piece), links)
@@ -491,24 +350,37 @@ def answer_markdown(lines: Sequence[object], links: Mapping[str, str]) -> str:
     )
 
 
-def verify_summary(counts: Mapping[str, int], tool_calls: int) -> str:
-    mismatch = counts.get("mismatch", 0)
-    unsupported = counts.get("unsupported", 0)
-    bits = [
-        f":green[일치 **{counts.get('ok', 0)}**]",
-        f":red[다름 **{mismatch}**]" if mismatch else "다름 **0**",
-        f":orange[근거 없음 **{unsupported}**]" if unsupported else "근거 없음 **0**",
-    ]
-    if unknown := counts.get("unknown_id", 0):
-        bits.append(f":red[모르는 근거 **{unknown}**]")
-    bits.append(f"도구 {tool_calls}회")
-    return "숫자 검증 · " + " · ".join(bits)
+def conclusion_line(lines: Sequence[object]) -> str:
+    for line in lines:
+        text = answer_markdown([line], {})
+        if text.strip():
+            return text.strip()
+    return ""
+
+
+def limit_line(state: LimitState, now: float) -> str:
+    at = f"{datetime.fromtimestamp(state.next_at).astimezone():%H:%M}"
+    if state.status == "waiting":
+        minutes, seconds = divmod(max(round(state.next_at - now), 0), 60)
+        wait = f"{minutes}분 {seconds}초" if minutes else f"{seconds}초"
+        return f"{state.source} 대기 {wait}"
+    if state.status == "reached":
+        return f"{state.source} 다음 가능 {at}"
+    if state.status == "blocked":
+        return f"{state.source} 제한 응답 · 다음 가능 {at}"
+    return ""
+
+
+def limit_lines(states: Iterable[LimitState], now: float) -> str:
+    return " · ".join(filter(None, (limit_line(state, now) for state in states)))
+
+
+def run_summary(data_calls: int, web_steps: int) -> str:
+    return f"데이터 {data_calls}회 · 웹 {web_steps}회"
 
 
 @dataclass(slots=True)
 class TurnView:
-    """One question and what came back for it."""
-
     question: str
     run: str = "준비 중…"
     tools: list[tuple[str, bool]] = field(default_factory=list)
@@ -519,6 +391,11 @@ class TurnView:
     tokens_in: int = 0
     tokens_out: int = 0
     usage_note: str = ""
+    threads: list[str] = field(default_factory=list)
+
+    @property
+    def empty(self) -> bool:
+        return not (self.raw or self.tools or self.notices or self.lines is not None)
 
     @property
     def run_line(self) -> str:
@@ -531,14 +408,18 @@ class TurnView:
 
 @dataclass(slots=True)
 class AnalysisLog:
-    """The page's copy of one conversation; the service keeps the real one."""
-
-    conversation: str = ""
+    title: str = ""
+    state: str = ""
     snapshot: str = ""
-    stale: bool = False
-    stopped: bool = False
     received: list[tuple[str, str]] = field(default_factory=list)
+    sources: list[tuple[str, str]] = field(default_factory=list)
     turns: list[TurnView] = field(default_factory=list)
+    report: bool = False
+    conclusion: str = ""
+
+    @property
+    def working(self) -> bool:
+        return self.state == "working"
 
     @property
     def header(self) -> str:
@@ -546,19 +427,16 @@ class AnalysisLog:
             return ""
         return f"데이터 {short_time(self.snapshot)}에 고정"
 
-    def ask(self, question: str) -> None:
-        self.stopped = False
-        self.turns.append(TurnView(question))
-
-    def apply(self, event: Event) -> bool:
-        """Apply one event to the last turn; ``True`` once the turn is done."""
-        turn = self.turns[-1]
+    def apply(self, event: Event) -> None:
         kind = event.get("type")
+        if kind == "turn":
+            self.state = "working"
+            self.turns.append(TurnView(str(event["question"])))
+            return
+        turn = self.turns[-1]
         if kind == "start":
-            self.conversation = str(event["conversation"])
             self.snapshot = str(event["snapshot"])
-            self.stale = self.stale or bool(event.get("stale"))
-            turn.run = f"{event['provider_title']} · {event['model']} · {event['view']}"
+            turn.run = f"{event['provider_title']} · {event['model']}"
         elif kind == "text":
             turn.raw += str(event["text"])
         elif kind == "tool":
@@ -570,22 +448,43 @@ class AnalysisLog:
         elif kind == "error":
             turn.notices.append((str(event["message"]), True))
         elif kind == "done":
-            report = cast("Mapping[str, object]", event["verify"])
-            turn.lines = cast("list[object]", report["lines"])
-            turn.summary = verify_summary(
-                cast("Mapping[str, int]", report["counts"]),
-                cast("int", event["tool_calls"]),
-            )
-            received = cast("list[Mapping[str, str]]", event["received"])
-            self.received = [(item["cite"], item["info"]) for item in received]
-            return True
-        return False
+            self._done(turn, event)
+        elif kind == "end":
+            self._end(turn, str(event["state"]))
 
-    def finish(self, *, done: bool) -> None:
-        """The run ended; say why when it ended without an answer."""
-        turn = self.turns[-1]
-        if self.stopped:
+    def _end(self, turn: TurnView, state: str) -> None:
+        self.state = state
+        if state == "stopped":
             turn.notices.append((STOPPED, False))
-        elif not done and not turn.notices:
-            turn.notices.append((CUT_SHORT, True))
-        self.stopped = False
+
+    def _done(self, turn: TurnView, event: Event) -> None:
+        turn.lines = cast("list[object]", event["lines"])
+        turn.summary = run_summary(
+            cast("int", event["data_calls"]), cast("int", event["web_steps"])
+        )
+        received = cast("list[Mapping[str, str]]", event["received"])
+        self.received = [(item["cite"], item["info"]) for item in received]
+        cited = cast("list[Mapping[str, str]]", event.get("sources") or [])
+        self.sources.extend(
+            (item["title"] or web.host(item["url"]), item["url"])
+            for item in cited
+            if item["url"] not in {url for _, url in self.sources}
+        )
+        if event.get("report"):
+            self.report = True
+            self.conclusion = conclusion_line(turn.lines)
+
+
+@dataclass(slots=True)
+class Board:
+    main: AnalysisLog = field(default_factory=AnalysisLog)
+    threads: dict[str, AnalysisLog] = field(default_factory=dict)
+
+    def apply(self, event: Event) -> None:
+        key = str(event["thread"])
+        if event["type"] == "thread":
+            title = str(event["title"])
+            self.threads[key] = AnalysisLog(title, "working")
+            self.main.turns[-1].threads.append(key)
+            return
+        (self.threads[key] if key else self.main).apply(event)

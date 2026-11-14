@@ -1,64 +1,120 @@
+"""대시보드 스냅샷 빌드·부분 갱신 및 추가 시계열 인메모리 캐시 서비스."""
+
 from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
+from functools import partial
 from typing import TYPE_CHECKING, final
 
-from finagent import catalog
-from finagent.dashboard import build_dashboard
+from finagent import catalog, memory
+from finagent.dashboard import (
+    EXTRAS,
+    PAGE_EXTRAS,
+    BuildProgress,
+    build_dashboard,
+    page_fetches,
+)
 from finagent.demo import dashboard as demo_dashboard
-from finagent.fetch import RETRY_DELAY_SECONDS, FetchContext, new_client
-from finagent.settings import load_view, save_view
-from finagent.sources import Ratio, combine_ratio
+from finagent.fetch import (
+    RETRY_DELAY_SECONDS,
+    FetchContext,
+    SharedWork,
+    new_client,
+)
+from finagent.limits import BACKGROUND_WAIT
+from finagent.sources import Difference, EtfSeries, series_code, years_before
 from finagent.transforms import apply
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Mapping
-    from datetime import date
-    from pathlib import Path
+    from collections.abc import AsyncGenerator, Callable, Collection, Mapping
 
     import httpx
 
-    from finagent.fetch import Closes
+    from finagent.dashboard import Extra
+    from finagent.fetch import SourceError
     from finagent.models import Dashboard
-    from finagent.sources import Fetch, Series
+    from finagent.sources import Fetch, MacroFetch, Series
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesRecord:
+    start: date
+    fetched_at: datetime
+    points: Series
 
 
 def local_now() -> datetime:
     return datetime.now().astimezone()
 
 
+def series_key(fetch: Fetch) -> str:
+    return f"{fetch.source}:{series_code(fetch)}"
+
+
+@final
+class SeriesStore:
+    def __init__(self, clock: Callable[[], datetime] = local_now) -> None:
+        self._clock = clock
+
+    def covering(self, source: str, code: str, start: date) -> Series | None:
+        found = memory.current()
+        key = f"{source}:{code}"
+        if found.macro_at is not None:
+            day = found.macro_at.date()
+            for fetch, points in list(found.macro.items()):
+                if (
+                    not isinstance(fetch, EtfSeries)
+                    and series_key(fetch) == key
+                    and years_before(day, fetch.years) <= start
+                ):
+                    return points
+        extra = found.extra.get(key)
+        if (
+            extra is not None
+            and extra.start <= start
+            and extra.fetched_at.date() == self._clock().date()
+        ):
+            return extra.points
+        return None
+
+    def put_extra(self, source: str, code: str, start: date, points: Series) -> None:
+        record = SeriesRecord(start, self._clock(), points)
+        memory.current().extra.put(f"{source}:{code}", record)
+
+    async def through(
+        self, fetch: MacroFetch, ctx: FetchContext, today: date
+    ) -> Series:
+        start = years_before(today, fetch.years)
+        code = series_code(fetch)
+        found = self.covering(fetch.source, code, start)
+        if found is not None:
+            return found
+        series = await ctx.shared(repr(fetch), partial(fetch.fetch, ctx, today))
+        self.put_extra(fetch.source, code, start, series)
+        return series
+
+
 @final
 class DashboardService:
-    """Holds the latest dashboard and the series behind it in process memory.
-
-    A pass runs when the app starts and whenever the user asks for a refresh.
-    Changing the view fetches only the series not yet in memory; a refresh
-    fetches everything the view shows again. There is no timer, and the only
-    file written is the saved view at ``settings_path`` (none when it is
-    ``None``), besides yfinance's caches when ``yahoo`` is ``YahooCloses``.
-    """
-
     __slots__ = (
-        "_cache",
         "_client_factory",
         "_clock",
         "_demo",
         "_env",
         "_pending",
-        "_pending_deep",
-        "_pending_refresh",
         "_refreshes",
         "_retry_delay",
-        "_settings_error",
-        "_settings_path",
+        "_shared",
         "_snapshot",
-        "_view",
-        "_yahoo",
+        "_stale",
+        "progress",
+        "series_store",
     )
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         env: Mapping[str, str],
         *,
@@ -66,67 +122,33 @@ class DashboardService:
         clock: Callable[[], datetime] = local_now,
         demo: bool = False,
         retry_delay: float = RETRY_DELAY_SECONDS,
-        settings_path: Path | None = None,
-        yahoo: Closes | None = None,
     ) -> None:
-        """Create a service; inject a client factory and clock for tests or demo.
-
-        With ``settings_path`` the view is read from that file at start and
-        saved there when it changes; without it the view lives in memory only.
-        ``yahoo`` reads Yahoo closes; without it Yahoo rows fail.
-        """
         self._retry_delay = retry_delay
-        self._yahoo = yahoo
+        self._shared = SharedWork()
+        self.series_store = SeriesStore(clock)
         self._env = env
         self._client_factory = client_factory
         self._clock = clock
         self._demo = demo
-        self._cache: dict[Fetch, Series] = {}
+        self._stale: dict[Fetch, SourceError] = {}
         self._refreshes = 0
         self._snapshot: Dashboard | None = None
         self._pending: asyncio.Task[Dashboard] | None = None
-        self._pending_deep: frozenset[str] = catalog.CORE_VIEW
-        self._pending_refresh = False
-        self._settings_path = settings_path
-        self._view = catalog.CORE_VIEW
-        self._settings_error: str | None = None
-        if settings_path is not None:
-            self._view, self._settings_error = load_view(settings_path)
-
-    @property
-    def view(self) -> frozenset[str]:
-        return self._view
-
-    @property
-    def series_cache(self) -> dict[Fetch, Series]:
-        """Series fetched so far (memory only); analysis tools add to it."""
-        return self._cache
+        self.progress: BuildProgress | None = None
 
     def full_series(self, indicator_id: str) -> Series:
-        """An indicator's whole fetched history with its transform applied.
-
-        Reads memory only; empty when the series is not (or no longer) cached.
-        """
-        indicator = next(
-            (
-                i
-                for spec in catalog.PANELS
-                for i in spec.indicators
-                if i.id == indicator_id
-            ),
-            None,
-        )
+        indicator = catalog.BY_ID.get(indicator_id)
         if indicator is None:
             return ()
         fetch = indicator.fetch
-        if isinstance(fetch, Ratio):
-            top, bottom = (
-                self._cache.get(fetch.numerator),
-                self._cache.get(fetch.denominator),
+        if isinstance(fetch, Difference):
+            left, right = (
+                memory.current().macro.get(fetch.left),
+                memory.current().macro.get(fetch.right),
             )
-            raw = combine_ratio(top, bottom) if top and bottom else None
+            raw = fetch.combine(left, right) if left and right else None
         else:
-            raw = self._cache.get(fetch)
+            raw = memory.current().macro.get(fetch)
         if not raw:
             return ()
         return apply(raw, indicator.transform, indicator.freq, indicator.scale)
@@ -137,91 +159,83 @@ class DashboardService:
 
     @property
     def refreshes(self) -> int:
-        """How many refreshes have started; tells whether data moved on."""
         return self._refreshes
 
     def today(self) -> date:
         return self._clock().date()
 
     @contextlib.asynccontextmanager
-    async def fetch_context(self) -> AsyncGenerator[FetchContext]:
-        """A client and fetch context for one analysis run's tool calls."""
+    async def fetch_context(
+        self, *, max_wait: float = BACKGROUND_WAIT
+    ) -> AsyncGenerator[FetchContext]:
         async with self._client_factory() as client:
             yield FetchContext(
-                client, self._env, retry_delay=self._retry_delay, yahoo=self._yahoo
+                client,
+                self._env,
+                retry_delay=self._retry_delay,
+                max_wait=max_wait,
+                shared=self._shared,
             )
 
-    async def set_view(self, deep: frozenset[str]) -> Dashboard:
-        """Switch to ``deep``, save it, and return the dashboard for it."""
-        deep &= catalog.ALL_VIEWS
-        if deep != self._view:
-            self._view = deep
-            self._settings_error = None
-            if self._settings_path is not None:
-                try:
-                    save_view(self._settings_path, deep)
-                except OSError as error:
-                    self._settings_error = f"설정을 저장하지 못했습니다: {error}"
-        return await self.get()
-
-    async def get(
-        self, *, refresh: bool = False, deep: frozenset[str] | None = None
-    ) -> Dashboard:
-        """Return the dashboard for ``deep`` (default: the saved view)."""
-        view = self._view if deep is None else deep & catalog.ALL_VIEWS
-        return self._annotate(await self._get(refresh=refresh, deep=view))
-
-    def _annotate(self, dashboard: Dashboard) -> Dashboard:
-        path = self._settings_path
-        return dashboard.model_copy(
-            update={
-                "settings_file": None if path is None else str(path),
-                "settings_error": self._settings_error,
-            }
+    async def get(self, *, refresh: bool = False, page: str | None = None) -> Dashboard:
+        if page is None:
+            return await self._get(refresh=refresh, only=None, extras=EXTRAS)
+        return await self._get(
+            refresh=refresh,
+            only=page_fetches(page),
+            extras=PAGE_EXTRAS.get(page, frozenset()),
         )
 
-    async def _get(self, *, refresh: bool, deep: frozenset[str]) -> Dashboard:
+    async def retry_failed(self) -> Dashboard:
+        return await self._get(refresh=True, only=set(self._stale), extras=frozenset())
+
+    async def _get(
+        self,
+        *,
+        refresh: bool,
+        only: Collection[Fetch] | None,
+        extras: Collection[Extra],
+    ) -> Dashboard:
         pending = self._pending
         if pending is not None and not pending.done():
-            if self._pending_deep == deep:
-                return await asyncio.shield(pending)
-            # Another view is being built; let it finish, then build this one
-            # from what it fetched.
-            if self._pending_refresh:
-                refresh = False
-            with contextlib.suppress(Exception):
-                _ = await asyncio.shield(pending)
-            return await self._get(refresh=refresh, deep=deep)
+            return await asyncio.shield(pending)
         snapshot = self._snapshot
-        if not refresh and snapshot is not None and frozenset(snapshot.deep) == deep:
+        if not refresh and snapshot is not None:
             return snapshot
         if refresh:
-            self._cache.clear()
             self._refreshes += 1
-        self._pending_deep = deep
-        self._pending_refresh = refresh
         self._pending = asyncio.ensure_future(
-            self._build(deep, None if refresh else snapshot)
+            self._build(refresh=refresh, only=only, extras=extras)
         )
         return await asyncio.shield(self._pending)
 
     async def _build(
-        self, deep: frozenset[str], previous: Dashboard | None
+        self,
+        *,
+        refresh: bool,
+        only: Collection[Fetch] | None,
+        extras: Collection[Extra],
     ) -> Dashboard:
-        if self._demo:  # fixed values, nothing fetched
-            self._snapshot = demo_dashboard.dashboard(self._clock(), deep)
+        if self._demo:
+            self._snapshot = demo_dashboard.dashboard(self._clock())
             return self._snapshot
-        async with self._client_factory() as client:
-            ctx = FetchContext(
-                client, self._env, retry_delay=self._retry_delay, yahoo=self._yahoo
-            )
-            dashboard = await build_dashboard(
-                ctx,
-                self._clock(),
-                demo=self._demo,
-                deep=deep,
-                cache=self._cache,
-                previous=previous,
-            )
-        self._snapshot = dashboard
-        return dashboard
+        found = memory.current()
+        now = self._clock()
+        self.progress = BuildProgress()
+        try:
+            async with self.fetch_context() as ctx:
+                self._snapshot = await build_dashboard(
+                    ctx,
+                    now,
+                    cache=found.macro,
+                    refresh=refresh,
+                    stale=self._stale,
+                    progress=self.progress,
+                    only=only,
+                    extras=extras,
+                    previous=self._snapshot,
+                )
+        finally:
+            self.progress = None
+        found.macro_at = now
+        return self._snapshot

@@ -1,21 +1,13 @@
-# Only the paths listed below are tracked; anything else at the top level
-# (.venv, data/, .env, settings, caches, agent folders, notes) stays local.
 /*
 !/.gitignore
 !/.github/
 !/.env.example
+!/.streamlit/
 !/README.md
 !/pyproject.toml
 !/uv.lock
 !/src/
 !/tests/
-!/training/
 
-# docs/: only the guide the AI tools read at runtime (analysis/tools.py)
-!/docs/
-/docs/*
-!/docs/data-sources.md
-
-# Caches inside the tracked folders
 __pycache__/
 *.py[cod]

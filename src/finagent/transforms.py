@@ -1,4 +1,4 @@
-"""Pure series transforms. Raw levels are fetched once; changes are computed here."""
+"""시계열 변환(전년동기대비·전기대비·차분·역수)·주기 레이블 및 경기침체 구간 산출."""
 
 from __future__ import annotations
 
@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING, Final, Literal
 
 if TYPE_CHECKING:
     from finagent.models import Freq
-    from finagent.sources import Series
 
-Transform = Literal["level", "yoy", "pct", "diff", "sum12"]
+type Series = tuple[tuple[date, float], ...]
+
+Transform = Literal["level", "yoy", "pct", "diff", "inverse"]
 
 HISTORY_MONTHS: Final = 24
 HISTORY_QUARTERS: Final = 12
+MONTH_DAYS: Final = 31
 YEAR_LOOKBACK_TOLERANCE_DAYS: Final = 10
 
 
@@ -36,14 +38,13 @@ def apply(
             (day, value - prior) for (_, prior), (day, value) in pairwise(series)
         )
     else:
-        out = rolling_sum(series, 12)
+        out = tuple((day, 1.0 / value) for day, value in series if value != 0)
     if scale == 1.0:
         return out
     return tuple((day, value * scale) for day, value in out)
 
 
 def year_over_year(series: Series, freq: Freq) -> Series:
-    """Percent change against the same period a year earlier."""
     if freq in {"M", "Q"}:
         lookup = {(day.year, day.month): value for day, value in series}
         changes: list[tuple[date, float]] = []
@@ -52,27 +53,18 @@ def year_over_year(series: Series, freq: Freq) -> Series:
             if prior:
                 changes.append((day, (value / prior - 1.0) * 100.0))
         return tuple(changes)
+    days = [point[0] for point in series]
     out: list[tuple[date, float]] = []
     for day, value in series:
-        prior_point = value_on_or_before(series, day - timedelta(days=365))
-        if prior_point is None or prior_point[1] == 0:
+        target = day - timedelta(days=365)
+        index = bisect_right(days, target)
+        if index == 0:
             continue
-        if (
-            day - timedelta(days=365) - prior_point[0]
-        ).days > YEAR_LOOKBACK_TOLERANCE_DAYS:
+        prior_day, prior = series[index - 1]
+        if prior == 0 or (target - prior_day).days > YEAR_LOOKBACK_TOLERANCE_DAYS:
             continue
-        out.append((day, (value / prior_point[1] - 1.0) * 100.0))
+        out.append((day, (value / prior - 1.0) * 100.0))
     return tuple(out)
-
-
-def rolling_sum(series: Series, window: int) -> Series:
-    return tuple(
-        (
-            series[index][0],
-            sum(value for _, value in series[index - window + 1 : index + 1]),
-        )
-        for index in range(window - 1, len(series))
-    )
 
 
 def value_on_or_before(series: Series, day: date) -> tuple[date, float] | None:
@@ -98,15 +90,13 @@ def monthly_mean(series: Series) -> tuple[tuple[str, float], ...]:
 
 
 def history(series: Series, freq: Freq) -> tuple[tuple[str, float], ...]:
-    """Recent points for a sparkline: monthly means for daily/weekly data."""
     if freq in {"D", "W"}:
-        return monthly_mean(series)[-HISTORY_MONTHS:]
+        return monthly_mean(series[-MONTH_DAYS * HISTORY_MONTHS :])[-HISTORY_MONTHS:]
     limit = HISTORY_QUARTERS if freq == "Q" else HISTORY_MONTHS
     return tuple((period_label(day, freq), value) for day, value in series[-limit:])
 
 
 def recession_bands(series: Series) -> tuple[tuple[str, str], ...]:
-    """Contiguous runs where an indicator series equals 1 (e.g. NBER USREC)."""
     bands: list[tuple[str, str]] = []
     start: date | None = None
     last: date | None = None

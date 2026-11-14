@@ -5,47 +5,33 @@ build-backend = "hatchling.build"
 [project]
 name = "finagent"
 version = "0.2.0"
-description = "Local macro dashboard on public data only (FRED, Treasury, NY Fed, BoK ECOS, ECB, BIS, OECD)."
+description = "Local investing terminal: macro dashboard, ETF comparison, portfolio analytics and AI analysis on public data."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "altair>=5.0",
     "httpx>=0.27",
+    "numpy>=1.26",
+    "pandas>=3.0",
+    "pyarrow>=10.0.1",
     "pydantic>=2.8",
     "streamlit>=1.57",
 ]
 
 [project.optional-dependencies]
-# AI analysis is optional; install only the providers you use.
 claude = ["anthropic>=1.13.0"]
 openai = ["openai>=3.30.0"]
 gemini = ["google-genai>=2.30.1"]
 llm = ["finagent[claude,openai,gemini]"]
-# S&P 500 screening, portfolios and the dashboard's gold row (yfinance, unofficial
-# Yahoo data); see the README.
-screen = [
-    "lxml>=6.1.3",
-    "yfinance>=1.7.0",
-]
-# GJR-GARCH volatility filter for the portfolio risk page; EWMA without it.
-garch = ["arch>=8.0.0"]
-# Kronos path generator (data/models/kronos/); torch is imported only then.
-kronos = [
-    "torch>=2.0",
-    "einops>=0.8.1",
-    "huggingface_hub>=0.33.1",
-    "safetensors>=0.6.2",
-    "tqdm",
-]
+yahoo = ["yfinance>=1.7.0"]
 
 [project.scripts]
 macro = "finagent.cli:main"
 
 [dependency-groups]
 dev = [
-    # The adapters and the screener are type-checked against the real packages.
     "finagent[llm]",
-    "finagent[screen]",
-    "finagent[garch]",
+    "finagent[yahoo]",
     "basedpyright>=1.21",
     "pytest>=8",
     "ruff>=0.8",
@@ -58,6 +44,7 @@ pythonPlatform = "All"
 include = ["src", "tests"]
 exclude = ["**/__pycache__", "**/.venv", "**/build", "**/dist"]
 reportUnusedCallResult = "warning"
+reportImportCycles = false
 reportUnnecessaryTypeIgnoreComment = "error"
 reportUnusedVariable = "error"
 reportMissingParameterType = "error"
@@ -71,8 +58,6 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
-    # User-facing Korean messages are written inline at the raise site, and
-    # labels use the typographic minus sign.
     "EM101",
     "EM102",
     "RUF001",
@@ -84,6 +69,7 @@ ignore = [
     "D102",
     "D103",
     "D104",
+    "D107",
     "D203",
     "D213",
     "FBT001",

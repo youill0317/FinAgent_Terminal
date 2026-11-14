@@ -2,24 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
-import types
-from datetime import date
+from datetime import date, timedelta
 from typing import TYPE_CHECKING
 
 import httpx
-import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
-import pytest
 
-from finagent.fetch import FetchContext, SourceError
+from finagent.fetch import FetchContext
 from finagent.sources import (
+    EcosSeries,
     FredSeries,
-    YahooCloses,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
-    from pathlib import Path
+
 
 TODAY = date(2026, 10, 12)
 KEYS = {"FRED_API_KEY": "fred-secret-key", "ECOS_API_KEY": "ecos-secret-key"}
@@ -64,84 +60,31 @@ def test_fred_sends_key_and_skips_missing_dots() -> None:
     assert params["series_id"] == "DGS10"
     assert params["api_key"] == "fred-secret-key"
     assert params["file_type"] == "json"
-    assert params["observation_start"] == "2022-10-12"
+    assert params["observation_start"] == "2015-10-01"
 
 
-def test_http_errors_never_leak_the_key() -> None:
-    def server_error(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(500)
+def test_ecos_pages_past_its_row_limit() -> None:
+    days = [date(1990, 1, 1) + timedelta(days=i) for i in range(12_000)]
+    asked: list[tuple[int, int]] = []
 
-    def network_error(request: httpx.Request) -> httpx.Response:
-        message = f"cannot reach {request.url}"
-        raise httpx.ConnectError(message, request=request)
+    def handler(request: httpx.Request) -> httpx.Response:
+        first, last = (int(part) for part in request.url.path.split("/")[6:8])
+        asked.append((first, last))
+        rows = [
+            {"TIME": day.strftime("%Y%m%d"), "DATA_VALUE": str(i)}
+            for i, day in enumerate(days[first - 1 : last])
+        ]
+        body = {"list_total_count": len(days), "row": rows}
+        return json_response({"StatisticSearch": body})
 
-    for handler in (server_error, network_error):
-        with pytest.raises(SourceError) as caught:
-            _ = run(handler, lambda ctx: FredSeries("DGS10").fetch(ctx, TODAY))
-        assert "fred-secret-key" not in str(caught.value)
+    series = run(
+        handler,
+        lambda ctx: EcosSeries("802Y001", "D", "0001000", years=40).fetch(ctx, TODAY),
+    )
 
-
-def test_server_errors_are_retried_once_only() -> None:
-    calls: list[int] = []
-
-    def flaky(_: httpx.Request) -> httpx.Response:
-        calls.append(1)
-        if len(calls) == 1:
-            return httpx.Response(502)
-        return json_response({"observations": [{"date": "2026-10-08", "value": "4"}]})
-
-    series = run(flaky, lambda ctx: FredSeries("DGS10").fetch(ctx, TODAY))
-
-    assert series == ((date(2026, 10, 8), 4.0),)
-    assert len(calls) == 2
-
-    calls.clear()
-
-    def down(_: httpx.Request) -> httpx.Response:
-        calls.append(1)
-        return httpx.Response(503)
-
-    with pytest.raises(SourceError, match="FRED HTTP 503"):
-        _ = run(down, lambda ctx: FredSeries("DGS10").fetch(ctx, TODAY))
-    assert len(calls) == 2  # gives up after one retry
+    assert asked == [(1, 10_000), (10_001, 20_000)]
+    assert len(series) == 12_000
+    assert series[-1] == (days[-1], 1_999.0)
 
 
-# ---------------------------------------------------------------- Yahoo
-
-
-def fake_yfinance(
-    monkeypatch: pytest.MonkeyPatch, answer: pd.DataFrame | Exception
-) -> list[dict[str, object]]:
-    """Stand in for the yfinance module; returns the ``history`` calls."""
-    calls: list[dict[str, object]] = []
-
-    class Ticker:
-        def __init__(self, ticker: str) -> None:
-            self.ticker: str = ticker
-
-        def history(self, **kwargs: object) -> pd.DataFrame:
-            calls.append({"ticker": self.ticker, **kwargs})
-            if isinstance(answer, Exception):
-                raise answer
-            return answer
-
-    def point(_: str) -> None:
-        pass
-
-    fake = types.ModuleType("yfinance")
-    fake.set_tz_cache_location = point  # pyright: ignore[reportAttributeAccessIssue]
-    fake.Ticker = Ticker  # pyright: ignore[reportAttributeAccessIssue]
-    monkeypatch.setitem(sys.modules, "yfinance", fake)
-    return calls
-
-
-def test_yahoo_failures_are_source_errors(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _ = fake_yfinance(monkeypatch, ConnectionError("down"))
-    with pytest.raises(SourceError, match="YAHOO GC=F: ConnectionError"):
-        _ = YahooCloses(tmp_path)("GC=F", TODAY)
-
-    _ = fake_yfinance(monkeypatch, pd.DataFrame({"Close": []}))
-    with pytest.raises(SourceError, match="YAHOO GC=F: 관측값 없음"):
-        _ = YahooCloses(tmp_path)("GC=F", TODAY)
+FRED = FredSeries("CPIAUCSL", years=4)

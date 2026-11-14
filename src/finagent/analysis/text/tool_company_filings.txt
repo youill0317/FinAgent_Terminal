@@ -1,0 +1,1 @@
+미국 상장 기업 SEC 제출 공시 목록 조회. 8-K 공시의 경우 items 항목으로 공시 내용 식별(item 2.02: 실적 공시). 결과의 accession 번호를 read_filing 도구에 전달.

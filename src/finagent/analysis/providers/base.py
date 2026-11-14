@@ -1,25 +1,25 @@
-"""What every provider adapter implements, and the events it streams back.
-
-An adapter turns the provider-neutral ``Conversation`` into its SDK's request
-shape, streams text back, and calls ``run_tool`` when the model asks for one
-of the data tools. Tool execution itself always happens in FinAgent.
-"""
+"""AI 분석 공급자 공통 프로토콜·이벤트 타입 및 상태 점검 유틸리티."""
 
 from __future__ import annotations
 
 import importlib.util
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
-    from finagent.analysis.evidence import Evidence
     from finagent.analysis.prompt import Conversation
     from finagent.analysis.tools import Json, ToolResult
+    from finagent.analysis.web import WebSource
 
 ProviderId = Literal["claude_api", "openai_api", "gemini_api", "demo"]
 StatusKind = Literal["ready", "missing_key", "not_installed"]
+StepKind = Literal["data", "web", "filter", "thread"]
+WEB_STEP_LIMIT: Final = 20
+TOO_MANY_ROUNDS: Final = "도구 왕복 한도 초과에 따른 실행 중단"
+TRUNCATED: Final = "출력 길이 제한 도달에 따른 응답 절단"
+NO_MODEL: Final = "미지원 모델: {model} (현재 키 사용 불가)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,13 +44,29 @@ class Usage:
     note: str = ""
 
 
-type ProviderEvent = TextDelta | Usage
+@dataclass(frozen=True, slots=True)
+class WebStep:
+    summary: str
+    ok: bool = True
+    kind: StepKind = "web"
+
+
+@dataclass(frozen=True, slots=True)
+class WebFound:
+    sources: tuple[WebSource, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRound: ...
+
+
+type ProviderEvent = TextDelta | Usage | WebStep | WebFound | ToolRound
 
 
 class RunTool(Protocol):
-    async def __call__(self, name: str, arguments: Mapping[str, object]) -> ToolResult:
-        """Run one data tool and return its result (errors are results too)."""
-        ...
+    async def __call__(
+        self, name: str, arguments: Mapping[str, object]
+    ) -> ToolResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,21 +76,18 @@ class ToolSpec:
     schema: Json
 
 
-def _no_evidence() -> dict[str, Evidence]:
-    return {}
-
-
 @dataclass(frozen=True, slots=True)
 class RunRequest:
     conversation: Conversation
     model: str
     tools: tuple[ToolSpec, ...]
     run_tool: RunTool
-    evidence: Mapping[str, Evidence] = field(default_factory=_no_evidence)
+    max_rounds: int
+    web: bool = False
+    kind: str = "page"
 
 
-class ProviderError(Exception):
-    """A run failed in a way worth showing to the user as-is."""
+class ProviderError(Exception): ...
 
 
 class Provider(Protocol):
@@ -82,17 +95,21 @@ class Provider(Protocol):
     title: str
     default_model: str
 
-    async def status(self) -> ProviderStatus:
-        """Whether this provider can run now (SDK installed, key present)."""
-        ...
+    async def status(self) -> ProviderStatus: ...
 
-    def stream(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:
-        """Run one turn, calling ``request.run_tool`` for tool calls."""
-        ...
+    def stream(self, request: RunRequest) -> AsyncIterator[ProviderEvent]: ...
 
 
 def installed(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
+
+
+def key_status(module: str, extra: str, key: str, env_name: str) -> ProviderStatus:
+    if not installed(module):
+        return ProviderStatus("not_installed", f"uv sync --extra {extra}")
+    if not key:
+        return ProviderStatus("missing_key", f"{env_name} 미설정")
+    return ProviderStatus("ready")
 
 
 def env_value(env: Mapping[str, str], *names: str) -> str:

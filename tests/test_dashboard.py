@@ -2,31 +2,31 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
+import pytest
 
 from finagent import catalog
-from finagent.cli import check_report
+from finagent.dashboard import (
+    BuildProgress,
+    all_fetches,
+    build_dashboard,
+)
 from finagent.service import DashboardService
-from tests.fake_sources import DEMO_KEYS, demo_closes, demo_transport
+from tests.fake_sources import DEMO_KEYS, demo_transport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    import pytest
-
-    from finagent.fetch import Closes
     from finagent.models import Dashboard
 
 NOW = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
+OECD_REQUESTS = 4
 
 
 def service(
-    env: dict[str, str] | None = None,
     wrap: Callable[[httpx.Request], httpx.Response | None] | None = None,
-    yahoo: Closes | None = None,
 ) -> DashboardService:
     demo = demo_transport(NOW.date())
 
@@ -37,50 +37,85 @@ def service(
 
     transport = httpx.MockTransport(handler)
     return DashboardService(
-        DEMO_KEYS if env is None else env,
+        DEMO_KEYS,
         client_factory=lambda: httpx.AsyncClient(transport=transport),
         clock=lambda: NOW,
         retry_delay=0,
-        yahoo=demo_closes(NOW.date()) if yahoo is None else yahoo,
     )
 
 
-def build(svc: DashboardService, deep: frozenset[str] = catalog.ALL_VIEWS) -> Dashboard:
-    return asyncio.run(svc.get(deep=deep))
+def build(svc: DashboardService) -> Dashboard:
+    return asyncio.run(svc.get())
 
 
-def test_every_catalog_indicator_resolves_with_demo_data() -> None:
-    dashboard = build(service())
+def test_a_cold_build_resolves_every_indicator_and_counts_every_fetch() -> None:
+    oecd: set[httpx.URL] = set()
+    progress = BuildProgress()
+
+    def record(request: httpx.Request) -> httpx.Response | None:
+        if request.url.host == "sdmx.oecd.org":
+            oecd.add(request.url)
+        return None
+
+    async def run() -> Dashboard:
+        async with service(wrap=record).fetch_context() as ctx:
+            return await build_dashboard(
+                ctx, NOW, cache={}, refresh=False, stale={}, progress=progress
+            )
+
+    dashboard = asyncio.run(run())
 
     rows = [row for panel in dashboard.panels for row in panel.rows]
     assert [row.id for row in rows if row.status != "ok"] == []
     assert len(rows) == sum(len(spec.indicators) for spec in catalog.PANELS)
     assert all(source.state == "ok" for source in dashboard.sources)
     assert all(row.history for row in rows)
+    millions = {row.id: row.value for row in rows}["us_fed_assets_mp"]
+    assert millions == pytest.approx(6.55, abs=0.01)
+    assert len(oecd) == OECD_REQUESTS
+    assert progress.series + progress.etfs == progress.count == len(all_fetches())
+    assert progress.done == progress.total
+    assert {page for _, page in progress.total} == {s.page for s in catalog.PANELS}
+    assert progress.extra == "done"
 
 
-def test_one_failing_source_does_not_hide_the_others() -> None:
-    def bis_down(request: httpx.Request) -> httpx.Response | None:
-        return httpx.Response(503) if request.url.host == "stats.bis.org" else None
+def test_a_failed_refresh_keeps_old_values_and_a_retry_fetches_only_the_failed() -> (
+    None
+):
+    limited = False
+    asked: list[httpx.URL] = []
 
-    dashboard = build(service(wrap=bis_down))
+    def fred_429(request: httpx.Request) -> httpx.Response | None:
+        asked.append(request.url)
+        if limited and request.url.host == "api.stlouisfed.org":
+            return httpx.Response(429, headers={"retry-after": "0"})
+        return None
 
-    states = {source.id: source.state for source in dashboard.sources}
-    assert states["BIS"] == "error"
-    assert states["FRED"] == "ok"
-    rows = {row.id: row for panel in dashboard.panels for row in panel.rows}
-    assert rows["boj_rate"].status == "error"
-    assert rows["boj_rate"].message == "BIS HTTP 503"
-    assert rows["us_unrate"].status == "ok"
-    assert "BIS:WS_CBPOL/JP" in check_report(dashboard)
+    svc = service(wrap=fred_429)
+    before = build(svc)
+    limited = True
+    after = asyncio.run(svc.get(refresh=True))
+
+    old = {row.id: row for panel in before.panels for row in panel.rows}
+    new = {row.id: row for panel in after.panels for row in panel.rows}
+    assert new["us_unrate"].status == "ok"
+    assert new["us_unrate"].value == old["us_unrate"].value
+    assert new["us_unrate"].message == "갱신 실패, 이전 값: FRED 요청 한도 초과"
+    assert old["us_unrate"].message is None
+    states = {source.id: source.state for source in after.sources}
+    assert states["FRED"] == "error"
+    assert svc.full_series("us_unrate") != ()
+
+    limited = False
+    asked.clear()
+    fixed = asyncio.run(svc.retry_failed())
+
+    assert {source.id: source.state for source in fixed.sources}["FRED"] == "ok"
+    rows = [row for panel in fixed.panels for row in panel.rows]
+    assert [row.message for row in rows if row.message] == []
+    assert "ecos.bok.or.kr" not in {url.host for url in asked}
+    assert not any(is_extra(url) for url in asked)
 
 
-def test_a_pass_writes_nothing_to_disk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    _ = build(service())
-
-    assert list(Path(tmp_path).iterdir()) == []
+def is_extra(url: httpx.URL) -> bool:
+    return "release" in url.path or "realtime_start" in url.params
