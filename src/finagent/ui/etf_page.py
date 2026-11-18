@@ -970,7 +970,6 @@ def open_detail(
     funds: Mapping[str, etf.Cell],
     rows: pd.DataFrame,
 ) -> None:
-    st.session_state.ai_last_etf = ticker
     name = funds.get("name")
     title = ticker if name is None else f"{ticker} · {name.value}"
     own = cast("pd.DataFrame", rows[rows["ticker"] == ticker])

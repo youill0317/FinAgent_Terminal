@@ -1197,10 +1197,8 @@ def inv_view(
     if not found:
         return
     pf_part(
-        "inv_holdings",
         partial(inv_holdings, found, data[2], data[3], prices, inv_flags(data[0])),
     )
     pf_part(
-        "inv_section",
         partial(inv_view_section, pf_key(cik, stamp), book, people, data, prices, more),
     )

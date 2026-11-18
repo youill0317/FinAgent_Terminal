@@ -70,9 +70,15 @@ def test_data_map_only_names_tools_that_exist_and_answer() -> None:
     samples = data_map_samples()
 
     async def run(name: str) -> ToolResult:
+        dashboard = await svc.get()
         async with svc.fetch_context() as ctx:
             box = Toolbox(
-                ctx, svc.series_store, svc.today(), Company({}, svc.today(), demo=True)
+                ctx,
+                svc.series_store,
+                svc.today(),
+                Company({}, svc.today(), demo=True),
+                dashboard=dashboard,
+                portfolios=lambda _: [{"name": "기본", "cite_as": "pf_a"}],
             )
             return await box.run(name, samples[name])
 
@@ -91,4 +97,6 @@ def data_map_samples() -> dict[str, dict[str, object]]:
         "etf_lookup": {"limit": 1},
         "etf_holdings": {"ticker": "XLK"},
         "company_profile": {"ticker": "AAPL"},
+        "read_dashboard": {"page": "overview"},
+        "read_portfolio": {},
     }

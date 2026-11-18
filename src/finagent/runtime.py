@@ -14,12 +14,13 @@ if TYPE_CHECKING:
 
 @final
 class Runtime:
-    __slots__ = ("_loop", "analysis", "dashboard", "workspace")
+    __slots__ = ("_loop", "analysis", "chat", "dashboard", "workspace")
 
     def __init__(self, dashboard: DashboardService, analysis: AnalysisService) -> None:
         self.dashboard = dashboard
         self.analysis = analysis
         self.workspace = analysis.open()
+        self.chat = analysis.open(chat=True)
         self._loop = asyncio.new_event_loop()
         threading.Thread(
             target=self._loop.run_forever, name="finagent-loop", daemon=True
@@ -28,6 +29,10 @@ class Runtime:
     def renew(self) -> None:
         if not self.workspace.busy:
             self.workspace = self.analysis.open()
+
+    def renew_chat(self) -> None:
+        if not self.chat.busy:
+            self.chat = self.analysis.open(chat=True)
 
     def call[T](self, coro: Coroutine[object, object, T]) -> T:
         return self.submit(coro).result()

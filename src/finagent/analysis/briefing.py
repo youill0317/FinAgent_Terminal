@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Final, cast
@@ -121,6 +122,25 @@ class Briefing:
             {} if self.demo else portfolio.load_splits(),
         )
 
+    def portfolios(self, name: str) -> list[dict[str, object]]:
+        book = self.book()
+        chosen = [p for p in book.portfolios if not name or p.name == name]
+        if name and not chosen:
+            names = ", ".join(p.name for p in book.portfolios) or "없음"
+            raise ValueError(f"없는 포트폴리오: {name} · 있는 포트폴리오: {names}")
+        calc = demo_portfolio if self.demo else portfolio
+        close = self.prices().close
+        out: list[dict[str, object]] = []
+        for p in chosen:
+            head: dict[str, object] = {"name": p.name, "cite_as": f"pf_{p.id}"}
+            try:
+                items = calc.holdings(p, close)
+            except portfolio.BookError as error:
+                out.append({**head, "error": str(error)})
+                continue
+            out.append({**head, **_holdings_body(items)})
+        return out
+
     def stock_inputs(self, ticker: str) -> documents.StockInputs:
         prices = self.prices()
         if self.demo:
@@ -233,3 +253,43 @@ class Briefing:
             holdings=documents.holding_lines(book, self.prices().close, ticker),
             fit=self.etf_fit(brief, found, book),
         )
+
+
+def _finite(value: float, digits: int = 2) -> float | None:
+    return round(value, digits) if math.isfinite(value) else None
+
+
+def _holdings_body(items: list[portfolio.Holding]) -> dict[str, object]:
+    total = portfolio.totals(items)
+    priced = sum(h.value for h in items if h.is_open and math.isfinite(h.value))
+    held = [
+        {
+            "ticker": h.ticker,
+            "quantity": _finite(h.position.quantity, 4),
+            "average": _finite(h.position.average, 4),
+            "price": _finite(h.price, 4),
+            "price_date": h.day.isoformat() if h.day else None,
+            "value": _finite(h.value),
+            "weight_pct": _finite(h.value / priced * 100 if priced > 0 else math.nan),
+            "unrealized": _finite(h.unrealized),
+            "return_pct": _finite(h.return_rate * 100),
+        }
+        for h in items
+        if h.is_open
+    ]
+    closed = [
+        {"ticker": h.ticker, "realized": _finite(h.position.realized)}
+        for h in items
+        if not h.is_open
+    ]
+    return {
+        "holdings": held,
+        "closed": closed,
+        "totals": {
+            "value": _finite(total.value),
+            "cost": _finite(total.cost),
+            "unrealized": _finite(total.unrealized),
+            "realized": _finite(total.realized),
+            "total_return_pct": _finite(total.total_return * 100),
+        },
+    }

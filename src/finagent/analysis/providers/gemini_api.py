@@ -113,18 +113,15 @@ async def _chunks(
 ) -> AsyncIterator[types.GenerateContentResponse]:
     from google.genai import types  # noqa: PLC0415  # 선택적 의존성 지연 임포트
 
-    tools = [
-        types.Tool(
-            function_declarations=[
-                types.FunctionDeclaration(
-                    name=spec.name,
-                    description=spec.description,
-                    parameters_json_schema=spec.schema,
-                )
-                for spec in request.tools
-            ]
+    declarations = [
+        types.FunctionDeclaration(
+            name=spec.name,
+            description=spec.description,
+            parameters_json_schema=spec.schema,
         )
+        for spec in request.tools
     ]
+    tools = [types.Tool(function_declarations=declarations)] if declarations else []
     config = types.GenerateContentConfig(
         system_instruction=request.conversation.system,
         tools=tools,

@@ -82,19 +82,12 @@ def pf_metric(
     delta: str | None = None,
     **options: Any,  # noqa: ANN401  # st.metric 가변 키워드 인자 전달
 ) -> None:
-    state.ai_page_values[label] = f"{value} ({delta})" if delta else value
     st.metric(label, value, delta, border=True, height="stretch", **options)
 
 
 @st.fragment
-def pf_part(key: str, render: Callable[[], None]) -> None:
-    outer = state.ai_page_values
-    state.ai_page_values = {}
-    try:
-        render()
-    finally:
-        state.ai_page_parts[key] = state.ai_page_values
-        state.ai_page_values = outer
+def pf_part(render: Callable[[], None]) -> None:
+    render()
 
 
 def pf_store(change: Callable[[portfolio.Book], portfolio.Book]) -> str:
@@ -130,12 +123,6 @@ def pf_table(
     helps: Mapping[str, str] | None = None,
     **options: Any,  # noqa: ANN401  # st.dataframe 가변 키워드 인자 전달
 ) -> None:
-    state.ai_page_values[alt_text] = "\n".join(
-        " · ".join(
-            f"{column}: {cell}" for column, cell in zip(data, cells, strict=True)
-        )
-        for cells in zip(*data.values(), strict=True)
-    )
     st.dataframe(
         pd.DataFrame(data).style.map(pf_style, subset=list(signed)),
         hide_index=True,

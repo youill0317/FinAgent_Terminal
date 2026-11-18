@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 
 from finagent import catalog, prices
-from finagent.analysis import prompt
+from finagent.analysis import documents, prompt
 from finagent.analysis.company_tools import (
     DEFAULT_FILINGS,
     DEFAULT_HOLDINGS,
@@ -45,11 +45,11 @@ from finagent.sources import (
 from finagent.transforms import apply
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from finagent.analysis.company_tools import Company
     from finagent.fetch import FetchContext
-    from finagent.models import SourceId
+    from finagent.models import Dashboard, SourceId
     from finagent.prices import Basis
     from finagent.service import SeriesStore
     from finagent.sources import Fetch, Series, SeriesInfo
@@ -71,11 +71,19 @@ FRED_HITS: Final = 15
 ECOS_PLAIN_PARTS: Final = 3
 
 type Json = dict[str, object]
+type PortfolioReader = Callable[[str], list[Json]]
 SOURCES: Final = ("FRED", "ECOS", "ECB", "BIS", "OECD")
 ETF_CODE: Final = re.compile(r"[A-Za-z0-9.^=-]+")
 SEARCHABLE: Final = ("catalog", "FRED", "ECOS", "ECB", "BIS", "OECD")
 TRANSFORMS: Final = ("level", "yoy", "pct", "diff")
 SDMX: Final = ("ECB", "BIS", "OECD")
+DASHBOARD_PAGES: Final[Mapping[str, str]] = {
+    "overview": "개요",
+    "economy": "경제 지표",
+    "monetary": "통화정책·금리",
+    "finance": "금융시장·심리",
+    "schedule": "일정·출처",
+}
 
 CODE_FORMATS: Final[Mapping[str, str]] = dict(
     cast("tuple[str, str]", tuple(line.split("\t", 1)))
@@ -239,6 +247,29 @@ TOOL_SPECS: Final[tuple[tuple[str, str, Json], ...]] = (
         },
     ),
     (
+        "read_dashboard",
+        prompt.text("tool_read_dashboard.txt"),
+        {
+            "type": "object",
+            "properties": {
+                "page": {"type": "string", "enum": list(DASHBOARD_PAGES)},
+            },
+            "required": ["page"],
+            "additionalProperties": False,
+        },
+    ),
+    (
+        "read_portfolio",
+        prompt.text("tool_read_portfolio.txt"),
+        {
+            "type": "object",
+            "properties": {
+                "portfolio": {"type": "string", "description": "포트폴리오 이름"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    (
         "source_guide",
         prompt.text("tool_source_guide.txt"),
         {
@@ -278,6 +309,8 @@ class Toolbox:
     company: Company
     in_document: frozenset[str] = frozenset()
     demo: bool = False
+    dashboard: Dashboard | None = None
+    portfolios: PortfolioReader | None = None
     limit: int = MAX_TOOL_CALLS
     calls: int = 0
     received: dict[str, str] = field(default_factory=dict)
@@ -294,6 +327,8 @@ class Toolbox:
             "get_series": self._get,
             "get_prices": self._prices,
             "source_guide": self._guide,
+            "read_dashboard": self._dashboard,
+            "read_portfolio": self._portfolio,
         }
         handler = handlers.get(name)
         if name in COMPANY_TOOLS:
@@ -313,6 +348,29 @@ class Toolbox:
         answer = await asyncio.to_thread(self.company.run, name, args)
         self.received.update(answer.received)
         return ToolResult(_dump(answer.body), ok=True, summary=answer.summary)
+
+    async def _dashboard(self, args: Mapping[str, object]) -> ToolResult:
+        page = text_arg(args, "page")
+        if page not in DASHBOARD_PAGES:
+            raise ValueError(f"page는 {', '.join(DASHBOARD_PAGES)} 중 하나")
+        if self.dashboard is None:
+            raise ValueError("현재 실행 환경 내 대시보드 조회 미지원")
+        found = documents.page_document(self.dashboard, page)
+        title = DASHBOARD_PAGES[page]
+        self.received.update(dict.fromkeys(found.ids, f"대시보드 {title}"))
+        head = f'<dashboard page="{page}" snapshot="{found.snapshot}">'
+        text = f"{head}\n{found.text}\n</dashboard>"
+        summary = f"read_dashboard({title}) · {len(found.ids)}항목"
+        return ToolResult(text, ok=True, summary=summary)
+
+    async def _portfolio(self, args: Mapping[str, object]) -> ToolResult:
+        if self.portfolios is None:
+            raise ValueError("현재 실행 환경 내 포트폴리오 조회 미지원")
+        found = await asyncio.to_thread(self.portfolios, text_arg(args, "portfolio"))
+        for item in found:
+            self.received[str(item["cite_as"])] = f"{item['name']} 보유 내역"
+        summary = f"read_portfolio · {len(found)}개"
+        return ToolResult(_dump({"portfolios": found}), ok=True, summary=summary)
 
     async def _search(self, args: Mapping[str, object]) -> ToolResult:
         source = text_arg(args, "source")

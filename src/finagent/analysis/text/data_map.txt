@@ -1,6 +1,8 @@
-거시 지표, GDP, CPI 전월비, 세부 물가, HICP, 정책금리	입력 문서 → search_series, get_series
+대시보드 지표 최신값·최근 이력, 경기 국면, 수익률 곡선, FOMC 경제전망, 정책금리 변경, 발표 일정	입력 문서(있을 때) → read_dashboard
+거시 지표 장기 이력, GDP, CPI 전월비, 세부 물가, HICP, 정책금리 등 시계열	search_series, get_series
 주가, 지수, 선물, 환율, 이벤트 후 시장 반응	get_prices
 미국 기업 매출, 이익, 공시 실적	company_facts, company_filings, read_filing
 ETF 수익률, 운용자산, 총보수, 분배수익률	etf_lookup
 ETF 구성 종목, 자산·국가·섹터 비중	etf_holdings
 기업 섹터, 산업, 시가총액, 밸류에이션, 사업 설명	company_profile
+사용자 포트폴리오 보유 종목, 평가액, 손익, 비중	read_portfolio

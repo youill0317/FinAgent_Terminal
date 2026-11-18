@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING, NoReturn
 
 import pytest
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 
     from finagent import etf
     from finagent.analysis.context import Document
+    from finagent.service import DashboardService
 
 
 def unused() -> NoReturn:
@@ -32,12 +34,10 @@ def look(w: pd.Series) -> tuple[lookthrough.Lookthrough, dict[str, etf.Compositi
     return lookthrough.effective_holdings(weights, comps), comps
 
 
-def test_prepare_builds_the_macro_stock_and_etf_documents_in_demo(
-    tmp_path: Path,
-) -> None:
+def demo_briefing(tmp_path: Path) -> tuple[Briefing, DashboardService]:
     service = build_service(demo=True, env={})
     portfolio.save_book(tmp_path, demo_book.book(service.today()))
-    found = Briefing(
+    return Briefing(
         root=tmp_path,
         settings_path=tmp_path / demo_book.SETTINGS_FILE,
         demo=True,
@@ -50,7 +50,13 @@ def test_prepare_builds_the_macro_stock_and_etf_documents_in_demo(
         fetcher=unused,
         updater=unused,
         look=look,
-    )
+    ), service
+
+
+def test_prepare_builds_the_macro_stock_and_etf_documents_in_demo(
+    tmp_path: Path,
+) -> None:
+    found, service = demo_briefing(tmp_path)
     data = asyncio.run(service.get())
     company = Company({}, service.today(), demo=True)
 
@@ -77,3 +83,18 @@ def test_prepare_builds_the_macro_stock_and_etf_documents_in_demo(
         _ = prepared("stock", "ZZZZ")
     with pytest.raises(ValueError, match="ZZZZ: 티커를 확인하지 못했습니다"):
         _ = prepared("etf", "ZZZZ")
+
+
+def test_portfolios_lists_holdings_and_totals_as_plain_json(tmp_path: Path) -> None:
+    found, _ = demo_briefing(tmp_path)
+
+    every = found.portfolios("")
+    one = found.portfolios("데모 포트폴리오")
+
+    assert "데모 포트폴리오" in [item["name"] for item in every]
+    assert [item["name"] for item in one] == ["데모 포트폴리오"]
+    assert one[0]["holdings"]
+    assert str(one[0]["cite_as"]).startswith("pf_")
+    _ = json.dumps(every, allow_nan=False)
+    with pytest.raises(ValueError, match="없는 포트폴리오: 없음"):
+        _ = found.portfolios("없음")

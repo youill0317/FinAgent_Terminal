@@ -12,7 +12,6 @@ from xml.sax.saxutils import escape, quoteattr
 
 from finagent.analysis import cites, prompt, web
 from finagent.analysis.company_tools import Company, text_arg
-from finagent.analysis.context import build_document
 from finagent.analysis.prompt import Conversation, ToolRecord, Turn, system_prompt
 from finagent.analysis.providers import DEFAULT_PROVIDER, registry
 from finagent.analysis.providers.base import (
@@ -25,7 +24,13 @@ from finagent.analysis.providers.base import (
     Usage,
     WebFound,
 )
-from finagent.analysis.tools import MAX_TOOL_CALLS, TOOL_SPECS, Toolbox, ToolResult
+from finagent.analysis.tools import (
+    MAX_TOOL_CALLS,
+    TOOL_SPECS,
+    PortfolioReader,
+    Toolbox,
+    ToolResult,
+)
 from finagent.display import Board
 from finagent.limits import INTERACTIVE_WAIT
 from finagent.settings import AnalysisChoice, load_analysis, save_analysis
@@ -44,12 +49,13 @@ type Event = dict[str, object]
 type ThreadState = Literal["working", "done", "failed", "stopped"]
 type Prepare = Callable[[Brief], RunInput]
 MAIN: Final = ""
-MAX_THREADS: Final = 4
+MAX_THREADS: Final = 8
 ERROR_LIMIT: Final = 400
 PRESET_TOOL_CALLS: Final = 40
 KINDS: Final = ("macro", "stock", "etf", "research")
 STOPPED: Final = "사용자 중지"
 UNANSWERED: Final = "조정자 응답 없음. 보유 자료로 진행할 것"
+NO_TOOLS: Final = "페이지 챗봇은 도구 미사용"
 ATTACH_SHAPE: Final = "attach는 {thread, sections}의 목록"
 ATTACH: Final = {
     "type": "array",
@@ -235,10 +241,10 @@ class _Job:
         )
 
     def conversation(self, system: str) -> Conversation:
-        first = self.thread.documents[0]
+        first = self.thread.documents[:1]
         return Conversation(
             system,
-            tuple(filter(None, (first.base, first.text))),
+            tuple(filter(None, (part for d in first for part in (d.base, d.text)))),
             tuple(self.thread.turns),
             self.given.request.strip(),
             self.added_text,
@@ -260,12 +266,13 @@ class AnalysisService:
         "_choice",
         "_dashboard",
         "_env",
+        "_portfolios",
         "_prepare",
         "_providers",
         "_settings_path",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  # 대시보드·공급자·브리핑·포트폴리오 의존성 주입
         self,
         dashboard: DashboardService,
         env: Mapping[str, str],
@@ -273,6 +280,7 @@ class AnalysisService:
         settings_path: Path | None = None,
         providers: Mapping[str, Provider] | None = None,
         prepare: Prepare | None = None,
+        portfolios: PortfolioReader | None = None,
     ) -> None:
         self._dashboard = dashboard
         self._env = env
@@ -283,6 +291,7 @@ class AnalysisService:
         )
         self._settings_path = settings_path
         self._prepare = prepare
+        self._portfolios = portfolios
         saved = load_analysis(settings_path) if settings_path is not None else None
         first = DEFAULT_PROVIDER if DEFAULT_PROVIDER in self._providers else ""
         fallback = first or next(iter(self._providers))
@@ -336,8 +345,8 @@ class AnalysisService:
         found = await asyncio.gather(*(self._providers[i].status() for i in ids))
         return dict(zip(ids, found, strict=True))
 
-    def open(self) -> Workspace:
-        return Workspace(self)
+    def open(self, *, chat: bool = False) -> Workspace:
+        return Workspace(self, chat=chat)
 
     def company(self) -> Company:
         return Company(
@@ -371,52 +380,64 @@ class AnalysisService:
             yield {"type": "error", "message": status.message or status.kind}
             return
         model = self.model_for(provider_id, thread=thread.id != MAIN)
-        if not thread.documents:
-            document = given.document or build_document(await self._dashboard.get())
-            thread.documents.append(document)
-            thread.ids |= document.ids
+        dashboard = await self._dashboard.get()
+        if not thread.documents and given.document is not None:
+            thread.documents.append(given.document)
+            thread.ids |= given.document.ids
         job = _Job(given, thread, provider, model, _new_document(thread, given), notes)
         desk.company.today = self._dashboard.today()
         yield {
             "type": "start",
-            "snapshot": thread.documents[0].snapshot,
             "provider_title": provider.title,
             "model": model,
         }
-        async with self._dashboard.fetch_context(max_wait=INTERACTIVE_WAIT) as ctx:
-            box = Toolbox(
-                ctx,
-                self._dashboard.series_store,
-                self._dashboard.today(),
-                desk.company,
-                in_document=frozenset(job.ids),
-                demo=self._dashboard.demo,
-                limit=job.limit,
-            )
-            async for event in self._answer(job, box, desk):
+        received: dict[str, str] = {}
+        if desk.chat:
+            async for event in self._answer(job, None, desk):
                 yield event
+        else:
+            async with self._dashboard.fetch_context(max_wait=INTERACTIVE_WAIT) as ctx:
+                box = Toolbox(
+                    ctx,
+                    self._dashboard.series_store,
+                    self._dashboard.today(),
+                    desk.company,
+                    in_document=frozenset(job.ids),
+                    demo=self._dashboard.demo,
+                    limit=job.limit,
+                    dashboard=dashboard,
+                    portfolios=self._portfolios,
+                )
+                async for event in self._answer(job, box, desk):
+                    yield event
+            received = box.received
         if not job.completed:
             return
-        ids = {*job.ids, *box.received}
-        job.commit(ids, box.received)
+        ids = {*job.ids, *received}
+        job.commit(ids, received)
         async for event in self._finish(job, ids):
             yield event
 
     async def _answer(
-        self, job: _Job, box: Toolbox, desk: Workspace
+        self, job: _Job, box: Toolbox | None, desk: Workspace
     ) -> AsyncGenerator[Event]:
         queue: asyncio.Queue[Event | None] = asyncio.Queue()
         main = job.thread.id == MAIN
-        extra = THREAD_SPECS if main else ASK_SPECS
+        extra = () if box is None else THREAD_SPECS if main else ASK_SPECS
         names = {spec.name for spec in extra}
 
         async def run_tool(name: str, arguments: Mapping[str, object]) -> ToolResult:
             delegated = name in names
-            result = (
-                await desk.use(job.thread, name, arguments)
-                if delegated
-                else await box.run(name, arguments)
-            )
+            if delegated:
+                result = await desk.use(job.thread, name, arguments)
+            elif box is not None:
+                result = await box.run(name, arguments)
+            else:
+                result = ToolResult(
+                    json.dumps({"error": NO_TOOLS}, ensure_ascii=False),
+                    ok=False,
+                    summary=f"{name} · 실패: {NO_TOOLS}",
+                )
             if delegated:
                 job.ids |= job.thread.ids
                 job.found.update(job.thread.web)
@@ -437,17 +458,18 @@ class AnalysisService:
         system = system_prompt(
             self._choice.instructions,
             web_limit=limit,
-            threads=MAX_THREADS if main else 0,
+            threads=MAX_THREADS if main and box is not None else 0,
             asking=not main,
+            chat=box is None,
         )
         request = RunRequest(
             conversation=job.conversation(system),
             model=job.model,
-            tools=(*SPECS, *extra),
+            tools=() if box is None else (*SPECS, *extra),
             run_tool=run_tool,
             web=job.searching,
-            max_rounds=job.limit,
-            kind=job.kind,
+            max_rounds=0 if box is None else job.limit,
+            kind="chat" if box is None else job.kind,
         )
         segments = [""]
         task = asyncio.create_task(self._pump(job, request, queue, segments))
@@ -530,28 +552,28 @@ class Workspace:
         "_inbox",
         "_lock",
         "_main",
-        "_page",
         "_service",
         "_tasks",
         "_threads",
         "_waiting",
         "_wake",
         "board",
+        "chat",
         "company",
         "portfolio",
     )
 
-    def __init__(self, service: AnalysisService) -> None:
+    def __init__(self, service: AnalysisService, *, chat: bool = False) -> None:
         self._service = service
+        self.chat = chat
         self._events: SimpleQueue[Event] = SimpleQueue()
         self._lock = Lock()
         self._main = Thread(MAIN)
         self._threads: dict[str, Thread] = {}
         self._tasks: dict[str, asyncio.Task[str]] = {}
         self._inbox: list[tuple[Thread, str]] = []
-        self._asked: list[tuple[RunInput, Document | None]] = []
+        self._asked: list[RunInput] = []
         self._waiting: dict[str, _Ask] = {}
-        self._page: Document | None = None
         self._wake = False
         self._active = 0
         self.board = Board()
@@ -571,13 +593,8 @@ class Workspace:
                     return
                 self.board.apply(event)
 
-    async def ask(
-        self,
-        text: str,
-        document: Document | None = None,
-        page: Document | None = None,
-    ) -> None:
-        self._asked.append((RunInput(text, document), page or document))
+    async def ask(self, text: str, document: Document | None = None) -> None:
+        self._asked.append(RunInput(text, document))
         self._advance()
 
     async def stop(self, thread: str = MAIN) -> None:
@@ -771,7 +788,7 @@ class Workspace:
         if MAIN in self._tasks:
             return
         if self._asked:
-            given, self._page = self._asked.pop(0)
+            given = self._asked.pop(0)
             self._begin(self._main, given.request, self._coordinate(given))
         elif self._due() or (self._wake and not self._busy()):
             self._begin(self._main, "", self._coordinate(RunInput("")))
@@ -845,7 +862,7 @@ class Workspace:
 
     async def _brief(self, kind: str, ticker: str, task: str) -> RunInput:
         if kind == "research":
-            return RunInput(task, self._page)
+            return RunInput(task)
         given = await self._service.prepare(kind, ticker, self.portfolio, self.company)
         if not task:
             return given
@@ -908,7 +925,7 @@ def _excerpt(answer: str, names: tuple[str, ...]) -> str:
 
 def _new_document(thread: Thread, given: RunInput) -> Document | None:
     document = given.document
-    if document is None or any(d.text == document.text for d in thread.documents):
+    if document is None or thread.documents[-1].text == document.text:
         return None
     return document
 

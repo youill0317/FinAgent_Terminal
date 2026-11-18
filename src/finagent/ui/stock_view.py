@@ -12,7 +12,7 @@ import altair as alt
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 import streamlit as st
 
-from finagent import demo, display, perf, portfolio, quant
+from finagent import demo, portfolio, quant
 from finagent.ui import palette, shared
 from finagent.ui.pf_common import (
     CHART_HEIGHT,
@@ -153,14 +153,6 @@ def stock_es(value: float) -> str:
     return pf_percent(max(value, 0.0), dec=2)
 
 
-def whatif_pair(
-    label: str, pair: tuple[float, float], text: Callable[[float], str]
-) -> str:
-    shown = stock_change(*pair, text)
-    state.ai_page_values[label] = shown
-    return shown
-
-
 def whatif_shift_chart(
     before: list[dict[str, float]],
     after: list[dict[str, float]],
@@ -234,19 +226,6 @@ def whatif_paths(
         picks=picks,
         w=portfolio.mixed_in(j, ticker, fraction),
     )
-    falls = (before.paths.falls, after.paths.falls)
-    ten = perf.PATH_LEVELS[0]
-    whatif_pair(
-        f"{label} 뒤 10% 이상 손실 경로 비율",
-        (falls[0][ten].end, falls[1][ten].end),
-        display.share,
-    )
-    for level in falls[0] if days > 1 else ():
-        whatif_pair(
-            f"기간 중 -{level:.0%} 낙폭 경로 비율",
-            (falls[0][level].swing, falls[1][level].swing),
-            display.share,
-        )
     with st.container(border=True):
         headed(
             f"**몬테카를로** · {label}",
@@ -428,7 +407,7 @@ def whatif_curves(  # noqa: PLR0913  # 매수 수량별 민감도 곡선 산출 
             if pair is None:
                 headed(f"**{label}** · {PF_THIN}", tip)
                 continue
-            headed(f"**{label}** · {whatif_pair(label, pair, text)}", tip)
+            headed(f"**{label}** · {stock_change(*pair, text)}", tip)
             points = [
                 {"shares": n, "weight": f, "value": getattr(m, field)}
                 for n, f, m in zip(grid, fractions, curve, strict=True)
@@ -514,7 +493,6 @@ def whatif_share(ticker: str, weight: float, added: portfolio.Added) -> None:
         if added.es_share is None:
             headed(f"**{label}** · {PF_THIN}", tip)
             return
-        state.ai_page_values[label] = pf_percent(added.es_share)
         headed(f"**{label}**", tip)
         st.altair_chart(
             whatif_share_chart(weight, added.es_share, ticker),
@@ -658,7 +636,7 @@ def stock_view(
             st.info(f"{ticker} 수신 가격 데이터 없음")
         return
     headed(f"**{ticker}**")
-    pf_part("stock_section", partial(stock_view_section, ticker, book, prices))
+    pf_part(partial(stock_view_section, ticker, book, prices))
 
 
 def stock_view_section(

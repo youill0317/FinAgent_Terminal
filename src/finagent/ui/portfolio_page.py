@@ -1168,7 +1168,6 @@ def pf_view(
         label_visibility="collapsed",
         bind="query-params",
     )
-    state.ai_page_values["보기"] = PF_SECTIONS[section or "returns"]
     pf_section(section or "returns", book, p, prices)
 
 
@@ -1244,7 +1243,6 @@ def portfolio_page() -> None:
         label_visibility="collapsed",
         bind="query-params",
     )
-    state.ai_page_values["구분"] = PF_MODES[mode or "mine"]
     if mode == "investors":
         inv_view(usable, prices, fetcher, missing)
         return
@@ -1260,9 +1258,8 @@ def portfolio_page() -> None:
     if p.id in broken:
         pf_broken(p, broken[p.id], splits, fetcher.progress.running)
         return
-    state.ai_page_values["포트폴리오"] = p.name
     shown = portfolio.split_adjusted(p, splits)
     pf_holdings(shown, prices, p)
     if not p.trades:
         return
-    pf_part("pf_section", partial(pf_view, usable, shown, prices))
+    pf_part(partial(pf_view, usable, shown, prices))

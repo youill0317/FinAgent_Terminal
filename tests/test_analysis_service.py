@@ -17,6 +17,7 @@ from finagent.analysis.providers.base import (
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import (
     MAIN,
+    MAX_THREADS,
     AnalysisService,
     RunInput,
 )
@@ -366,3 +367,76 @@ def test_a_thread_asks_the_coordinator_and_goes_on_with_the_relayed_answer() -> 
     assert 'state="waiting">종목</thread>' in mains[1].request_document
     assert '<thread_report id="t1"' in mains[3].request_document
     assert ended(events, MAIN) == ["done"] * 4
+
+
+def test_the_agent_starts_without_page_data_and_can_read_the_dashboard() -> None:
+    provider = Recorder()
+    service = analysis(provider)
+
+    _ = asyncio.run(asked(service, "질문"))
+
+    seen = provider.seen[0]
+    names = {spec.name for spec in seen.tools}
+    assert seen.conversation.documents == ()
+    assert seen.conversation.messages()[0].text == "<request>\n질문\n</request>"
+    assert {"read_dashboard", "read_portfolio", "start_thread"} <= names
+    assert seen.kind == "main"
+
+
+def test_the_page_chat_uses_only_the_pages_it_was_shown() -> None:
+    provider = Recorder()
+    service = analysis(provider)
+    first, second = document("<page_document>A</page_document>"), document("B")
+
+    async def scenario() -> None:
+        ws = service.open(chat=True)
+        for text, page in (("하나", first), ("둘", first), ("셋", second)):
+            await ws.ask(text, page)
+            await until(ws, [])
+
+    asyncio.run(scenario())
+
+    talks = [seen.conversation for seen in provider.seen]
+    assert all(seen.tools == () and not seen.web for seen in provider.seen)
+    assert {seen.kind for seen in provider.seen} == {"chat"}
+    assert "페이지 챗봇" in talks[0].system
+    assert all(talk.documents == (first.text,) for talk in talks)
+    assert [talk.request_document for talk in talks] == ["", "", second.text]
+    assert [turn.request for turn in talks[2].turns] == ["하나", "둘"]
+
+
+def test_the_demo_page_chat_cites_the_page_it_saw() -> None:
+    service = analysis(DemoProvider(delay=0))
+    page = document(
+        '<indicator id="us_unrate" name="실업률">4.1</indicator>', "us_unrate"
+    )
+
+    async def scenario() -> list[Event]:
+        ws = service.open(chat=True)
+        events: list[Event] = []
+        await ws.ask("실업률은?", page)
+        await until(ws, events)
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert of_type(events, "tool") == []
+    assert marks(of_type(events, "done")[0]) == [("us_unrate", True)]
+
+
+def test_threads_beyond_the_limit_are_refused_while_the_rest_run() -> None:
+    provider = Delegating([research(f"조사{n}") for n in range(MAX_THREADS + 1)])
+    service = analysis(provider)
+
+    async def scenario() -> None:
+        ws = service.open()
+        await ws.ask("맡겨")
+        await until(ws, [], lambda: provider.working == MAX_THREADS)
+        provider.gate.set()
+        await until(ws, [])
+
+    asyncio.run(scenario())
+
+    assert provider.peak == MAX_THREADS
+    assert [result.ok for result in provider.results] == [True] * MAX_THREADS + [False]
+    assert f"한도({MAX_THREADS}개)" in provider.results[-1].text

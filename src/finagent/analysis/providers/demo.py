@@ -40,6 +40,8 @@ STARTED: Final = "{titles} 스레드 작업 위임 및 완료 시 보고"
 ARRIVED: Final = "**결론**: {titles} 스레드 보고 완료 (전문 스레드 참조)"
 
 INTRO: Final = "데모 공급자 예시 답변 (모델 호출 없는 도구 결과 기반)"
+CHAT: Final = "데모 페이지 챗봇 예시 답변 (모델 호출 없는 화면 데이터 기반)"
+INDICATOR: Final = re.compile(r'<indicator id="([^"]+)"')
 SUMMARY: Final = "**결론**: 도구 기반 장기 이력 수신 완료"
 
 
@@ -55,7 +57,9 @@ class DemoProvider:
         return ProviderStatus("ready", "예시 답변 생성 데모 공급자")
 
     async def stream(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:
-        if request.kind == "main":
+        if request.kind == "chat":
+            events = self._chat(request)
+        elif request.kind == "main":
             events = self._main(request)
         elif request.kind != "page":
             events = self._report(request)
@@ -77,6 +81,15 @@ class DemoProvider:
             request.conversation.request_document
         )
         text = (STARTED if calls else ARRIVED).format(titles=", ".join(titles))
+        async for event in self._type(text, CHUNK):
+            yield event
+
+    async def _chat(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:
+        talk = request.conversation
+        pages = (talk.request_document, *(turn.document for turn in talk.turns[::-1]))
+        found = (INDICATOR.search(page) for page in (*pages, *talk.documents))
+        cite = next((match.group(1) for match in found if match), "")
+        text = f"{CHAT}\n\n화면 첫 항목 확인 [[{cite}]]" if cite else CHAT
         async for event in self._type(text, CHUNK):
             yield event
 

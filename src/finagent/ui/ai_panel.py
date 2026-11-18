@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections import Counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import streamlit as st
 
@@ -18,16 +18,28 @@ from finagent.analysis.providers.base import ProviderError
 from finagent.demo import etf as demo_etf
 from finagent.ui import shared
 from finagent.ui.shared import etf_confirm, etf_held, etf_updater
+from finagent.ui.slash import Command, slash_menu
 
 if TYPE_CHECKING:
     from finagent.analysis.context import Document
-    from finagent.analysis.providers.base import ProviderStatus
     from finagent.analysis.service import Workspace
     from finagent.models import Dashboard
 
 state = st.session_state
-STOCK_POPOVER = "ai_stock_popover"
-ETF_POPOVER = "ai_etf_popover"
+COMMANDS: Final[dict[str, Preset]] = {
+    "/매크로": MACRO,
+    "/macro": MACRO,
+    "/etf": ETF,
+    "/종목": STOCK,
+    "/stock": STOCK,
+}
+COMMAND_TEXT: Final = "/매크로, /etf 티커, /종목 티커"
+AGENT_HINT: Final = "요청 입력 · / 입력 시 프리셋 목록"
+SLASH: Final = (
+    Command("/매크로", MACRO.title, "", ("매크로", "macro")),
+    Command("/etf", ETF.title, "티커", ("etf",)),
+    Command("/종목", STOCK.title, "티커", ("종목", "stock")),
+)
 STATE_ICON = {
     "working": ":material/progress_activity:",
     "done": ":material/check_circle:",
@@ -41,15 +53,6 @@ class View:
     data: Dashboard
     key: str
     panels: set[str]
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class Ready:
-    statuses: dict[str, ProviderStatus]
-    held: list[str]
-    refused: str
-    etfs: list[str]
-    skill: bool
 
 
 def workspace() -> Workspace:
@@ -86,6 +89,7 @@ def ai_settings() -> None:
         key=f"set_model_{provider_id}",
         help=(
             "사용자 대화 및 스레드 작업 위임 전담 조정자 모델  \n"
+            "페이지 챗봇도 같은 모델 사용  \n"
             "공란 시 입력란에 흐리게 표시된 기본 모델 적용"
         ),
     )
@@ -131,34 +135,9 @@ def new_conversation() -> None:
     state.ai_thread = ""
 
 
-def open_document(view: View) -> Document:
-    snapshot = view.data.generated_at
-    if view.key == "portfolio":
-        values = dict(state.ai_page_values)
-        for part in state.ai_page_parts.values():
-            values.update(part)
-        return documents.portfolio_document(values, snapshot)
-    if view.key == "etf":
-        found: documents.EtfView | None = state.get("ai_etf_view")
-        if found is None:
-            return documents.portfolio_document({}, snapshot)
-        return documents.etf_document(found, snapshot)
-    return documents.page_document(view.data, view.key)
-
-
-def start_run(text: str, view: View) -> bool:
-    text = text.strip()
-    if not text:
-        return False
-    shared.app.rt.call(workspace().ask(text, open_document(view)))
-    return True
-
-
-def start_thread(preset: Preset, view: View, ticker: str = "") -> None:
+def start_thread(preset: Preset, ticker: str = "") -> None:
     target = f"{ticker} {preset.title}" if ticker else preset.title
-    text = f"{target} 스레드 시작 요청"
-    document = documents.request_document(view.data.generated_at)
-    shared.app.rt.call(workspace().ask(text, document, open_document(view)))
+    shared.app.rt.call(workspace().ask(f"{target} 스레드 시작 요청"))
 
 
 def etf_options() -> list[str]:
@@ -170,111 +149,50 @@ def etf_options() -> list[str]:
     return [*listed, *held]
 
 
-def start_etf(view: View, ticker: str) -> None:
-    state.ai_last_etf = ticker
-    state[ETF_POPOVER] = False
-    start_thread(ETF, view, ticker)
-
-
-def etf_picker(view: View, options: list[str]) -> None:
-    last = state.ai_last_etf
-    ticker = st.selectbox(
-        "ETF",
-        options,
-        index=options.index(last) if last in options else None,
-        placeholder="ETF 티커 선택",
-        help=(
-            "유니버스 등록 및 보유 ETF 목록  \n"
-            "마지막으로 상세를 열었거나 분석한 ETF 미리 선택"
-        ),
-    )
-    if st.button(
-        "분석 시작",
-        type="primary",
-        disabled=not ticker,
-        key="ai_etf_go",
-        on_click=start_etf,
-        args=(view, ticker),
-    ):
-        st.rerun()
-
-
-def choice_line(status: ProviderStatus) -> str:
-    pid = shared.app.rt.analysis.choice.provider
-    model = shared.app.rt.analysis.model_for(pid)
-    worker = shared.app.rt.analysis.model_for(pid, thread=True)
-    parts = [
-        shared.app.rt.analysis.providers[pid].title,
-        model if worker == model else f"{model} · 스레드 {worker}",
-        display.STATUS_TEXT.get(status.kind, status.kind),
-    ]
-    return " · ".join(parts)
-
-
-def ready() -> Ready:
-    held: list[str] = []
-    refused = ""
-    try:
-        held = portfolio.book_tickers(portfolio.load_book(shared.app.root))
-    except portfolio.BookError as error:
-        refused = str(error)
-    return Ready(
-        shared.app.rt.call(shared.app.rt.analysis.statuses()),
-        held,
-        refused,
-        etf_options(),
-        shared.app.demo or skill.available(shared.app.root / skill.DATA_DIR),
-    )
-
-
-def start_stock(view: View, ticker: str, held: list[str]) -> None:
-    state.ai_stock_refused = ""
+def check_stock(ticker: str) -> None:
+    folder = shared.app.root / skill.DATA_DIR
+    if not (shared.app.demo or skill.available(folder)):
+        raise ValueError(f"종목 분석에는 `{folder}` 디렉터리 내 참고 자료 필요")
+    held = portfolio.book_tickers(portfolio.load_book(shared.app.root))
     if ticker not in held:
-        try:
-            Briefing.refuse(ticker, etf_confirm(ticker), {"찾을 수 없음"})
-        except ValueError as error:
-            state.ai_stock_refused = str(error)
-            return
-    state.ai_last_stock = ticker
-    state[STOCK_POPOVER] = False
-    start_thread(STOCK, view, ticker)
+        Briefing.refuse(ticker, etf_confirm(ticker), {"찾을 수 없음"})
 
 
-def stock_picker(view: View, found: Ready) -> None:
-    if found.refused:
-        st.error(found.refused)
+def check_etf(ticker: str) -> None:
+    if ticker not in etf_options():
+        Briefing.refuse(ticker, etf_confirm(ticker), {"찾을 수 없음", "개별 주식"})
+
+
+def run_command(text: str) -> None:
+    name, _, rest = text.partition(" ")
+    preset = COMMANDS.get(name.lower())
+    if preset is None:
+        raise ValueError(f"알 수 없는 명령: {name} · 사용 가능: {COMMAND_TEXT}")
+    ticker = rest.strip().upper()
+    if preset is MACRO:
+        start_thread(MACRO)
         return
-    held = found.held
-    last = state.ai_last_stock
-    picked = st.selectbox(
-        "보유 종목",
-        held,
-        index=held.index(last) if last in held else None,
-    )
-    typed = (
-        st.text_input(
-            "티커",
-            help=(
-                "미보유 종목 직접 입력  \n"
-                "입력 시 위에서 고른 종목 대신 이 티커 분석  \n"
-                "미국 밖 종목은 거래소 접미사 포함(예: 005930.KS)"
-            ),
-        )
-        .strip()
-        .upper()
-    )
-    ticker = typed or picked
-    if refused := state.get("ai_stock_refused"):
-        st.error(refused)
-    started = st.button(
-        "분석 시작",
-        type="primary",
-        disabled=not ticker,
-        on_click=start_stock,
-        args=(view, ticker, held),
-    )
-    if started and not state.ai_stock_refused:
-        st.rerun()
+    if not ticker:
+        raise ValueError(f"{name} 뒤에 티커 입력 (예: {name} AAPL)")
+    if preset is STOCK:
+        check_stock(ticker)
+    else:
+        check_etf(ticker)
+    start_thread(preset, ticker)
+
+
+def submit_agent() -> None:
+    text: str = (state.get("ai_input") or "").strip()
+    state.ai_command_error = ""
+    if not text:
+        return
+    if not text.startswith("/"):
+        shared.app.rt.call(workspace().ask(text))
+        return
+    try:
+        run_command(text)
+    except (ValueError, portfolio.BookError) as error:
+        state.ai_command_error = str(error)
 
 
 def stop() -> None:
@@ -293,89 +211,96 @@ def thread_card(key: str, place: str) -> None:
         key=f"ai_card_{place}_{key}",
         on_click=open_thread,
         args=(key,),
-        width="stretch",
+        type="tertiary" if place == "turn" else "secondary",
+        width="content" if place == "turn" else "stretch",
     )
-    if log.conclusion:
+    if log.conclusion and place == "list":
         st.caption(log.conclusion)
 
 
-def overview() -> None:
+def thread_list() -> None:
     threads = workspace().board.threads
-    if not threads:
-        return
     working = sum(log.working for log in threads.values())
     label = f"스레드 {len(threads)}개" + (f" · 작업 중 {working}" if working else "")
-    with st.expander(label, type="compact"):
-        for found, title in display.STATE_TEXT.items():
-            keys = [key for key, log in threads.items() if log.state == found]
-            if keys:
-                st.caption(title)
-            for key in keys:
-                thread_card(key, "overview")
+    st.subheader(label, anchor=False)
+    for found, title in display.STATE_TEXT.items():
+        keys = [key for key, log in threads.items() if log.state == found]
+        if keys:
+            st.caption(title)
+        for key in keys:
+            thread_card(key, "list")
 
 
-def presets(view: View, found: Ready) -> None:
-    folder = shared.app.root / skill.DATA_DIR
-    if st.button(MACRO.title, key="ai_preset_macro"):
-        start_thread(MACRO, view)
-        st.rerun()
-    with st.popover(
-        STOCK.title,
-        disabled=not found.skill,
-        help=None if found.skill else f"`{folder}` 디렉터리 내 참고 자료 필요",
-        key=STOCK_POPOVER,
-        on_change="rerun",
-    ):
-        if found.skill:
-            stock_picker(view, found)
-    with st.popover(ETF.title, key=ETF_POPOVER, on_change="rerun"):
-        etf_picker(view, found.etfs)
+def icon_button(icon: str, key: str, label: str, **options: object) -> None:
+    st.button(
+        "",
+        icon=icon,
+        key=key,
+        help=label,
+        type="tertiary",
+        **options,  # pyright: ignore[reportArgumentType]
+    )
 
 
-def controls(view: View, found: Ready) -> None:
-    log = conversation()
-    key: str = state.ai_thread
-    with st.container(horizontal=True, vertical_alignment="center"):
-        if not key:
-            presets(view, found)
+def controls(log: display.AnalysisLog) -> None:
+    if state.ai_thread:
         if log.working:
-            st.button("중지", icon=":material/stop:", key="ai_stop", on_click=stop)
-        if not key:
-            st.button("새 대화", on_click=new_conversation, disabled=workspace().busy)
-    if key:
+            icon_button(":material/stop_circle:", "ai_stop", "중지", on_click=stop)
         return
-    request = st.chat_input("분석 요청 사항 입력", key="ai_input", disabled=log.working)
-    if request and start_run(request, view):
-        st.rerun()
+    if error := state.get("ai_command_error"):
+        st.error(error)
+    with st.container(horizontal=True, vertical_alignment="center", gap="small"):
+        if log.working:
+            icon_button(":material/stop_circle:", "ai_stop", "중지", on_click=stop)
+        else:
+            icon_button(
+                ":material/add_comment:",
+                "ai_new",
+                "새 대화",
+                on_click=new_conversation,
+                disabled=workspace().busy,
+            )
+        st.chat_input(
+            AGENT_HINT,
+            key="ai_input",
+            disabled=log.working,
+            on_submit=submit_agent,
+        )
+    slash_menu("ai_input", SLASH)
 
 
-def turn_steps(tools: list[tuple[str, bool]]) -> None:
-    for summary, ok in tools:
-        st.caption(summary if ok else f":red[{summary}]")
+def steps_label(turn: display.TurnView) -> str:
+    failed = sum(not ok for _, ok in turn.tools)
+    parts = [turn.summary or f"단계 {len(turn.tools)}개"]
+    if failed:
+        parts.append(f":red[실패 {failed}]")
+    return " · ".join(parts)
 
 
-def finished_steps(tools: list[tuple[str, bool]]) -> None:
-    failed = Counter(summary for summary, ok in tools if not ok)
-    for summary, count in failed.items():
-        st.caption(f":red[{summary} · {count}회]" if count > 1 else f":red[{summary}]")
-    if tools:
-        with st.expander(f"수행 단계 {len(tools)}개", type="compact"):
-            turn_steps(tools)
+def turn_meta(turn: display.TurnView) -> None:
+    failed = Counter(summary for summary, ok in turn.tools if not ok)
+    with st.expander(steps_label(turn), type="compact"):
+        st.caption(turn.run_line, help=display.SUMMARY_HELP)
+        for summary, ok in turn.tools:
+            if ok:
+                st.caption(summary)
+        for summary, count in failed.items():
+            st.caption(f":red[{summary}" + (f" · {count}회]" if count > 1 else "]"))
 
 
 def answer(turn: display.TurnView, links: dict[str, str], *, live: bool) -> None:
     with st.chat_message("assistant", avatar=":material/smart_toy:"):
-        st.caption(turn.run_line)
-        if turn.lines is not None:
-            finished_steps(turn.tools)
-            st.markdown(display.answer_markdown(turn.lines, links))
-            st.caption(turn.summary, help=display.SUMMARY_HELP)
-        elif live:
-            turn_steps(turn.tools)
+        if live:
+            step = turn.tools[-1][0] if turn.tools else "작업 중"
+            st.caption(f":shimmer[{step}]")
             st.markdown(display.live_tail(turn.raw))
         else:
-            finished_steps(turn.tools)
-            st.markdown(display.live_text(turn.raw))
+            if turn.tools:
+                turn_meta(turn)
+            if turn.lines is not None:
+                st.markdown(display.answer_markdown(turn.lines, links))
+            else:
+                st.markdown(display.live_text(turn.raw))
         for message, error in turn.notices:
             if error:
                 st.error(message)
@@ -413,46 +338,35 @@ def toggle_wide() -> None:
     state.ai_wide = not state.ai_wide
 
 
-def panel_head(d: Dashboard, log: display.AnalysisLog, status: ProviderStatus) -> None:
+def thread_head(log: display.AnalysisLog) -> None:
     with st.container(horizontal=True, vertical_alignment="center"):
-        if state.ai_thread:
-            st.button(
-                "",
-                icon=":material/arrow_back:",
-                key="ai_back",
-                help="메인 대화 목록 복귀",
-                type="tertiary",
-                on_click=open_thread,
-                args=("",),
-            )
-        st.subheader(log.title or "AI 분석", anchor="analysis")
-        st.space("stretch")
-        st.button(
-            "",
-            icon=":material/close_fullscreen:"
-            if state.ai_wide
-            else ":material/open_in_full:",
-            key="ai_wide_on" if state.ai_wide else "ai_wide_off",
-            help="기본 너비 복귀" if state.ai_wide else "패널 너비 확장",
-            type="tertiary",
-            on_click=toggle_wide,
+        icon_button(
+            ":material/arrow_back:",
+            "ai_back",
+            "메인 대화 복귀",
+            on_click=open_thread,
+            args=("",),
         )
-    basis = log.header or f"데이터 기준 시점: {display.short_time(d.generated_at)}"
-    st.caption(
-        f"{choice_line(status)} · {basis}",
-        help=display.STATUS_HELP.get(status.kind, "").format(message=status.message)
-        or None,
-    )
+        st.subheader(log.title, anchor="analysis")
     if log.conclusion:
         with st.container(key="ai_conclusion"):
             st.markdown(log.conclusion)
-    if not state.ai_thread:
-        overview()
 
 
-def analysis(view: View) -> None:
+def conversation_body(view: View, log: display.AnalysisLog) -> None:
+    with st.container(key="ai_page"):
+        if state.ai_thread:
+            thread_head(log)
+        reading = log.report and len(log.turns) == 1 and not log.working
+        outer = "ai_report" if reading else "ai_turns"
+        with st.container(key=outer), st.container(key=f"{outer}_inner"):
+            turns(view, log)
+            received_data(log)
+        controls(log)
+
+
+def agent_page(view: View) -> None:
     busy = workspace().busy
-    found = ready()
 
     @st.fragment(run_every=0.5 if busy else None)
     def body() -> None:
@@ -461,16 +375,89 @@ def analysis(view: View) -> None:
         ws.drain()
         if state.ai_thread not in ws.board.threads:
             state.ai_thread = ""
-        if busy and not ws.busy and not state.get("settings_open"):
+        if busy != ws.busy and not state.get("settings_open"):
             st.rerun()
         log = conversation()
-        status = found.statuses[shared.app.rt.analysis.choice.provider]
-        panel_head(view.data, log, status)
-        reading = log.report and len(log.turns) == 1 and not log.working
-        outer = "ai_report" if reading else "ai_turns"
-        with st.container(key=outer), st.container(key=f"{outer}_inner"):
+        if not ws.board.threads:
+            conversation_body(view, log)
+            return
+        talk, side = st.columns([3, 1], gap="large")
+        with talk:
+            conversation_body(view, log)
+        with side, st.container(key="ai_threads"):
+            thread_list()
+
+    body()
+
+
+def chat() -> Workspace:
+    return shared.app.rt.chat
+
+
+def open_document(view: View) -> Document:
+    if view.key == "etf":
+        found: documents.EtfView | None = state.get("ai_etf_view")
+        if found is None:
+            return documents.page_document(view.data, view.key)
+        return documents.etf_document(found, view.data.generated_at)
+    return documents.page_document(view.data, view.key)
+
+
+def ask_page(view: View) -> None:
+    text: str = (state.get("chat_input") or "").strip()
+    if text:
+        shared.app.rt.call(chat().ask(text, open_document(view)))
+
+
+def stop_chat() -> None:
+    shared.app.rt.call(chat().stop())
+
+
+def chat_head(log: display.AnalysisLog) -> None:
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.subheader("페이지 챗봇", anchor=False)
+        st.space("stretch")
+        if log.working:
+            icon_button(
+                ":material/stop_circle:", "chat_stop", "중지", on_click=stop_chat
+            )
+        else:
+            icon_button(
+                ":material/add_comment:",
+                "chat_new",
+                "새 대화",
+                on_click=shared.app.rt.renew_chat,
+                disabled=chat().busy,
+            )
+        icon_button(
+            ":material/close_fullscreen:"
+            if state.ai_wide
+            else ":material/open_in_full:",
+            "ai_wide_on" if state.ai_wide else "ai_wide_off",
+            "기본 너비 복귀" if state.ai_wide else "패널 너비 확장",
+            on_click=toggle_wide,
+        )
+
+
+def page_chat(view: View) -> None:
+    busy = chat().busy
+
+    @st.fragment(run_every=0.5 if busy else None)
+    def body() -> None:
+        ws = chat()
+        ws.drain()
+        if busy != ws.busy and not state.get("settings_open"):
+            st.rerun()
+        log = ws.board.main
+        chat_head(log)
+        with st.container(key="ai_turns"), st.container(key="ai_turns_inner"):
             turns(view, log)
-            received_data(log)
-        controls(view, found)
+        st.chat_input(
+            "현재 화면에 대해 질문",
+            key="chat_input",
+            disabled=log.working,
+            on_submit=ask_page,
+            args=(view,),
+        )
 
     body()

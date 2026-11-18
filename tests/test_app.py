@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     import pytest
 
 APP = Path(finagent.__file__).parent / "app.py"
-PAGES = ("economy", "monetary", "finance", "schedule", "etf", "portfolio")
+PAGES = ("economy", "monetary", "finance", "schedule", "etf", "agent", "portfolio")
+WITHOUT_CHAT = {"agent", "portfolio"}
 
 
 def test_demo_renders_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -24,6 +25,11 @@ def test_demo_renders_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
         # Streamlit AppTest 페이지 전환용 내부 해시 직접 설정
         at._page_hash = calc_hash(path)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert not at.run().exception, path
+        toggles = [b for b in at.button if b.key == "ai_toggle"]
+        assert len(toggles) == (path not in WITHOUT_CHAT), path
+        if path == "agent":
+            _ = at.chat_input(key="ai_input").set_value("/foo").run()
+            assert "알 수 없는 명령: /foo" in at.error[0].value
     for section in at.button_group(key="pf_section").options:
         _ = at.button_group(key="pf_section").set_value(section)
         assert not at.run().exception, section

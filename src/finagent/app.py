@@ -30,10 +30,11 @@ from finagent.ui import overview as ui_overview
 from finagent.ui import schedule as ui_schedule
 from finagent.ui.ai_panel import (
     View,
+    agent_page,
     ai_settings,
-    analysis,
     apply_ai,
     etf_options,
+    page_chat,
 )
 from finagent.ui.context import UiContext
 from finagent.ui.pf_common import (
@@ -81,29 +82,49 @@ AI_CSS = """<style>
   .st-key-ai_panel {animation: ai-panel-fade 120ms ease-out}
   @keyframes ai-panel-fade {from {opacity: 0}}}
 .st-key-ai_panel:has(.st-key-ai_wide_on) {width: calc(100vw - 3rem)}
+.st-key-ai_page {flex: none; height: calc(100dvh - 12rem); min-height: 28rem;
+  width: 100%; max-width: 56rem; margin-inline: auto}
 .st-key-ai_panel > div {flex: 1 1 auto; min-height: 0}
 .st-key-ai_panel > div > [data-testid="stVerticalBlock"] {flex: 1 1 auto;
   min-height: 0; height: 100%; gap: 0.5rem}
-.st-key-ai_panel div:has(> .st-key-ai_turns),
-.st-key-ai_panel div:has(> .st-key-ai_report) {flex: 1 1 0; min-height: 0}
-.st-key-ai_panel .st-key-ai_turns {height: 100%; overflow-y: auto;
-  flex-direction: column-reverse; justify-content: flex-start}
+:is(.st-key-ai_panel, .st-key-ai_page) div:has(> .st-key-ai_turns),
+:is(.st-key-ai_panel, .st-key-ai_page) div:has(> .st-key-ai_report)
+  {flex: 1 1 0; min-height: 0}
+:is(.st-key-ai_panel, .st-key-ai_page) .st-key-ai_turns {height: 100%;
+  overflow-y: auto; flex-direction: column-reverse; justify-content: flex-start}
 .st-key-ai_turns > * {flex-shrink: 0}
 .st-key-ai_report {height: 100%; overflow-y: auto; overflow-anchor: none}
-.st-key-ai_turns, .st-key-ai_report {scrollbar-width: thin;
+.st-key-ai_threads {flex: none; height: calc(100dvh - 12rem); min-height: 28rem;
+  overflow-y: auto; overflow-x: hidden}
+.st-key-ai_threads > * {flex-shrink: 0}
+.st-key-ai_turns, .st-key-ai_report, .st-key-ai_threads {scrollbar-width: thin;
   scrollbar-color: light-dark(#CBD5E1, #334155) transparent}
 .st-key-ai_conclusion {padding-bottom: 0.5rem;
   border-bottom: 1px solid light-dark(#CBD5E1, #334155)}
 .st-key-ai_conclusion p {font-size: 14px; font-weight: 600}
 .st-key-ai_panel h2 {font-size: 18px; font-weight: 600;
   padding: 1.25rem 0 0.25rem}
-.st-key-ai_panel [data-testid="stChatMessage"] h3 {font-size: 14px;
-  font-weight: 600; padding: 1rem 0 0.25rem}
-.st-key-ai_panel [data-testid="stChatMessage"] p {max-width: 75ch}
-.st-key-ai_panel table {width: 100%; font-size: 13px;
+:is(.st-key-ai_panel, .st-key-ai_page) [data-testid="stChatMessage"] h3
+  {font-size: 14px; font-weight: 600; padding: 1rem 0 0.25rem}
+:is(.st-key-ai_panel, .st-key-ai_page) [data-testid="stChatMessage"] p
+  {max-width: 75ch}
+:is(.st-key-ai_panel, .st-key-ai_page) table {width: 100%; font-size: 13px;
   font-variant-numeric: tabular-nums; word-break: keep-all;
   overflow-wrap: anywhere}
-.st-key-ai_panel th {white-space: nowrap}
+:is(.st-key-ai_panel, .st-key-ai_page) th {white-space: nowrap}
+.st-key-ai_input_slash {display: none}
+.fa-slash {position: fixed; z-index: 1100; padding: 0.25rem;
+  border: 1px solid light-dark(#CBD5E1, #334155); border-radius: 0.5rem;
+  background: light-dark(#FFFFFF, #1E293B);
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 0.2)}
+.fa-slash-item {display: flex; gap: 0.75rem; align-items: baseline;
+  padding: 0.5rem 0.75rem; border-radius: 0.375rem; cursor: pointer;
+  font-size: 14px}
+.fa-slash-item[aria-selected="true"], .fa-slash-item:hover
+  {background: light-dark(#F1F5F9, #334155)}
+.fa-slash-item b {font-weight: 600}
+.fa-slash-item span, .fa-slash-item small {color: light-dark(#475569, #94A3B8)}
+.fa-slash-item small {margin-left: auto}
 [data-testid="stChatInputSubmitButton"]:disabled {color: light-dark(#64748B, #94A3B8)}
 </style>"""
 CARDS_CSS = """<style>
@@ -120,7 +141,7 @@ div:has(> [class*="st-key-"][class*="_cards"]) {container-type: inline-size}
     {grid-template-columns: repeat(3, minmax(0, 1fr))}
 }
 h1, h2, h3 {word-break: keep-all; overflow-wrap: break-word}
-h3:not(.st-key-ai_panel h3) {padding-top: 1.75rem}
+h3:not(:is(.st-key-ai_panel, .st-key-ai_page) h3) {padding-top: 1.75rem}
 div:has(> .st-key-page_heading) {position: absolute; width: 1px; height: 1px;
   overflow: hidden; clip-path: inset(50%)}
 button[data-testid="stBaseButton-primary"],
@@ -174,7 +195,11 @@ def runtime(demo: bool, env_file: str, settings: str) -> Runtime:
     return Runtime(
         service,
         AnalysisService(
-            service, env, settings_path=settings_path, prepare=briefing.prepare
+            service,
+            env,
+            settings_path=settings_path,
+            prepare=briefing.prepare,
+            portfolios=briefing.portfolios,
         ),
     )
 
@@ -199,8 +224,6 @@ state.setdefault("toast", "")
 state.setdefault("ai_open", False)
 state.setdefault("ai_thread", "")
 state.setdefault("ai_wide", False)
-state.setdefault("ai_last_stock", "")
-state.setdefault("ai_last_etf", "")
 
 
 def progress_table() -> tuple[str, float, dict[str, list[object]], str]:
@@ -367,14 +390,14 @@ def ai_dock(view: View) -> None:
             "",
             icon=":material/close:" if state.ai_open else ":material/smart_toy:",
             key="ai_toggle",
-            help="AI 분석",
+            help="페이지 챗봇",
             type="primary",
             shortcut="A",
             on_click=toggle_ai,
         )
     if state.ai_open:
         with st.container(key="ai_panel", border=True):
-            analysis(view)
+            page_chat(view)
 
 
 @st.fragment(run_every=60.0)
@@ -433,6 +456,10 @@ def etf_context() -> etf_page.EtfContext:
 
 def show_etf() -> None:
     etf_page.page(etf_context())
+
+
+def show_agent() -> None:
+    agent_page(View(data, "agent", set()))
 
 
 def update_all() -> None:
@@ -510,6 +537,12 @@ page = st.navigation(
             url_path="etf",
         ),
         st.Page(
+            show_agent,
+            title="에이전트",
+            icon=":material/smart_toy:",
+            url_path="agent",
+        ),
+        st.Page(
             portfolio_page,
             title="포트폴리오",
             icon=":material/pie_chart:",
@@ -543,8 +576,6 @@ with clock_slot:
 page_panels = {p.id for p in data.panels if p.page == page_key}
 with st.container(key="page_heading"):
     st.header(page.title, anchor=False)
-state.ai_page_values = {}
-state.ai_page_parts = {}
 page.run()
 state.pop("refresh_page", None)
 
@@ -552,4 +583,5 @@ theme_watch()
 st.html(palette.scheme_css(palette.kind()))
 st.html(CARDS_CSS)
 st.html(AI_CSS)
-ai_dock(View(data, page_key, page_panels))
+if page_key not in {"agent", "portfolio"}:
+    ai_dock(View(data, page_key, page_panels))

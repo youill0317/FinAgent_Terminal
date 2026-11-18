@@ -48,15 +48,6 @@ STATUS_TEXT: Final = {
     "missing_key": "키 없음",
     "not_installed": "설치 안 됨",
 }
-STATUS_HELP: Final = {
-    "missing_key": (
-        "{message}  \n환경변수 API 키 등록 또는 설정에서 대체 공급자 선택 시 실행 가능"
-    ),
-    "not_installed": (
-        "공급자 패키지 미설치  \n`{message}` 설치 또는 설정에서 대체 공급자"
-        " 선택 시 실행 가능"
-    ),
-}
 WEEKDAYS: Final = "월화수목금토일"
 STATE_TEXT: Final = {
     "working": "작업 중",
@@ -167,10 +158,6 @@ def short_date(row: IndicatorRow) -> str:
     if row.freq == "M":
         return text[2:].replace("-", ".", 1)
     return text[5:].replace("-", "/", 1)
-
-
-def short_time(iso: str) -> str:
-    return iso.replace("T", " ")[:16]
 
 
 def weekday(day: str) -> str:
@@ -410,7 +397,6 @@ class TurnView:
 class AnalysisLog:
     title: str = ""
     state: str = ""
-    snapshot: str = ""
     received: list[tuple[str, str]] = field(default_factory=list)
     sources: list[tuple[str, str]] = field(default_factory=list)
     turns: list[TurnView] = field(default_factory=list)
@@ -421,12 +407,6 @@ class AnalysisLog:
     def working(self) -> bool:
         return self.state == "working"
 
-    @property
-    def header(self) -> str:
-        if not self.snapshot:
-            return ""
-        return f"데이터 {short_time(self.snapshot)}에 고정"
-
     def apply(self, event: Event) -> None:
         kind = event.get("type")
         if kind == "turn":
@@ -435,7 +415,6 @@ class AnalysisLog:
             return
         turn = self.turns[-1]
         if kind == "start":
-            self.snapshot = str(event["snapshot"])
             turn.run = f"{event['provider_title']} · {event['model']}"
         elif kind == "text":
             turn.raw += str(event["text"])

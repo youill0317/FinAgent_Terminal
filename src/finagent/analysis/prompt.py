@@ -27,8 +27,9 @@ def system_prompt(
     web_limit: int = 0,
     threads: int = 0,
     asking: bool = False,
+    chat: bool = False,
 ) -> str:
-    parts = [text("system.txt"), data_map()]
+    parts = [text("system.txt"), text("system_chat.txt") if chat else data_map()]
     if threads:
         parts.append(text("system_main.txt").format(limit=threads))
     if asking:
@@ -89,7 +90,7 @@ class Conversation:
         for index, (request, document) in enumerate(requests):
             wrapped = f"<request>\n{request}\n</request>" if request else REPORT_REQUEST
             body = f"{document}\n\n{wrapped}" if document else wrapped
-            if index == 0:
+            if index == 0 and self.documents:
                 first = f"{FIRST_REQUEST}\n{body}"
                 out.append(Message("user", (*self.documents, first)))
             else:

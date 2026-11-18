@@ -381,15 +381,10 @@ def investor_lines(root: Path, ticker: str) -> tuple[str, ...]:
 
 
 NO_DATA: Final = "데이터 없음"
-NO_PAGE: Final = "화면 데이터 없이 보낸 요청"
 
 
 def _empty(snapshot: str) -> Document:
     return Document(f"<page_document>{NO_DATA}</page_document>", frozenset(), snapshot)
-
-
-def request_document(snapshot: str) -> Document:
-    return Document(f"<page_document>{NO_PAGE}</page_document>", frozenset(), snapshot)
 
 
 def _combined(items: Sequence[tuple[str, str]], snapshot: str) -> Document:
@@ -494,16 +489,6 @@ def etf_document(view: EtfView, snapshot: str) -> Document:
         )
     )
     return Document(f"{escape(head)}\n{picked.text}", picked.ids, snapshot)
-
-
-def portfolio_document(values: Mapping[str, str], snapshot: str) -> Document:
-    return _combined(
-        [
-            _item(f"pv_{index}", label, "포트폴리오", [text])
-            for index, (label, text) in enumerate(values.items(), 1)
-        ],
-        snapshot,
-    )
 
 
 ETF_FIELDS: Final = (

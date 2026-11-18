@@ -96,6 +96,8 @@ class ClaudeApiProvider:
 async def _rounds(
     client: AsyncAnthropic, request: RunRequest
 ) -> AsyncIterator[ProviderEvent]:
+    from anthropic import omit  # noqa: PLC0415  # 선택적 의존성 지연 임포트
+
     conversation = request.conversation
     messages = _messages(request)
     tools = _tools(request)
@@ -115,7 +117,7 @@ async def _rounds(
                 }
             ],
             messages=messages,
-            tools=tools,
+            tools=tools or omit,
             container=container,
             cache_control={"type": "ephemeral"},
             output_config={"effort": EFFORT},
