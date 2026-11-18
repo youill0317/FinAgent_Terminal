@@ -124,7 +124,7 @@ class Client:
             "type": form,
             "dateb": "",
             "owner": "include",
-            "count": "1",
+            "count": "10",
             "output": "atom",
         }
         response = limits.send(
