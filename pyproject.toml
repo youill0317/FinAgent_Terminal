@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "finagent"
-version = "1.0.2"
+version = "1.1.0"
 description = "Local investing terminal: macro dashboard, ETF comparison, portfolio analytics and AI analysis on public data."
 readme = "README.md"
 requires-python = ">=3.12"
