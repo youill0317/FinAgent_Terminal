@@ -475,6 +475,7 @@ class Updater:
 
 
 PERIODS: Final[Mapping[str, pd.DateOffset]] = {
+    "1일": pd.DateOffset(days=1),
     "1주": pd.DateOffset(weeks=1),
     "1개월": pd.DateOffset(months=1),
     "3개월": pd.DateOffset(months=3),
