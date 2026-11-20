@@ -16,21 +16,21 @@ paddingTop = "0.5rem"
 paddingBottom = "3rem"
 
 [theme.light]
-primaryColor = "#0F172A"
+primaryColor = "#1C1917"
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F1F5F9"
-codeBackgroundColor = "#F1F5F9"
-textColor = "#0F172A"
-linkColor = "#0F172A"
-borderColor = "#CBD5E1"
-codeTextColor = "#334155"
+secondaryBackgroundColor = "#F5F5F4"
+codeBackgroundColor = "#F5F5F4"
+textColor = "#1C1917"
+linkColor = "#1C1917"
+borderColor = "#D6D3D1"
+codeTextColor = "#44403C"
 greenColor = "#059669"
 redColor = "#DC2626"
 yellowColor = "#D97706"
 orangeColor = "#EA580C"
 blueColor = "#1D4ED8"
 violetColor = "#7C3AED"
-grayColor = "#64748B"
+grayColor = "#78716C"
 chartCategoricalColors = [
     "#1D4ED8",
     "#059669",
@@ -38,7 +38,7 @@ chartCategoricalColors = [
     "#DC2626",
     "#D97706",
     "#0284C7",
-    "#64748B",
+    "#78716C",
     "#EA580C",
 ]
 chartSequentialColors = [
@@ -53,26 +53,26 @@ chartSequentialColors = [
     "#075985",
     "#0C4A6E",
 ]
-dataframeBorderColor = "#CBD5E1"
-dataframeHeaderBackgroundColor = "#E2E8F0"
-dataframeHeaderTextColor = "#0F172A"
+dataframeBorderColor = "#D6D3D1"
+dataframeHeaderBackgroundColor = "#E7E5E4"
+dataframeHeaderTextColor = "#1C1917"
 
 [theme.dark]
-primaryColor = "#F1F5F9"
-backgroundColor = "#0F172A"
-secondaryBackgroundColor = "#1E293B"
-codeBackgroundColor = "#1E293B"
-textColor = "#F1F5F9"
-linkColor = "#F1F5F9"
-borderColor = "#334155"
-codeTextColor = "#CBD5E1"
+primaryColor = "#F5F5F4"
+backgroundColor = "#1C1917"
+secondaryBackgroundColor = "#292524"
+codeBackgroundColor = "#292524"
+textColor = "#F5F5F4"
+linkColor = "#F5F5F4"
+borderColor = "#44403C"
+codeTextColor = "#D6D3D1"
 greenColor = "#60CE9F"
 redColor = "#E97E7B"
 yellowColor = "#F1C25B"
 orangeColor = "#ED9A5C"
 blueColor = "#70A6E9"
 violetColor = "#A591E9"
-grayColor = "#94A3B8"
+grayColor = "#A8A29E"
 chartCategoricalColors = [
     "#70A6E9",
     "#60CE9F",
@@ -80,7 +80,7 @@ chartCategoricalColors = [
     "#E97E7B",
     "#F1C25B",
     "#5EBBEA",
-    "#94A3B8",
+    "#A8A29E",
     "#ED9A5C",
 ]
 chartSequentialColors = [
@@ -95,9 +95,9 @@ chartSequentialColors = [
     "#E0F2FE",
     "#F0F9FF",
 ]
-dataframeBorderColor = "#334155"
-dataframeHeaderBackgroundColor = "#1E293B"
-dataframeHeaderTextColor = "#F8FAFC"
+dataframeBorderColor = "#44403C"
+dataframeHeaderBackgroundColor = "#292524"
+dataframeHeaderTextColor = "#FAFAF9"
 
 [theme.sidebar]
 paddingTop = "0.5rem"
@@ -105,18 +105,18 @@ paddingBottom = "1.5rem"
 
 [theme.light.sidebar]
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F1F5F9"
-codeBackgroundColor = "#E2E8F0"
-textColor = "#0F172A"
-borderColor = "#CBD5E1"
-primaryColor = "#0F172A"
-linkColor = "#0F172A"
+secondaryBackgroundColor = "#F5F5F4"
+codeBackgroundColor = "#E7E5E4"
+textColor = "#1C1917"
+borderColor = "#D6D3D1"
+primaryColor = "#1C1917"
+linkColor = "#1C1917"
 
 [theme.dark.sidebar]
-backgroundColor = "#020617"
-secondaryBackgroundColor = "#1E293B"
-codeBackgroundColor = "#1E293B"
-textColor = "#F1F5F9"
-borderColor = "#334155"
-primaryColor = "#F1F5F9"
-linkColor = "#F1F5F9"
+backgroundColor = "#0C0A09"
+secondaryBackgroundColor = "#292524"
+codeBackgroundColor = "#292524"
+textColor = "#F5F5F4"
+borderColor = "#44403C"
+primaryColor = "#F5F5F4"
+linkColor = "#F5F5F4"

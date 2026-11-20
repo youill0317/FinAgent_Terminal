@@ -73,7 +73,7 @@ AI_CSS = """<style>
 .st-key-ai_panel {position: fixed; right: 1.5rem; top: 4rem; bottom: 5.5rem;
   z-index: 1000; width: min(800px, 100vw - 3rem); overflow: hidden;
   display: flex; flex-direction: column; gap: 0.5rem;
-  background: Canvas; background: light-dark(#FFFFFF, #0F172A);
+  background: Canvas; background: light-dark(#FFFFFF, #1C1917);
   box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 0.25);
   transform-origin: bottom right;
   animation: ai-panel-in 240ms cubic-bezier(0.16, 1, 0.3, 1)}
@@ -98,9 +98,9 @@ AI_CSS = """<style>
   overflow-y: auto; overflow-x: hidden}
 .st-key-ai_threads > * {flex-shrink: 0}
 .st-key-ai_turns, .st-key-ai_report, .st-key-ai_threads {scrollbar-width: thin;
-  scrollbar-color: light-dark(#CBD5E1, #334155) transparent}
+  scrollbar-color: light-dark(#D6D3D1, #44403C) transparent}
 .st-key-ai_conclusion {padding-bottom: 0.5rem;
-  border-bottom: 1px solid light-dark(#CBD5E1, #334155)}
+  border-bottom: 1px solid light-dark(#D6D3D1, #44403C)}
 .st-key-ai_conclusion p {font-size: 14px; font-weight: 600}
 .st-key-ai_panel h2 {font-size: 18px; font-weight: 600;
   padding: 1.25rem 0 0.25rem}
@@ -114,18 +114,18 @@ AI_CSS = """<style>
 :is(.st-key-ai_panel, .st-key-ai_page) th {white-space: nowrap}
 .st-key-ai_input_slash {display: none}
 .fa-slash {position: fixed; z-index: 1100; padding: 0.25rem;
-  border: 1px solid light-dark(#CBD5E1, #334155); border-radius: 0.5rem;
-  background: light-dark(#FFFFFF, #1E293B);
+  border: 1px solid light-dark(#D6D3D1, #44403C); border-radius: 0.5rem;
+  background: light-dark(#FFFFFF, #292524);
   box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 0.2)}
 .fa-slash-item {display: flex; gap: 0.75rem; align-items: baseline;
   padding: 0.5rem 0.75rem; border-radius: 0.375rem; cursor: pointer;
   font-size: 14px}
 .fa-slash-item[aria-selected="true"], .fa-slash-item:hover
-  {background: light-dark(#F1F5F9, #334155)}
+  {background: light-dark(#F5F5F4, #44403C)}
 .fa-slash-item b {font-weight: 600}
-.fa-slash-item span, .fa-slash-item small {color: light-dark(#475569, #94A3B8)}
+.fa-slash-item span, .fa-slash-item small {color: light-dark(#57534E, #A8A29E)}
 .fa-slash-item small {margin-left: auto}
-[data-testid="stChatInputSubmitButton"]:disabled {color: light-dark(#64748B, #94A3B8)}
+[data-testid="stChatInputSubmitButton"]:disabled {color: light-dark(#78716C, #A8A29E)}
 </style>"""
 CARDS_CSS = """<style>
 div:has(> [class*="st-key-"][class*="_cards"]) {container-type: inline-size}
@@ -145,17 +145,17 @@ h3:not(:is(.st-key-ai_panel, .st-key-ai_page) h3) {padding-top: 1.75rem}
 div:has(> .st-key-page_heading) {position: absolute; width: 1px; height: 1px;
   overflow: hidden; clip-path: inset(50%)}
 button[data-testid="stBaseButton-primary"],
-button[data-testid="stBaseButton-primary"] * {color: light-dark(#fff, #0F172A)}
+button[data-testid="stBaseButton-primary"] * {color: light-dark(#fff, #1C1917)}
 button[data-testid="stBaseButton-primary"]:disabled,
 button[data-testid="stBaseButton-primary"]:disabled *
-  {color: light-dark(#64748B, #94A3B8)}
+  {color: light-dark(#78716C, #A8A29E)}
 [data-testid="stSelectbox"] [role="group"]:not(:focus-within),
 [data-testid="stMultiSelect"] [role="group"]:not(:focus-within),
 [data-testid="stTextInputRootElement"]:not(:focus-within),
 [data-testid="stNumberInputContainer"]:not(:focus-within),
 [data-testid="stDateInputField"]:not(:focus-within),
 [data-testid="stTextAreaRootElement"]:not(:focus-within)
-  {border-color: light-dark(#CBD5E1, #64748B)}
+  {border-color: light-dark(#D6D3D1, #78716C)}
 </style>"""
 
 
@@ -481,6 +481,7 @@ def dashboard_page(
 
 
 state.pop("etf_universe_changed", None)
+palette.scheme_sync()
 with st.container(horizontal=True, vertical_alignment="center"):
     st.title("FinAgent", anchor=False, width="content")
     if args.demo:
@@ -580,7 +581,6 @@ page.run()
 state.pop("refresh_page", None)
 
 theme_watch()
-st.html(palette.scheme_css(palette.kind()))
 st.html(CARDS_CSS)
 st.html(AI_CSS)
 if page_key not in {"agent", "portfolio"}:

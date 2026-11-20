@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 import streamlit as st
+from streamlit.components.v2 import component
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -59,13 +60,13 @@ LIGHT: Final = Palette(
         "EA": "#D97706",
         "JP": "#7C3AED",
         "CN": "#0D9488",
-        "GL": "#475569",
+        "GL": "#57534E",
     },
     up="#DC2626",
     down="#1D4ED8",
-    ink="#0F172A",
-    guide="#94A3B8",
-    muted="#64748B",
+    ink="#1C1917",
+    guide="#A8A29E",
+    muted="#78716C",
     paper="#FFFFFF",
 )
 DARK: Final = Palette(
@@ -75,14 +76,14 @@ DARK: Final = Palette(
         "EA": "#F1C25B",
         "JP": "#A591E9",
         "CN": "#5FCFBE",
-        "GL": "#94A3B8",
+        "GL": "#A8A29E",
     },
     up="#E97E7B",
     down="#70A6E9",
-    ink="#F1F5F9",
-    guide="#64748B",
-    muted="#94A3B8",
-    paper="#0F172A",
+    ink="#F5F5F4",
+    guide="#78716C",
+    muted="#A8A29E",
+    paper="#1C1917",
 )
 
 
@@ -111,5 +112,27 @@ def tint(color: str, step: int) -> str:
     return mix(color, current().guide, share)
 
 
-def scheme_css(theme: str) -> str:
-    return f"<style>:root {{color-scheme: {theme}}}</style>"
+SCHEME_JS: Final = """
+function sync() {
+  const app = document.querySelector(".stApp");
+  if (!app) return;
+  const [r, g, b] = getComputedStyle(app).backgroundColor.match(/\\d+/g).map(Number);
+  const dark = 0.2126 * r + 0.7152 * g + 0.0722 * b < 128;
+  document.documentElement.style.colorScheme = dark ? "dark" : "light";
+}
+
+export default function () {
+  sync();
+  const app = document.querySelector(".stApp");
+  if (!app || window.__finagentScheme === app) return;
+  window.__finagentScheme = app;
+  new MutationObserver(sync).observe(app, { attributeFilter: ["class"] });
+}
+"""
+
+_SCHEME: Final = component("finagent_scheme", js=SCHEME_JS)
+
+
+def scheme_sync() -> None:
+    _ = st.html("<style>.st-key-color_scheme {display: none}</style>")
+    _ = _SCHEME(key="color_scheme")
