@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from importlib.resources import files
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
 
 TEXT: Final = files("finagent.analysis") / "text"
 
@@ -21,19 +24,27 @@ def text(name: str) -> str:
     return (TEXT / name).read_text(encoding="utf-8").strip()
 
 
-def system_prompt(
+def system_prompt(  # noqa: PLR0913  # 조정자·스레드·팀 에이전트·챗봇별 지침 조합 옵션
     instructions: str = "",
     *,
     web_limit: int = 0,
-    threads: int = 0,
+    coordinator: bool = False,
     asking: bool = False,
+    team: bool = False,
     chat: bool = False,
+    tools: Collection[str] | None = None,
 ) -> str:
-    parts = [text("system.txt"), text("system_chat.txt") if chat else data_map()]
-    if threads:
-        parts.append(text("system_main.txt").format(limit=threads))
+    parts = [text("system.txt")]
+    if chat:
+        parts.append(text("system_chat.txt"))
+    elif tools is None or tools:
+        parts.append(data_map(tools))
+    if coordinator:
+        parts.append(text("system_main.txt"))
     if asking:
         parts.append(text("system_thread.txt"))
+    if team:
+        parts.append(text("system_agent.txt"))
     if web_limit:
         parts.append(text("system_web.txt").format(limit=web_limit))
     if instructions.strip():
@@ -41,9 +52,13 @@ def system_prompt(
     return "\n\n".join(parts)
 
 
-def data_map() -> str:
+def data_map(tools: Collection[str] | None = None) -> str:
     rows = (line.split("\t", 1) for line in text("data_map.txt").splitlines())
-    lines = [f"- {need}: {tool}" for need, tool in rows]
+    lines = [
+        f"- {need}: {tool}"
+        for need, tool in rows
+        if tools is None or any(name in tool for name in tools)
+    ]
     return "\n".join((DATA_MAP_HEAD, *lines))
 
 

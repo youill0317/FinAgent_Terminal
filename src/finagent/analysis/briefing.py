@@ -20,7 +20,6 @@ from finagent import (
 from finagent.analysis import documents, prompt, skill
 from finagent.analysis.company_tools import universe
 from finagent.analysis.context import build_document
-from finagent.analysis.presets import ETF, MACRO, STOCK
 from finagent.analysis.service import RunInput
 from finagent.demo import etf as demo_etf
 from finagent.demo import portfolio as demo_portfolio
@@ -71,14 +70,15 @@ class Briefing:
             document = documents.stock_document(
                 self.stock_inputs(ticker), build_document(d)
             )
-            return RunInput(STOCK.text, document, brief.kind)
+            guide = "" if self.demo else skill.guide(folder)
+            return RunInput("", document, brief.kind, guide)
         if brief.kind == "etf":
             if ticker not in self.options():
                 self.refuse(ticker, self.confirm(ticker), {"찾을 수 없음", "개별 주식"})
             document = documents.etf_analysis_document(
                 self.etf_inputs(brief), build_document(d)
             )
-            return RunInput(ETF.text, document, brief.kind)
+            return RunInput("", document, brief.kind, prompt.text("etf_guide.txt"))
         found = self.etf_points([ticker for _, _, ticker in documents.MARKET_ETFS])
         document = documents.macro_document(
             d,
@@ -86,7 +86,7 @@ class Briefing:
             self.dashboard.today(),
             lambda ticker: found.get(ticker, ()),
         )
-        return RunInput(MACRO.text, document, brief.kind)
+        return RunInput("", document, brief.kind, prompt.text("macro_guide.txt"))
 
     @staticmethod
     def refuse(ticker: str, verdict: etf.Verdict, refused: set[etf.Verdict]) -> None:
@@ -157,7 +157,6 @@ class Briefing:
         return documents.StockInputs(
             ticker=ticker,
             name=ticker if name is None else str(name.value),
-            guide=skill.guide(self.root / skill.DATA_DIR) if not self.demo else "",
             company=found.cells,
             annual=annual,
             bars=bars,
@@ -245,7 +244,6 @@ class Briefing:
         book = self.book()
         return documents.EtfInputs(
             ticker=ticker,
-            guide=prompt.text("etf_guide.txt"),
             funds=funds.get(ticker, {}),
             table=brief.company.etf_table(),
             composition=found,

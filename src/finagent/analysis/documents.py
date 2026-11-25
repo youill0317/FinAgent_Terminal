@@ -186,7 +186,6 @@ BASIC_FIELDS: Final = (
 class StockInputs:
     ticker: str
     name: str
-    guide: str
     company: Mapping[str, etf.Cell]
     annual: Mapping[str, object]
     bars: pd.DataFrame
@@ -302,10 +301,9 @@ def stock_document(inputs: StockInputs, base: Document) -> Document:
     )
     stock = "\n".join(text for text, _ in items)
     ticker = quoteattr(inputs.ticker)
-    parts = [inputs.guide] if inputs.guide else []
-    parts.append(f"<stock ticker={ticker}>\n{stock}\n</stock>")
+    text = f"<stock ticker={ticker}>\n{stock}\n</stock>"
     ids = base.ids | {cite for _, cite in items}
-    return Document("\n\n".join(parts), ids, base.snapshot, base.text)
+    return Document(text, ids, base.snapshot, base.text)
 
 
 def _last_year(bars: pd.DataFrame) -> pd.DataFrame:
@@ -514,7 +512,6 @@ COUNTRIES: Final = 10
 @dataclass(frozen=True, slots=True)
 class EtfInputs:
     ticker: str
-    guide: str
     funds: Mapping[str, etf.Cell]
     table: pd.DataFrame
     composition: etf.Composition | None
@@ -701,6 +698,6 @@ def etf_analysis_document(inputs: EtfInputs, base: Document) -> Document:
         )
     )
     body = "\n".join(text for text, _ in items)
-    parts = [inputs.guide, f"<etf ticker={quoteattr(inputs.ticker)}>\n{body}\n</etf>"]
+    text = f"<etf ticker={quoteattr(inputs.ticker)}>\n{body}\n</etf>"
     ids = base.ids | {cite for _, cite in items}
-    return Document("\n\n".join(parts), ids, base.snapshot, base.text)
+    return Document(text, ids, base.snapshot, base.text)

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Final
 import streamlit as st
 
 from finagent import display, portfolio
-from finagent.analysis import documents, skill
+from finagent.analysis import agents, documents, skill
 from finagent.analysis.briefing import Briefing
 from finagent.analysis.company_tools import universe
 from finagent.analysis.presets import ETF, MACRO, STOCK, Preset
@@ -40,6 +40,7 @@ SLASH: Final = (
     Command("/etf", ETF.title, "티커", ("etf",)),
     Command("/종목", STOCK.title, "티커", ("종목", "stock")),
 )
+DEBATE_STAGE: Final = agents.DEBATE
 STATE_ICON = {
     "working": ":material/progress_activity:",
     "done": ":material/check_circle:",
@@ -203,10 +204,18 @@ def open_thread(key: str) -> None:
     state.ai_thread = key
 
 
+def card_label(log: display.AnalysisLog) -> str:
+    parts = [log.title]
+    if log.stage == DEBATE_STAGE and log.turns:
+        parts.append(f"{len(log.turns)}라운드")
+    parts.append(display.STATE_TEXT[log.state])
+    return " · ".join(parts)
+
+
 def thread_card(key: str, place: str) -> None:
     log = workspace().board.threads[key]
     st.button(
-        f"{log.title} · {display.STATE_TEXT[log.state]}",
+        card_label(log),
         icon=STATE_ICON[log.state],
         key=f"ai_card_{place}_{key}",
         on_click=open_thread,
@@ -218,8 +227,27 @@ def thread_card(key: str, place: str) -> None:
         st.caption(log.conclusion)
 
 
+def team_list(key: str) -> None:
+    board = workspace().board
+    log = board.threads.get(key)
+    if log is not None and log.parent:
+        key, log = log.parent, board.threads[log.parent]
+    if log is None or not log.children:
+        return
+    working = sum(board.threads[child].working for child in log.children)
+    label = f"에이전트 {len(log.children)}개" + (
+        f" · 작업 중 {working}" if working else ""
+    )
+    st.subheader(label, anchor=False)
+    for stage, keys in board.stages(key).items():
+        st.caption(stage)
+        for child in keys:
+            thread_card(child, "team")
+    st.divider()
+
+
 def thread_list() -> None:
-    threads = workspace().board.threads
+    threads = workspace().board.top()
     working = sum(log.working for log in threads.values())
     label = f"스레드 {len(threads)}개" + (f" · 작업 중 {working}" if working else "")
     st.subheader(label, anchor=False)
@@ -339,15 +367,17 @@ def toggle_wide() -> None:
 
 
 def thread_head(log: display.AnalysisLog) -> None:
+    parent = workspace().board.threads.get(log.parent) if log.parent else None
     with st.container(horizontal=True, vertical_alignment="center"):
         icon_button(
             ":material/arrow_back:",
             "ai_back",
-            "메인 대화 복귀",
+            "보고서 복귀" if parent is not None else "메인 대화 복귀",
             on_click=open_thread,
-            args=("",),
+            args=(log.parent,),
         )
-        st.subheader(log.title, anchor="analysis")
+        title = f"{parent.title} · {log.title}" if parent is not None else log.title
+        st.subheader(title, anchor="analysis")
     if log.conclusion:
         with st.container(key="ai_conclusion"):
             st.markdown(log.conclusion)
@@ -385,6 +415,7 @@ def agent_page(view: View) -> None:
         with talk:
             conversation_body(view, log)
         with side, st.container(key="ai_threads"):
+            team_list(state.ai_thread)
             thread_list()
 
     body()

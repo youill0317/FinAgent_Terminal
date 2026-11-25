@@ -402,6 +402,9 @@ class AnalysisLog:
     turns: list[TurnView] = field(default_factory=list)
     report: bool = False
     conclusion: str = ""
+    parent: str = ""
+    stage: str = ""
+    children: list[str] = field(default_factory=list)
 
     @property
     def working(self) -> bool:
@@ -462,8 +465,23 @@ class Board:
     def apply(self, event: Event) -> None:
         key = str(event["thread"])
         if event["type"] == "thread":
-            title = str(event["title"])
-            self.threads[key] = AnalysisLog(title, "working")
-            self.main.turns[-1].threads.append(key)
+            title, parent = str(event["title"]), str(event.get("parent") or "")
+            stage = str(event.get("stage") or "")
+            self.threads[key] = AnalysisLog(
+                title, "working", parent=parent, stage=stage
+            )
+            if parent:
+                self.threads[parent].children.append(key)
+            else:
+                self.main.turns[-1].threads.append(key)
             return
         (self.threads[key] if key else self.main).apply(event)
+
+    def top(self) -> dict[str, AnalysisLog]:
+        return {key: log for key, log in self.threads.items() if not log.parent}
+
+    def stages(self, key: str) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        for child in self.threads[key].children:
+            grouped.setdefault(self.threads[child].stage, []).append(child)
+        return grouped
