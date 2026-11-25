@@ -157,5 +157,6 @@ class Dashboard(Frozen):
     calendar: tuple[CalendarEntry, ...]
     policy_changes: tuple[PolicyChange, ...]
     fomc_dates: tuple[str, ...]
+    recent_releases: tuple[CalendarEntry, ...] = ()
     calendar_message: str | None = None
     fomc_message: str | None = None

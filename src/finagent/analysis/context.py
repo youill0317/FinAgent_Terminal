@@ -2,16 +2,55 @@
 
 from __future__ import annotations
 
+from calendar import monthrange
 from dataclasses import dataclass
+from datetime import date
 from typing import TYPE_CHECKING, Final
 from xml.sax.saxutils import escape, quoteattr
 
 from finagent import display
+from finagent.sources import parse_period
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from finagent.models import Dashboard, IndicatorRow, Panel, Projections
 
 MISSING: Final = "—"
+STALE_LAG_DAYS: Final[Mapping[str, int]] = {
+    "D": 5,
+    "W": 14,
+    "M": 40,
+    "Q": 115,
+    "A": 400,
+}
+
+
+def period_end(value: date | str, freq: str) -> date | None:
+    """관측 시점(일·월·분기·연)의 해당 기간 종료일을 반환한다."""
+    day = value if isinstance(value, date) else parse_period(value)
+    if day is None:
+        return None
+    if freq in {"D", "W"}:
+        return day
+    if freq == "M":
+        return date(day.year, day.month, monthrange(day.year, day.month)[1])
+    if freq == "Q":
+        end_month = ((day.month - 1) // 3 + 1) * 3
+        return date(day.year, end_month, monthrange(day.year, end_month)[1])
+    if freq == "A":
+        return date(day.year, 12, 31)
+    return day
+
+
+def stale_days(value: date | str, freq: str, today: date) -> int | None:
+    """관측 종료일이 기준일 대비 지연 임계치 이상이면 경과 일수를 반환한다."""
+    end = period_end(value, freq)
+    limit = STALE_LAG_DAYS.get(freq)
+    if end is None or limit is None:
+        return None
+    lag = (today - end).days
+    return lag if lag >= limit else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,11 +63,12 @@ class Document:
 
 def build_document(dashboard: Dashboard) -> Document:
     snapshot = quoteattr(dashboard.generated_at)
+    as_of = date.fromisoformat(dashboard.generated_at[:10])
     lines = [f"<indicator_document snapshot={snapshot}>"]
     ids: set[str] = set()
     for panel in dashboard.panels:
         for row in panel.rows:
-            text, known = _indicator(panel, row)
+            text, known = _indicator(panel, row, as_of)
             lines.append(text)
             if known:
                 ids.add(row.id)
@@ -81,13 +121,9 @@ def build_document(dashboard: Dashboard) -> Document:
         sep_lines, sep_ids = _projections(dashboard.projections)
         lines.extend(sep_lines)
         ids.update(sep_ids)
-    if dashboard.calendar:
-        body = " · ".join(
-            f"{entry.date} {entry.name} ({entry.source})"
-            for entry in dashboard.calendar
-        )
-        lines.append(element("calendar", "발표 일정", "FRED releases", body))
-        ids.add("calendar")
+    for text, cite in _release_elements(dashboard):
+        lines.append(text)
+        ids.add(cite)
     lines.append("</indicator_document>")
     return Document(
         text="\n".join(lines),
@@ -96,7 +132,21 @@ def build_document(dashboard: Dashboard) -> Document:
     )
 
 
-def _indicator(panel: Panel, row: IndicatorRow) -> tuple[str, bool]:
+def _release_elements(dashboard: Dashboard) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for cite, title, entries in (
+        ("calendar", "발표 일정", dashboard.calendar),
+        ("recent_releases", "최근 발표 완료", dashboard.recent_releases),
+    ):
+        if entries:
+            body = " · ".join(
+                f"{entry.date} {entry.name} ({entry.source})" for entry in entries
+            )
+            out.append((element(cite, title, "FRED releases", body), cite))
+    return out
+
+
+def _indicator(panel: Panel, row: IndicatorRow, as_of: date) -> tuple[str, bool]:
     attrs = {
         "id": row.id,
         "name": row.label,
@@ -107,6 +157,11 @@ def _indicator(panel: Panel, row: IndicatorRow) -> tuple[str, bool]:
     }
     if row.copyright:
         attrs["copyright"] = row.copyright
+    if row.status == "ok" and row.date:
+        lag = stale_days(row.date, row.freq, as_of)
+        if lag is not None:
+            attrs["stale"] = "true"
+            attrs["lag_days"] = str(lag)
     head = (
         "<indicator " + " ".join(f"{k}={quoteattr(v)}" for k, v in attrs.items()) + ">"
     )

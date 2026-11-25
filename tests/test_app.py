@@ -33,9 +33,12 @@ def test_demo_renders_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
     for section in at.button_group(key="pf_section").options:
         _ = at.button_group(key="pf_section").set_value(section)
         assert not at.run().exception, section
+    _ = at.button_group(key="pf_mode").set_value("investors")
+    assert not at.run().exception, "investors"
     _ = at.button_group(key="pf_mode").set_value("stock")
     held = at.run().button_group(key="stock_held")
     _ = held.set_value(held.options[0])
+    assert "기업 정보" in at.run().button_group(key="stock_section").options
     for section in at.run().button_group(key="stock_section").options:
         _ = at.button_group(key="stock_section").set_value(section)
         assert not at.run().exception, section

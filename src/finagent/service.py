@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from functools import partial
-from typing import TYPE_CHECKING, final
+from typing import TYPE_CHECKING, Final, final
 
 from finagent import catalog, memory
 from finagent.dashboard import (
@@ -50,6 +50,10 @@ def local_now() -> datetime:
     return datetime.now().astimezone()
 
 
+SERIES_TTL: Final = timedelta(hours=1)
+SNAPSHOT_TTL: Final = timedelta(hours=1)
+
+
 def series_key(fetch: Fetch) -> str:
     return f"{fetch.source}:{series_code(fetch)}"
 
@@ -59,11 +63,27 @@ class SeriesStore:
     def __init__(self, clock: Callable[[], datetime] = local_now) -> None:
         self._clock = clock
 
+    def _is_fresh(self, fetched_at: datetime) -> bool:
+        now = self._clock()
+        return (
+            fetched_at.date() == now.date()
+            and timedelta(0) <= now - fetched_at <= SERIES_TTL
+        )
+
     def covering(self, source: str, code: str, start: date) -> Series | None:
         found = memory.current()
         key = f"{source}:{code}"
-        if found.macro_at is not None:
-            day = found.macro_at.date()
+        macro_at = found.macro_at
+        extra = found.extra.get(key)
+        if (
+            extra is not None
+            and extra.start <= start
+            and self._is_fresh(extra.fetched_at)
+            and (macro_at is None or extra.fetched_at >= macro_at)
+        ):
+            return extra.points
+        if macro_at is not None and self._is_fresh(macro_at):
+            day = macro_at.date()
             for fetch, points in list(found.macro.items()):
                 if (
                     not isinstance(fetch, EtfSeries)
@@ -71,13 +91,6 @@ class SeriesStore:
                     and years_before(day, fetch.years) <= start
                 ):
                     return points
-        extra = found.extra.get(key)
-        if (
-            extra is not None
-            and extra.start <= start
-            and extra.fetched_at.date() == self._clock().date()
-        ):
-            return extra.points
         return None
 
     def put_extra(self, source: str, code: str, start: date, points: Series) -> None:
@@ -85,11 +98,16 @@ class SeriesStore:
         memory.current().extra.put(f"{source}:{code}", record)
 
     async def through(
-        self, fetch: MacroFetch, ctx: FetchContext, today: date
+        self,
+        fetch: MacroFetch,
+        ctx: FetchContext,
+        today: date,
+        *,
+        fresh: bool = False,
     ) -> Series:
         start = years_before(today, fetch.years)
         code = series_code(fetch)
-        found = self.covering(fetch.source, code, start)
+        found = None if fresh else self.covering(fetch.source, code, start)
         if found is not None:
             return found
         series = await ctx.shared(repr(fetch), partial(fetch.fetch, ctx, today))
@@ -100,6 +118,7 @@ class SeriesStore:
 @final
 class DashboardService:
     __slots__ = (
+        "_built_at",
         "_client_factory",
         "_clock",
         "_demo",
@@ -130,6 +149,7 @@ class DashboardService:
         self._client_factory = client_factory
         self._clock = clock
         self._demo = demo
+        self._built_at: datetime | None = None
         self._stale: dict[Fetch, SourceError] = {}
         self._refreshes = 0
         self._snapshot: Dashboard | None = None
@@ -189,6 +209,16 @@ class DashboardService:
     async def retry_failed(self) -> Dashboard:
         return await self._get(refresh=True, only=set(self._stale), extras=frozenset())
 
+    def _is_stale(self) -> bool:
+        if self._demo or self._built_at is None:
+            return False
+        now = self._clock()
+        return (
+            self._built_at.date() != now.date()
+            or now - self._built_at > SNAPSHOT_TTL
+            or now < self._built_at
+        )
+
     async def _get(
         self,
         *,
@@ -200,12 +230,14 @@ class DashboardService:
         if pending is not None and not pending.done():
             return await asyncio.shield(pending)
         snapshot = self._snapshot
-        if not refresh and snapshot is not None:
+        stale = not refresh and snapshot is not None and self._is_stale()
+        if not refresh and not stale and snapshot is not None:
             return snapshot
-        if refresh:
+        renew = refresh or stale
+        if renew:
             self._refreshes += 1
         self._pending = asyncio.ensure_future(
-            self._build(refresh=refresh, only=only, extras=extras)
+            self._build(refresh=renew, only=only, extras=extras)
         )
         return await asyncio.shield(self._pending)
 
@@ -238,4 +270,5 @@ class DashboardService:
         finally:
             self.progress = None
         found.macro_at = now
+        self._built_at = now
         return self._snapshot

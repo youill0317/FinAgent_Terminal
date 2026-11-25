@@ -362,6 +362,7 @@ class AnalysisService:
         if self._prepare is None:
             msg = "현재 실행 환경 내 보고서 분석 준비 미지원"
             raise ValueError(msg)
+        company.today = self._dashboard.today()
         brief = Brief(kind, ticker, portfolio, await self._dashboard.get(), company)
         return await asyncio.to_thread(self._prepare, brief)
 

@@ -18,7 +18,7 @@ from finagent import etf, limits, markets, memory, prices, sec, yahoo
 from finagent.etf import FAILURES, Cell
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
 HISTORY_DAYS: Final = 400
 CALENDAR_YEAR: Final = 365
@@ -47,6 +47,8 @@ PERCENT_FIELDS: Final = frozenset({"roe", "net_margin", "revenue_growth"})
 
 
 SEC_YEARS: Final = 5
+FILING_FORMS: Final = frozenset({"10-K", "10-Q", "8-K"})
+FILING_LIMIT: Final = 12
 
 
 YEAR_DAYS: Final = (350, 380)
@@ -488,12 +490,111 @@ def _yahoo_annual(symbol: str) -> dict[str, object]:
     return {"source": YAHOO, **{key: row[key] for key in kept}}
 
 
+@dataclass(frozen=True, slots=True)
+class FilingRow:
+    form: str
+    accession: str
+    filed: str
+    items: str
+    primary: str
+    url: str
+
+
 def annual_rows(symbol: str, agent: str, today: date) -> dict[str, object]:
-    if markets.us_listed(symbol) and agent and agent.isascii():
-        found = _sec_annual(symbol, agent, today)
-        if found:
-            return found
-    return _yahoo_annual(symbol)
+    table = memory.current().annuals
+    saved = table.get(symbol)
+    if saved is not None and saved[0] == today:
+        return saved[1]
+    found = (
+        _sec_annual(symbol, agent, today)
+        if markets.us_listed(symbol) and agent and agent.isascii()
+        else {}
+    )
+    if not found:
+        found = _yahoo_annual(symbol)
+    if found:
+        table.put(symbol, (today, found))
+    return found
+
+
+def _items_text(value: object) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if str(item))
+    return str(value or "")
+
+
+def _parse_filings(cik: str, raw: Mapping[str, object]) -> tuple[FilingRow, ...]:
+    filings = raw.get("filings")
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if not isinstance(recent, dict):
+        return ()
+    forms = recent.get("form")
+    accessions = recent.get("accessionNumber")
+    filed_dates = recent.get("filingDate")
+    if not (
+        isinstance(forms, list)
+        and isinstance(accessions, list)
+        and isinstance(filed_dates, list)
+    ):
+        return ()
+    items_list = recent.get("items")
+    primaries = recent.get("primaryDocument")
+    item_col = items_list if isinstance(items_list, list) else [""] * len(forms)
+    primary_col = primaries if isinstance(primaries, list) else [""] * len(forms)
+    return tuple(
+        FilingRow(
+            form=str(form),
+            accession=str(accession),
+            filed=str(filed),
+            items=_items_text(items),
+            primary=str(primary or ""),
+            url=sec.archive_url(cik, str(accession), str(primary))
+            if primary
+            else sec.archive_url(cik, str(accession)),
+        )
+        for form, accession, filed, items, primary in zip(
+            forms, accessions, filed_dates, item_col, primary_col, strict=False
+        )
+    )
+
+
+def _recent_filings(symbol: str, agent: str, today: date) -> tuple[FilingRow, ...]:
+    table = memory.current().submissions
+    saved = table.get(symbol)
+    if saved is not None and saved[0] == today:
+        return saved[1]
+    client = sec.Client(agent)
+    try:
+        archive = sec.Archive(client, today, limits.INTERACTIVE_WAIT)
+        cik = archive.cik(symbol)
+        if cik is None:
+            return ()
+        raw = sec.json_or_none(client.submissions(cik, limits.INTERACTIVE_WAIT))
+    except FAILURES:
+        return ()
+    finally:
+        client.close()
+    if raw is None:
+        return ()
+    rows = _parse_filings(cik, raw)
+    table.put(symbol, (today, rows))
+    return rows
+
+
+def company_filings(
+    symbol: str,
+    agent: str,
+    today: date,
+    *,
+    forms: Collection[str] = FILING_FORMS,
+    limit: int = FILING_LIMIT,
+) -> tuple[FilingRow, ...]:
+    if not (markets.us_listed(symbol) and agent and agent.isascii()):
+        return ()
+    rows = _recent_filings(symbol, agent, today)
+    wanted = set(forms)
+    kept = [row for row in rows if not wanted or row.form in wanted]
+    return tuple(kept[:limit])
 
 
 def _bars(symbol: str, today: date) -> prices.PriceStore:

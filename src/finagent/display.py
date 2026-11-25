@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 from finagent import catalog
 from finagent.analysis import web
 from finagent.fetch import ECOS_KEY_ENV, FRED_KEY_ENV
+from finagent.investors import FIGI_KEY
+from finagent.markets import ALPACA_KEY_ENV, ALPACA_SECRET_ENV
 from finagent.models import AREA_LABEL
 
 if TYPE_CHECKING:
@@ -30,6 +32,11 @@ type Color = Literal["red", "orange", "yellow", "blue", "green", "violet", "gray
 KEY_HELP: Final = {
     "FRED": (FRED_KEY_ENV, "https://fredaccount.stlouisfed.org/apikeys"),
     "ECOS": (ECOS_KEY_ENV, "https://ecos.bok.or.kr/api/#/AuthKeyApply"),
+    "ALPACA": (
+        f"{ALPACA_KEY_ENV}` · `{ALPACA_SECRET_ENV}",
+        "https://app.alpaca.markets/signup",
+    ),
+    "OPENFIGI": (FIGI_KEY, "https://www.openfigi.com/user/profile/api-key"),
 }
 SOURCE_COLOR: Final[dict[str, Color]] = {
     "ok": "green",

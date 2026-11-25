@@ -101,6 +101,7 @@ FRED: Final[dict[str, Walk]] = {
     "SP500": _w("D", (4, 4300), (2, 5200), (1, 5900), (0, 6650), vol=40),
     "NIKKEI225": _w("D", (4, 27500), (2, 38500), (1, 39000), (0, 48500), vol=350),
     "WALCL": _w("W", (4, 8300000), (0, 6550000), vol=5000),
+    "JPNASSETS": _w("M", (4, 7000000), (0, 7450000), vol=30000),
     "BAMLH0A0HYM2": _w("D", (3, 4.5), (1.5, 3.2), (0.5, 3.6), (0, 3.05), vol=0.05),
     "BAMLHE00EHYIOAS": _w("D", (3, 5.0), (1.5, 3.8), (0.5, 3.4), (0, 3.0), vol=0.05),
     "DRTSCILM": _w("Q", (4, 40), (2, 8), (1, -2), (0, 5), vol=3),
@@ -178,6 +179,7 @@ ECOS: Final[dict[str, Walk]] = {
     "104Y016/BDCA1": _w("M", (4, 2300000), (0, 2586900), vol=4000),
     "901Y033/AB00/2": _w("M", (4, 112.0), (0, 124.8), vol=1.5),
     "161Y005/BBHS00": _w("M", (4, 3800000), (0, 4350000), vol=4000),
+    "102Y004/ABA1": _w("M", (4, 255000), (0, 275000), vol=2000),
     "902Y023/IRLT/JPN": _w("M", (4, 0.5), (1, 1.0), (0, 1.65), vol=0.05),
     "902Y023/IRLT/CHN": _w("M", (4, 2.8), (1, 1.9), (0, 1.8), vol=0.05),
     "514Y001/AA": _w("Q", (4, -15), (1, -5), (0, 3), vol=3),
@@ -346,6 +348,8 @@ DEMO_SEP_LONGER_RUN: Final[dict[str, tuple[float, float]]] = {
 }
 
 DEMO_RELEASES: Final = (
+    (-3, "Employment Situation"),
+    (-1, "Personal Income and Outlays"),
     (1, "Producer Price Index"),
     (2, "Consumer Price Index"),
     (2, "Unemployment Insurance Weekly Claims Report"),

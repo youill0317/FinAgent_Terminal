@@ -496,11 +496,15 @@ def rows_chart(  # noqa: PLR0913
     }
     formats = {name: row.fmt for name, row in zip(labels, shown, strict=True)}
     if rebase:
-        lines = {name: rebased(points) for name, points in lines.items()}
-        formats = dict.fromkeys(labels, REBASED_FMT)
+        lines = {
+            name: rebased(points)
+            for name, points in lines.items()
+            if points and points[0][1]
+        }
+        formats = dict.fromkeys(lines, REBASED_FMT)
     line_chart(
         lines,
-        fmt=formats[labels[0]],
+        fmt=formats.get(labels[0], REBASED_FMT),
         colors=colors_of(shown, labels),
         height=height,
         alt=alt,

@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final, cast
 
 from finagent import (
     etf,
     fundamentals,
     investors,
+    limits,
     lookthrough,
     markets,
     portfolio,
@@ -106,7 +107,14 @@ class Briefing:
             rows = demo_etf.rows(list(tickers))
         else:
             listed = {p.ticker for p in universe(self.settings_path)}
-            rows = price_store().rows([t for t in tickers if t in listed])
+            wanted = [t for t in tickers if t in listed]
+            today = self.dashboard.today()
+            if wanted:
+                start = today - timedelta(days=documents.CHANGE_DAYS + 30)
+                _ = price_store().ensure(
+                    wanted, start, today, max_wait=limits.INTERACTIVE_WAIT
+                )
+            rows = price_store().rows(wanted)
         table = etf.wide(rows, "adj_close")
         return {
             str(name): tuple(
@@ -148,7 +156,7 @@ class Briefing:
             annual = demo_etf.annual()
             bars = demo_etf.stock_rows(ticker)
         else:
-            day = datetime.now().astimezone().date()
+            day = self.dashboard.today()
             agent = self.sec_agent()
             found = fundamentals.company_info(ticker, self.market_keys(), agent, day)
             annual = fundamentals.annual_rows(found.symbol, agent, day)
@@ -238,7 +246,7 @@ class Briefing:
             bars = demo_etf.rows([ticker])
         else:
             updater = self.updater()
-            day = datetime.now().astimezone().date()
+            day = self.dashboard.today()
             found = etf.open_detail(ticker, self.sec_agent(), updater.store, day)
             funds = updater.store.funds()
             bars = price_store().rows([ticker])

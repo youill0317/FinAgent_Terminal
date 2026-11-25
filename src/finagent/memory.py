@@ -61,6 +61,10 @@ class Store:
         self.expenses: Table[str, dict[str, float]] = Table()
         self.fund_series: tuple[date, dict[str, sec.FundSeries]] | None = None
         self.companies: Table[str, fundamentals.Company] = Table()
+        self.annuals: Table[str, tuple[date, dict[str, object]]] = Table()
+        self.submissions: Table[
+            str, tuple[date, tuple[fundamentals.FilingRow, ...]]
+        ] = Table()
         self.facts: Table[str, portfolio.Facts] = Table()
         self.splits: Table[str, tuple[portfolio.Split, ...]] = Table()
         self.ciks: tuple[date, dict[str, str]] | None = None

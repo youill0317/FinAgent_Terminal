@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 
 from finagent import catalog, prices
-from finagent.analysis import documents, prompt
+from finagent.analysis import context, documents, prompt
 from finagent.analysis.company_tools import (
     DEFAULT_FILINGS,
     DEFAULT_HOLDINGS,
@@ -66,7 +66,7 @@ RAW_DECIMALS: Final = 4
 PRICE_DEFAULT_DAYS: Final = 90
 PRICE_TICKER_LIMIT: Final = 20
 BASES: Final[tuple[str, ...]] = ("split", "total")
-STALE_FRED_DAYS: Final = 730
+STALE_FRED_DAYS: Final = 180
 FRED_HITS: Final = 15
 ECOS_PLAIN_PARTS: Final = 3
 
@@ -125,6 +125,10 @@ TOOL_SPECS: Final[tuple[tuple[str, str, Json], ...]] = (
                     "description": "native(원래 주기) 또는 월·분기·연 평균",
                 },
                 "transform": {"type": "string", "enum": list(TRANSFORMS)},
+                "fresh": {
+                    "type": "boolean",
+                    "description": "true 시 캐시를 건너뛰고 원천 API 재조회",
+                },
             },
             "additionalProperties": False,
         },
@@ -147,6 +151,10 @@ TOOL_SPECS: Final[tuple[tuple[str, str, Json], ...]] = (
                 },
                 "end": {"type": "string", "description": "YYYY-MM-DD (기본 오늘)"},
                 "basis": {"type": "string", "enum": list(BASES)},
+                "fresh": {
+                    "type": "boolean",
+                    "description": "true 시 캐시를 건너뛰고 원천 API 재조회",
+                },
             },
             "required": ["tickers"],
             "additionalProperties": False,
@@ -416,7 +424,10 @@ class Toolbox:
             return []
         if source == "FRED":
             found = await fred_search(self.ctx, query, FRED_HITS)
-            return [_info_json(hit) for hit in _ended_last(found, self.today)]
+            return [
+                _info_json(hit, stale=_is_ended(hit, self.today))
+                for hit in _ended_last(found, self.today)
+            ]
         if source == "ECOS":
             return await self._ecos_hits(query, dataset)
         provider = cast("SourceId", source)
@@ -468,12 +479,13 @@ class Toolbox:
         requested = text_arg(args, "transform")
         if requested and requested not in TRANSFORMS:
             raise ValueError(f"transform은 {', '.join(TRANSFORMS)} 중 하나")
+        fresh = _bool_arg(args, "fresh")
         span = (
             min(MAX_YEARS, math.ceil((self.today - start).days / 365.25))
             if given
             else DEFAULT_YEARS
         )
-        got = await self._resolve(args, span, requested)
+        got = await self._resolve(args, span, requested, fresh=fresh)
         series = tuple(point for point in got.series if start <= point[0] <= end)
         series, shown_freq, note = shape(series, got.freq, frequency)
         if not series:
@@ -489,9 +501,15 @@ class Toolbox:
             "frequency": shown_freq,
             "transform": got.transform,
             "unit": got.unit,
+            "as_of": self.today.isoformat(),
             "count": len(points),
             "points": points,
         }
+        if end >= self.today:
+            lag = context.stale_days(series[-1][0], shown_freq, self.today)
+            if lag is not None:
+                body["stale"] = True
+                body["lag_days"] = lag
         if got.copyright:
             body["copyright"] = got.copyright
         if note:
@@ -504,7 +522,12 @@ class Toolbox:
         return ToolResult(_dump(body), ok=True, summary=summary)
 
     async def _resolve(
-        self, args: Mapping[str, object], span: int, requested: str
+        self,
+        args: Mapping[str, object],
+        span: int,
+        requested: str,
+        *,
+        fresh: bool = False,
     ) -> _Resolved:
         indicator_id = text_arg(args, "id")
         if indicator_id:
@@ -515,7 +538,7 @@ class Toolbox:
             if self.demo:
                 series = demo_dashboard.series(indicator.freq, self.today, years)
             else:
-                raw = await self._fetch(indicator.fetch, years)
+                raw = await self._fetch(indicator.fetch, years, fresh=fresh)
                 series = apply(raw, transform, indicator.freq, indicator.scale)
                 if isinstance(indicator.fetch, EtfSeries):
                     shown = self._etf_names.get(indicator.fetch.ticker, indicator.code)
@@ -540,7 +563,9 @@ class Toolbox:
         if self.demo:
             series, freq = demo_dashboard.series("M", self.today, years), "M"
         else:
-            raw = await self._fetch(build_fetch(source_id, code, years), years)
+            raw = await self._fetch(
+                build_fetch(source_id, code, years), years, fresh=fresh
+            )
             freq = infer_freq(raw)
             series = apply(raw, transform, "Q" if freq == "A" else freq)
         return _Resolved(
@@ -554,21 +579,25 @@ class Toolbox:
             decimals=RAW_DECIMALS,
         )
 
-    async def _fetch(self, fetch: Fetch | Difference, years: int) -> Series:
+    async def _fetch(
+        self, fetch: Fetch | Difference, years: int, *, fresh: bool = False
+    ) -> Series:
         if isinstance(fetch, Difference):
             left, right = await asyncio.gather(
-                self._fetch(fetch.left, years),
-                self._fetch(fetch.right, years),
+                self._fetch(fetch.left, years, fresh=fresh),
+                self._fetch(fetch.right, years, fresh=fresh),
             )
             return fetch.combine(left, right)
         spec = with_years(fetch, years)
         if isinstance(spec, EtfSeries):
-            return await self._etf(spec)
-        return await self.series.through(spec, self.ctx, self.today)
+            return await self._etf(spec, fresh=fresh)
+        return await self.series.through(spec, self.ctx, self.today, fresh=fresh)
 
-    async def _etf(self, spec: EtfSeries) -> Series:
+    async def _etf(self, spec: EtfSeries, *, fresh: bool = False) -> Series:
         start = years_before(self.today, spec.years)
-        found = await self._stored_prices([spec.ticker], start, self.today, "total")
+        found = await self._stored_prices(
+            [spec.ticker], start, self.today, "total", force=fresh
+        )
         got = found[1].get(spec.ticker)
         if got is None:
             raise SourceError(f"{spec.ticker}: {found[0].get(spec.ticker, NO_PRICE)}")
@@ -576,11 +605,22 @@ class Toolbox:
         return prices.points(got.series)
 
     async def _stored_prices(
-        self, tickers: Sequence[str], start: date, end: date, basis: Basis
+        self,
+        tickers: Sequence[str],
+        start: date,
+        end: date,
+        basis: Basis,
+        *,
+        force: bool = False,
     ) -> tuple[Mapping[str, str], Mapping[str, PriceSeries]]:
         store = prices.current()
         result = await asyncio.to_thread(
-            store.ensure, tickers, start, end, max_wait=self.ctx.max_wait
+            store.ensure,
+            tickers,
+            start,
+            end,
+            force=force,
+            max_wait=self.ctx.max_wait,
         )
         found = store.latest(tickers, start, end, basis)
         if result.reached is not None and not found:
@@ -592,6 +632,7 @@ class Toolbox:
         basis = text_arg(args, "basis") or "split"
         if basis not in BASES:
             raise ValueError(f"basis는 {', '.join(BASES)} 중 하나")
+        fresh = _bool_arg(args, "fresh")
         fallback = self.today - timedelta(days=PRICE_DEFAULT_DAYS)
         start = _day(text_arg(args, "start"), fallback)
         end = _day(text_arg(args, "end"), self.today)
@@ -601,7 +642,9 @@ class Toolbox:
         if self.demo:
             found = self._demo_prices(tickers, start, end)
         else:
-            lost, found = await self._stored_prices(tickers, start, end, basis)
+            lost, found = await self._stored_prices(
+                tickers, start, end, basis, force=fresh
+            )
         rows: list[Json] = []
         failed: list[Json] = []
         share = MAX_POINTS // len(tickers)
@@ -616,6 +659,7 @@ class Toolbox:
             reasons = "; ".join(cast("str", row["error"]) for row in failed)
             raise SourceError(reasons)
         body: Json = {
+            "as_of": self.today.isoformat(),
             "start": start.isoformat(),
             "end": end.isoformat(),
             "basis": basis,
@@ -834,9 +878,20 @@ def _day(text: str, fallback: date) -> date:
     return date.fromisoformat(text)
 
 
-def _ended_last(items: list[SeriesInfo], today: date) -> list[SeriesInfo]:
+def _bool_arg(args: Mapping[str, object], key: str) -> bool:
+    raw = args.get(key)
+    if raw is not None and not isinstance(raw, bool):
+        raise ValueError(f"{key}는 true 또는 false")
+    return bool(raw)
+
+
+def _is_ended(info: SeriesInfo, today: date) -> bool:
     cutoff = (today - timedelta(days=STALE_FRED_DAYS)).isoformat()
-    return sorted(items, key=lambda item: bool(item.end) and item.end < cutoff)
+    return bool(info.end) and info.end < cutoff
+
+
+def _ended_last(items: list[SeriesInfo], today: date) -> list[SeriesInfo]:
+    return sorted(items, key=lambda item: _is_ended(item, today))
 
 
 def _filter(items: list[SeriesInfo], query: str) -> list[SeriesInfo]:
@@ -848,12 +903,14 @@ def _filter(items: list[SeriesInfo], query: str) -> list[SeriesInfo]:
     ]
 
 
-def _info_json(info: SeriesInfo) -> Json:
+def _info_json(info: SeriesInfo, *, stale: bool = False) -> Json:
     out: Json = {"code": info.code, "name": info.name}
     for key in ("freq", "unit", "start", "end", "note"):
         value = cast("str", getattr(info, key))
         if value:
             out[key] = value
+    if stale:
+        out["stale"] = True
     return out
 
 

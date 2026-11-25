@@ -412,6 +412,10 @@ def _schedule_document(dashboard: Dashboard) -> Document:
     calendar = [
         f"{entry.date} {entry.name} ({entry.source})" for entry in dashboard.calendar
     ]
+    recent = [
+        f"{entry.date} {entry.name} ({entry.source})"
+        for entry in dashboard.recent_releases
+    ]
     sources = [
         f"{source.name}: {source.ok}/{source.total} · {source.state}"
         for source in dashboard.sources
@@ -424,6 +428,7 @@ def _schedule_document(dashboard: Dashboard) -> Document:
     return _combined(
         (
             _item("calendar", "발표 일정", "FRED releases", calendar),
+            _item("recent_releases", "최근 발표 완료", "FRED releases", recent),
             _item("fomc_dates", "FOMC 일정", "FRED", dashboard.fomc_dates),
             _item("sources", "출처 상태", "FinAgent", sources),
             _item("indicators", "지표 목록", "FinAgent", rows),
@@ -450,6 +455,7 @@ def page_document(dashboard: Dashboard, page: str) -> Document:
                 "spread": dashboard.spread if overview else None,
                 "projections": dashboard.projections if overview else None,
                 "calendar": (),
+                "recent_releases": (),
             }
         )
     )

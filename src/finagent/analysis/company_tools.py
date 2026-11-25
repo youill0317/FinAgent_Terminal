@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Final, cast
@@ -26,7 +27,7 @@ from finagent.limits import INTERACTIVE_WAIT, SourceError
 from finagent.settings import load_etf
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
     import pandas as pd
@@ -57,6 +58,8 @@ DEFAULT_PERIODS: Final = 8
 MAX_PERIODS: Final = 40
 DEFAULT_FILINGS: Final = 20
 MAX_FILINGS: Final = 100
+SUBMISSIONS_TTL: Final = 3600.0
+STALE_FACTS_DAYS: Final = 140
 DEFAULT_ROWS: Final = 20
 MAX_ROWS: Final = 50
 DEFAULT_HOLDINGS: Final = 25
@@ -119,6 +122,15 @@ def _count(args: Mapping[str, object], key: str, default: int, top: int) -> int:
 def _day(args: Mapping[str, object], key: str) -> date | None:
     value = text_arg(args, key)
     return date.fromisoformat(value) if value else None
+
+
+def _parse_iso(value: object) -> date | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _ticker(args: Mapping[str, object]) -> str:
@@ -185,9 +197,10 @@ class Company:
     today: date
     demo: bool = False
     settings: Path | None = None
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
     _client: sec.Client | None = field(default=None, repr=False)
     _ciks: dict[str, str] = field(default_factory=dict, repr=False)
-    _recents: dict[tuple[str, date], list[Json]] = field(
+    _recents: dict[tuple[str, date], tuple[float, list[Json]]] = field(
         default_factory=dict, repr=False
     )
     _table: tuple[object, pd.DataFrame] | None = field(default=None, repr=False)
@@ -260,17 +273,40 @@ class Company:
             {"metric": metric, "cite_as": cites.get(metric), "periods": rows}
             for metric, rows in out.items()
         ]
+        body: Json = {
+            "ticker": ticker,
+            "as_of": self.today.isoformat(),
+            "items": items,
+        }
+        latest = max(
+            (
+                day
+                for rows in out.values()
+                for row in rows
+                if (day := _parse_iso(row.get("end"))) is not None
+            ),
+            default=None,
+        )
+        if latest is not None:
+            lag = (self.today - latest).days
+            if lag >= STALE_FACTS_DAYS:
+                body["stale"] = True
+                body["lag_days"] = lag
         return Answer(
-            {"ticker": ticker, "items": items},
+            body,
             f"company_facts({ticker}) · {len(cites)}개 항목",
             {cite: f"{ticker} {metric} · SEC" for metric, cite in cites.items()},
         )
 
     def _recent(self, ticker: str) -> list[Json]:
         key = (ticker, self.today)
-        if key not in self._recents:
-            self._recents[key] = self._submissions(ticker)
-        return self._recents[key]
+        now = self.clock()
+        saved = self._recents.get(key)
+        if saved is not None and 0 <= now - saved[0] <= SUBMISSIONS_TTL:
+            return saved[1]
+        rows = self._submissions(ticker)
+        self._recents[key] = (now, rows)
+        return rows
 
     def _submissions(self, ticker: str) -> list[Json]:
         response = self._sec().submissions(self._cik(ticker), INTERACTIVE_WAIT)
@@ -332,7 +368,11 @@ class Company:
             for row in kept
         ]
         return Answer(
-            {"ticker": ticker, "filings": shown},
+            {
+                "ticker": ticker,
+                "as_of": self.today.isoformat(),
+                "filings": shown,
+            },
             f"company_filings({ticker}) · {len(shown)}건",
             {str(r["cite_as"]): f"{ticker} {r['form']} {r['filed']}" for r in shown},
         )
@@ -490,6 +530,7 @@ class Company:
             {
                 "ticker": ticker,
                 "symbol": found.symbol,
+                "as_of": self.today.isoformat(),
                 "cite_as": cite,
                 "values": values,
             },

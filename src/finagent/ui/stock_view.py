@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
@@ -12,8 +13,9 @@ import altair as alt
 import pandas as pd  # pyright: ignore[reportMissingTypeStubs]
 import streamlit as st
 
-from finagent import demo, portfolio, quant
-from finagent.ui import palette, shared
+from finagent import demo, fundamentals, portfolio, quant
+from finagent.demo import etf as demo_etf
+from finagent.ui import company_view, palette, shared
 from finagent.ui.pf_common import (
     CHART_HEIGHT,
     PF_DONUT_SLICES,
@@ -57,6 +59,7 @@ state = st.session_state
 
 STOCK_SECTIONS = {
     "stats": "통계",
+    "profile": "기업 정보",
     "simulation": "시뮬레이션",
     "whatif": "편입 효과",
 }
@@ -639,6 +642,21 @@ def stock_view(
     pf_part(partial(stock_view_section, ticker, book, prices))
 
 
+def stock_profile(ticker: str) -> None:
+    if shared.app.demo:
+        found = demo_etf.company(ticker)
+        annual = demo_etf.annual()
+        filings = demo_etf.filings(ticker)
+    else:
+        day = datetime.now().astimezone().date()
+        keys, agent = shared.market_keys(), shared.sec_agent()
+        with st.spinner(f"{ticker} 기업 정보 수신 중…"):
+            found = fundamentals.company_info(ticker, keys, agent, day)
+            annual = fundamentals.annual_rows(found.symbol, agent, day)
+            filings = fundamentals.company_filings(found.symbol, agent, day)
+    company_view.render_profile(found, annual, filings)
+
+
 def stock_view_section(
     ticker: str, book: portfolio.Book, prices: portfolio.Prices
 ) -> None:
@@ -652,6 +670,9 @@ def stock_view_section(
         label_visibility="collapsed",
         bind="query-params",
     )
+    if section == "profile":
+        stock_profile(ticker)
+        return
     horizons = {"simulation": "pf_horizon", "whatif": "whatif_horizon"}
     top = st.container(horizontal=True, vertical_alignment="bottom")
     row = st.container(horizontal=True, vertical_alignment="bottom")

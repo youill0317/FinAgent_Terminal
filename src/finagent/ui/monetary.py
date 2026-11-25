@@ -22,10 +22,12 @@ POLICY_IDS: Final = (
     "cn_policy_rate",
     "kr_policy_rate",
 )
-ASSET_IDS: Final = frozenset({"us_fed_assets_mp", "ea_ecb_assets"})
+ASSET_IDS: Final = frozenset(
+    {"us_fed_assets_mp", "ea_ecb_assets", "jp_boj_assets", "kr_bok_base"}
+)
 PAGE: Final = "monetary"
 BANKS_HELP: Final = (
-    "[정의] 5대 중앙은행 정책금리 및 연준·유로시스템 총자산 현황"
+    "[정의] 5대 중앙은행 정책금리 및 Fed·ECB·BOJ 총자산·한국은행 본원통화 현황"
     "\n\n[해석] 금리 인상·자산 축소 시 긴축, 금리 인하·자산 확대 시 완화"
     "\n\n[산출] 금리 카드 변화값은 최근 조정폭·변경일 및 최근 12개월 변경 횟수"
 )
@@ -35,9 +37,10 @@ POLICY_HELP: Final = (
     "\n\n[산출] 통화정책회의 의결 기준금리 계단식(Step) 시계열"
 )
 ASSETS_HELP: Final = (
-    "[정의] 연준(조 달러) 및 유로시스템(조 유로) 대차대조표 총자산"
-    "\n\n[해석] 통화 단위 상이에 따른 절대 규모 대신 증감 추세 비교"
-    "\n\n[산출] 중앙은행 보유 자산 총액 시계열"
+    "[정의] Fed($T)·ECB(€T)·BOJ(¥T) 총자산 및 한국은행 본원통화(조원) 추이"
+    "\n\n[해석] 통화 단위 상이에 따라 선택 기간 첫날을 100으로 맞춰 상대 증감 추세"
+    " 비교"
+    "\n\n[산출] 각 중앙은행 대차대조표 자산 및 본원통화 지수화 시계열"
 )
 
 
@@ -85,13 +88,16 @@ def central_banks(d: Dashboard, ctx: UiContext, months: int) -> None:
                 height=ui.SMALL_CHART_HEIGHT,
             )
         with right:
-            _ = st.caption("중앙은행 총자산 · 단위 $T·€T", help=ASSETS_HELP)
+            _ = st.caption(
+                "중앙은행 자산·유동성 · 선택 기간 첫날 = 100", help=ASSETS_HELP
+            )
             ui.rows_chart(
                 assets,
                 ctx,
                 months,
-                alt="Fed·ECB 총자산 비교",
+                alt="Fed·ECB·BOJ 자산 및 한국은행 본원통화 비교",
                 height=ui.SMALL_CHART_HEIGHT,
+                rebase=True,
             )
         for p in found:
             ui.problems(p)

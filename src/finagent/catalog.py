@@ -75,9 +75,12 @@ USD_BBL: Final = Fmt(pre="$", suf="/bbl", dec=2)
 USD_MMBTU: Final = Fmt(pre="$", suf="/MMBtu", dec=2)
 USD_T0: Final = Fmt(pre="$", suf="/t", dec=0)
 USD_OZ: Final = Fmt(pre="$", suf="/oz", dec=0)
+USD_LB: Final = Fmt(pre="$", suf="/lb", dec=2)
 EUR_T: Final = Fmt(pre="€", suf="T", dec=2)
 EUR_B1_SIGNED: Final = Fmt(pre="€", suf="B", dec=1, signed=True)
+JPY_T: Final = Fmt(pre="¥", suf="T", dec=0)
 KRW: Final = Fmt(suf="원", dec=1)
+KRW_T: Final = Fmt(suf="조원", dec=1)
 THOUSANDS_SIGNED: Final = Fmt(suf="K", dec=0, signed=True)
 THOUSANDS: Final = Fmt(suf="K", dec=0)
 MILLIONS: Final = Fmt(suf="M", dec=2)
@@ -392,6 +395,19 @@ def etf(id_: str, label: str, ticker: str) -> Indicator:
     )
 
 
+def yahoo_price(id_: str, label: str, ticker: str, fmt: Fmt) -> Indicator:
+    return price(
+        _indicator(
+            id_,
+            label,
+            f"YAHOO:{ticker}",
+            EtfSeries(ticker, source="YAHOO"),
+            "D",
+            fmt,
+        )
+    )
+
+
 PANELS: Final = (
     PanelSpec(
         "ov_growth",
@@ -548,10 +564,10 @@ PANELS: Final = (
         "ov_commodities",
         "overview",
         "원자재",
-        "WTI 원유 및 금 가격 추이\n\n금 지표는 월평균 기준 월간 단위 갱신",
+        "WTI 원유 및 금(COMEX 선물) 일간 가격 추이",
         (
             price(fred("gl_wti_ov", "WTI", "DCOILWTICO", "D", USD_BBL)),
-            price(ecos("gl_gold_ov", "금", "902Y003", "M", "040101", USD_OZ)),
+            yahoo_price("gl_gold_ov", "금 (COMEX 선물)", "GC=F", USD_OZ),
         ),
     ),
     PanelSpec(
@@ -1270,7 +1286,12 @@ PANELS: Final = (
         "monetary",
         "BOJ",
         "",
-        (bis_policy_rate("jp_policy_rate", "정책금리 (BOJ)", "JP"),),
+        (
+            bis_policy_rate("jp_policy_rate", "정책금리 (BOJ)", "JP"),
+            fred(
+                "jp_boj_assets", "일본은행 총자산", "JPNASSETS", "M", JPY_T, scale=1e-4
+            ),
+        ),
     ),
     PanelSpec(
         "mp_pboc",
@@ -1284,7 +1305,18 @@ PANELS: Final = (
         "monetary",
         "한국은행",
         "",
-        (bis_policy_rate("kr_policy_rate", "정책금리 (한국은행)", "KR"),),
+        (
+            bis_policy_rate("kr_policy_rate", "정책금리 (한국은행)", "KR"),
+            ecos(
+                "kr_bok_base",
+                "본원통화 (평잔, SA)",
+                "102Y004",
+                "M",
+                "ABA1",
+                KRW_T,
+                scale=1e-3,
+            ),
+        ),
     ),
     PanelSpec(
         "mp_rates",
@@ -1406,16 +1438,13 @@ PANELS: Final = (
         "fin_commodities",
         "finance",
         "원자재",
-        (
-            "글로벌 에너지(원유·천연가스) 및 주요 금속(구리·금) 가격 추이"
-            "\n\n원유·천연가스는 일간 시세, 구리·금은 월평균 기준 월간 단위 갱신"
-        ),
+        "글로벌 에너지(원유·천연가스) 및 주요 금속(구리·금) 일간 가격 추이",
         (
             price(fred("gl_wti", "WTI", "DCOILWTICO", "D", USD_BBL)),
             price(fred("gl_brent", "브렌트", "DCOILBRENTEU", "D", USD_BBL)),
             price(fred("us_henryhub", "헨리허브 천연가스", "DHHNGSP", "D", USD_MMBTU)),
-            price(fred("gl_copper", "구리", "PCOPPUSDM", "M", USD_T0)),
-            price(ecos("gl_gold", "금", "902Y003", "M", "040101", USD_OZ)),
+            yahoo_price("gl_copper", "구리 (COMEX 선물)", "HG=F", USD_LB),
+            yahoo_price("gl_gold", "금 (COMEX 선물)", "GC=F", USD_OZ),
         ),
     ),
     PanelSpec(

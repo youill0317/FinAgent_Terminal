@@ -16,6 +16,7 @@ from datetime import UTC, date, datetime, timedelta
 from datetime import time as clock_time
 from functools import partial
 from typing import TYPE_CHECKING, Final, Literal, cast, final
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -51,6 +52,26 @@ KEY: Final = ["ticker", "date"]
 CHUNK: Final = 100
 NO_PRICE: Final = "시세 없음"
 SESSION_SETTLED: Final = clock_time(17, 0)
+SEOUL: Final = ZoneInfo("Asia/Seoul")
+TOKYO: Final = ZoneInfo("Asia/Tokyo")
+SHANGHAI: Final = ZoneInfo("Asia/Shanghai")
+LONDON: Final = ZoneInfo("Europe/London")
+MARKET_CLOSES: Final[tuple[tuple[tuple[str, ...], ZoneInfo, clock_time], ...]] = (
+    ((".KS", ".KQ"), SEOUL, clock_time(16, 0)),
+    ((".T",), TOKYO, clock_time(16, 0)),
+    ((".HK", ".SS", ".SZ"), SHANGHAI, clock_time(16, 30)),
+    ((".L", ".DE", ".PA", ".AS", ".SW", ".MI"), LONDON, clock_time(17, 30)),
+)
+INDEX_CLOSES: Final[Mapping[str, tuple[ZoneInfo, clock_time]]] = {
+    "^KS11": (SEOUL, clock_time(16, 0)),
+    "^KQ11": (SEOUL, clock_time(16, 0)),
+    "^N225": (TOKYO, clock_time(16, 0)),
+    "^HSI": (SHANGHAI, clock_time(16, 30)),
+    "^FTSE": (LONDON, clock_time(17, 30)),
+    "^GDAXI": (LONDON, clock_time(17, 30)),
+    "^FCHI": (LONDON, clock_time(17, 30)),
+    "^STOXX50E": (LONDON, clock_time(17, 30)),
+}
 YAHOO_FIELDS: Final = {
     "Open": "open",
     "High": "high",
@@ -304,10 +325,28 @@ def points(values: pd.Series) -> tuple[tuple[date, float], ...]:
     )
 
 
-def last_session(now: datetime) -> date:
-    local = now.astimezone(markets.NEW_YORK)
+def _is_continuous(ticker: str) -> bool:
+    return ticker.endswith(("=X", "=F")) or ticker == "DX-Y.NYB"
+
+
+def _market_close(ticker: str) -> tuple[ZoneInfo, clock_time]:
+    if ticker in INDEX_CLOSES:
+        return INDEX_CLOSES[ticker]
+    for suffixes, zone, settled in MARKET_CLOSES:
+        if ticker.endswith(suffixes):
+            return zone, settled
+    return markets.NEW_YORK, SESSION_SETTLED
+
+
+def last_session(now: datetime, ticker: str = "") -> date:
+    """티커의 거래소 현지 마감 시각 기준으로 최신 종료 거래일을 반환한다."""
+    upper = ticker.strip().upper()
+    if upper and _is_continuous(upper):
+        return now.astimezone(UTC).date()
+    zone, settled = _market_close(upper)
+    local = now.astimezone(zone)
     day = local.date()
-    return day if local.time() >= SESSION_SETTLED else day - timedelta(days=1)
+    return day if local.time() >= settled else day - timedelta(days=1)
 
 
 def drifted(store: pd.DataFrame, fresh: pd.DataFrame) -> list[str]:
@@ -430,10 +469,11 @@ class PriceStore:
 
     def _plan(self, tickers: Sequence[str], run: _Run) -> list[_Ask]:
         ranges = self._ranges(tickers)
-        wanted_to = min(run.end, last_session(self._clock()))
+        now = self._clock()
         tails: dict[date, list[str]] = {}
         wholes: dict[date, list[str]] = {}
         for ticker in tickers:
+            wanted_to = min(run.end, last_session(now, ticker))
             span = ranges.get(ticker)
             if span is None:
                 wholes.setdefault(run.start, []).append(ticker)
@@ -545,9 +585,10 @@ class PriceStore:
                 memory.current().price_version += 1
 
     def _cover(self, ask: _Ask, run: _Run, merged: pd.DataFrame, got: set[str]) -> None:
-        to = min(run.end, last_session(self._clock()))
+        now = self._clock()
         firsts = merged[merged["ticker"].isin(got)].groupby("ticker")["date"].min()
         for ticker in ask.tickers:
+            to = min(run.end, last_session(now, ticker))
             known = memory.current().covered.get(ticker)
             if ticker not in firsts.index:
                 continue
@@ -590,6 +631,18 @@ class PriceStore:
             )
             sources = dict.fromkeys(str(s) for s in group["source"])
             out[str(ticker)] = PriceSeries(values, "+".join(sources))
+        return out
+
+    def sources_by_ticker(self) -> dict[str, tuple[str, ...]]:
+        """티커별 저장된 시세 출처 목록을 반환한다."""
+        found = self.rows()
+        if found.empty:
+            return {}
+        out: dict[str, tuple[str, ...]] = {}
+        for ticker, group in found.groupby("ticker"):
+            sources = tuple(dict.fromkeys(str(src) for src in group["source"] if src))
+            if sources:
+                out[str(ticker)] = sources
         return out
 
 

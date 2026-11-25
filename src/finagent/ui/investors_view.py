@@ -371,7 +371,19 @@ def inv_weight_history(points: list[tuple[object, float]]) -> alt.Chart:
 def inv_stock_body(
     found: list[investors.Quarter], row: dict[str, object], prices: portfolio.Prices
 ) -> None:
-    st.caption(f"{sector_label(str(row['sector']))} · CUSIP {row['cusip']}")
+    ticker = str(row["ticker"] or "")
+    with st.container(horizontal=True, vertical_alignment="center"):
+        st.caption(f"{sector_label(str(row['sector']))} · CUSIP {row['cusip']}")
+        if ticker:
+            st.space("stretch")
+            if st.button(
+                "종목 분석",
+                icon=":material/open_in_new:",
+                key="inv_jump_stock",
+            ):
+                state.pf_jump_stock = ticker
+                clear_selection(TABLE_KEY)
+                st.rerun()
     left, right = st.columns(2)
     with left, st.container(border=True, height="stretch"):
         headed(
@@ -385,7 +397,6 @@ def inv_stock_body(
         st.altair_chart(inv_weight_history(list(history)), alt="분기별 비중")
     with right, st.container(border=True, height="stretch"):
         st.markdown("**1년 주가** · 종가")
-        ticker = str(row["ticker"])
         series = (
             portfolio.window(cast("pd.Series", prices.close[ticker]).dropna(), 12)
             if ticker in prices.close.columns

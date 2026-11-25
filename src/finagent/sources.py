@@ -477,7 +477,7 @@ def parse_sdmx_csv(text: str) -> list[dict[str, str]]:
 class EtfSeries:
     ticker: str
     years: int = CHART_YEARS
-    source: ClassVar[SourceId] = "ALPACA"
+    source: SourceId = "ALPACA"
 
 
 def etf_start(fetches: Sequence[EtfSeries], today: date) -> date:

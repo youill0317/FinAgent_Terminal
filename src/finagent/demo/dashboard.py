@@ -87,6 +87,13 @@ def dashboard(now: datetime) -> Dashboard:
         fomc_dates=tuple(
             (today + timedelta(days=days)).isoformat() for days in DEMO_FOMC_DAYS
         ),
+        recent_releases=(
+            CalendarEntry(
+                date=(today - timedelta(days=2)).isoformat(),
+                name="데모컴퍼니 발표",
+                source="데모",
+            ),
+        ),
     )
 
 

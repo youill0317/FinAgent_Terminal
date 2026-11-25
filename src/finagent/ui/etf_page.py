@@ -19,7 +19,7 @@ from finagent.analysis import documents
 from finagent.etf_universe import Product
 from finagent.settings import EtfChoice, load_etf, save_etf
 from finagent.treemap import Rect, squarify
-from finagent.ui import components, palette
+from finagent.ui import company_view, components, palette
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -72,65 +72,41 @@ SPREADS: Final[tuple[tuple[str, str, Callable[[str], str], str], ...]] = (
         "채권",
     ),
 )
-DESCRIPTION_LIMIT: Final = 600
+COUNTRY_LIMIT: Final = 10
+COUNTRY_LABELS: Final = {
+    "US": "미국",
+    "GB": "영국",
+    "JP": "일본",
+    "CN": "중국",
+    "KR": "한국",
+    "TW": "대만",
+    "CA": "캐나다",
+    "DE": "독일",
+    "FR": "프랑스",
+    "CH": "스위스",
+    "NL": "네덜란드",
+    "IE": "아일랜드",
+    "AU": "호주",
+    "IN": "인도",
+    "BR": "브라질",
+    "HK": "홍콩",
+    "SG": "싱가포르",
+    "SE": "스웨덴",
+    "DK": "덴마크",
+    "ES": "스페인",
+    "IT": "이탈리아",
+    "MX": "멕시코",
+    "KY": "케이맨제도",
+    "LU": "룩셈부르크",
+    "BM": "버뮤다",
+    "OTHER": "기타",
+}
 FORM_DEFAULTS: Final[dict[str, object]] = {
     "etf_add_ticker": "",
     "etf_add_group": None,
     "etf_add_category": None,
     "etf_add_multiple": 1.0,
 }
-STOCK_FACTS: Final = (("sector", "sector"), ("industry", "text"), ("country", "text"))
-STOCK_METRICS: Final[tuple[tuple[str, str, str, str | None], ...]] = (
-    ("market_cap", "시가총액", "big", None),
-    (
-        "per",
-        "PER",
-        "num",
-        "[정의] 주가수익비율(Price-to-Earnings Ratio)\n\n"
-        "[해석] 높을수록 이익 대비 고평가 상태\n\n"
-        "[산출] 현재 주가 ÷ 최근 12개월 주당순이익(EPS)",
-    ),
-    (
-        "forward_per",
-        "선행 PER",
-        "num",
-        "[정의] 향후 12개월 예상 이익 기준 주가수익비율\n\n"
-        "[해석] 현행 PER 하회 시 향후 이익 성장 기대 반영\n\n"
-        "[산출] 현재 주가 ÷ 향후 12개월 컨센서스 EPS",
-    ),
-    (
-        "dividend_yield",
-        "배당수익률",
-        "pct",
-        "[정의] 주가 대비 연간 현금배당 비율\n\n"
-        "[해석] 높을수록 현금 배당 매력 우위\n\n"
-        "[산출] 연간 주당배당금 ÷ 현재 주가",
-    ),
-    (
-        "roe",
-        "ROE",
-        "pct",
-        "[정의] 자기자본이익률(Return on Equity)\n\n"
-        "[해석] 높을수록 자기자본 활용 수익성 우위\n\n"
-        "[산출] 당기순이익 ÷ 자기자본",
-    ),
-    (
-        "net_margin",
-        "순이익률",
-        "pct",
-        "[정의] 매출액 대비 당기순이익 비율\n\n"
-        "[해석] 높을수록 최종 비용 차감 후 마진 구조 우위\n\n"
-        "[산출] 당기순이익 ÷ 매출액",
-    ),
-    (
-        "revenue_growth",
-        "매출 성장률",
-        "pct",
-        "[정의] 전년 동기 대비 매출액 증감률\n\n"
-        "[해석] 양(+)의 값 확대 시 외형 성장 가속\n\n"
-        "[산출] (당기 매출액 − 전년 동기 매출액) ÷ 전년 동기 매출액",
-    ),
-)
 VIEW_HELP: Final = (
     "[정의] 분류·카테고리별 ETF 운용자산 및 기간 수익률 트리맵\n\n"
     "[해석] 상승 시 빨강, 하락 시 파랑(변동폭 비례 채도), 점선 테두리는 레버리지·인버스"
@@ -173,6 +149,16 @@ MIX_HELP: Final = (
     "[정의] 순자산 내 주식·채권·현금 등 자산군별 구성 비중(%)\n\n"
     "[해석] 펀드 자산배분 성격 및 주된 위험 노출 자산군 파악\n\n"
     "[산출] 자산군별 평가액 합계 ÷ 펀드 순자산총액"
+)
+MATURITY_HELP: Final = (
+    "[정의] SEC N-PORT 편입 채권의 비중 가중 평균 잔존만기(년)\n\n"
+    "[해석] 길수록 금리 변동에 대한 채권 가격 민감도(듀레이션) 확대\n\n"
+    "[산출] Σ(채권 잔존만기 × 비중) ÷ 채권 총비중"
+)
+COUNTRY_HELP: Final = (
+    "[정의] SEC N-PORT 보유 증권의 발행 국가별 구성 비중(%)\n\n"
+    "[해석] 펀드 자산의 실질 지역·통화 위험 분산 현황\n\n"
+    "[산출] 담보 제외 보유 종목 국가별 비중 합계(상위 10개국 외 기타 병합)"
 )
 TOP_HELP: Final = (
     "[정의] 순자산 대비 편입 비중 상위 보유 종목 목록\n\n"
@@ -386,21 +372,7 @@ def _bar(ctx: EtfContext) -> None:
     body()
 
 
-def _fmt(value: object, kind: str) -> str:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return "—"
-    if kind == "sector":
-        value = components.sector_label(str(value))
-    if kind == "text" or not isinstance(value, int | float):
-        return str(value)
-    if kind == "pct":
-        return f"{value:,.2f}%"
-    if kind == "big":
-        for size, unit in ((1e12, "조"), (1e9, "B"), (1e6, "M")):
-            if abs(value) >= size:
-                return f"{value / size:,.1f}{unit}"
-        return f"{value:,.0f}"
-    return f"{value:,.2f}"
+_fmt = company_view.fmt_value
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -789,21 +761,11 @@ def _company(ctx: EtfContext, row: fund_filings.Row) -> None:
     with st.spinner(f"{ticker} 데이터 수신 중…"):
         found = ctx.company(ticker)
     cells = found.cells
-    currency = cells.get("currency")
     st.title(f"{ticker} · {row.name}", anchor=False)
-    facts = [
-        _fmt(cell.value, kind)
-        for name, kind in STOCK_FACTS
-        if (cell := cells.get(name)) is not None
-    ]
-    if facts:
-        st.caption(" · ".join(facts))
-    description = cells.get("description")
-    if description is not None:
-        text = str(description.value)
-        if len(text) > DESCRIPTION_LIMIT:
-            text = text[:DESCRIPTION_LIMIT].rsplit(". ", 1)[0] + "."
-        st.caption(text)
+    if facts := company_view.fact_line(cells):
+        st.caption(facts)
+    if (description := cells.get("description")) is not None:
+        st.caption(company_view.short_description(str(description.value)))
     with st.container(horizontal=True, key="etf_stock_cards"):
         st.metric(
             "ETF 내 비중",
@@ -812,15 +774,20 @@ def _company(ctx: EtfContext, row: fund_filings.Row) -> None:
             border=True,
             height="stretch",
         )
-        for name, label, kind, help_ in STOCK_METRICS:
-            cell = cells.get(name)
-            text = _fmt(None if cell is None else cell.value, kind)
-            if name == "market_cap" and currency is not None and text != "—":
-                text = f"{text} {currency.value}"
-            st.metric(label, text, help=help_, border=True, height="stretch")
+        for name, label, kind, help_ in company_view.STOCK_METRICS:
+            st.metric(
+                label,
+                company_view.metric_text(name, cells, kind),
+                help=help_,
+                border=True,
+                height="stretch",
+            )
     days = [
         cell.as_of
-        for name in (*(n for n, _ in STOCK_FACTS), *(n for n, *_ in STOCK_METRICS))
+        for name in (
+            *(n for n, _ in company_view.STOCK_FACTS),
+            *(n for n, *_ in company_view.STOCK_METRICS),
+        )
         if (cell := cells.get(name)) is not None
     ]
     if days:
@@ -866,8 +833,45 @@ def _holdings(ticker: str, found: etf.Composition) -> fund_filings.Row | None:
     return chosen if chosen is not None and chosen.asset == "stock" else None
 
 
+def etf_maturity(found: etf.Composition | None) -> float | None:
+    """N-PORT 전체 보유 내역 기반 채권 비중 가중평균 잔존만기를 계산한다."""
+    if found is None or not found.full or not found.as_of:
+        return None
+    try:
+        return fund_filings.maturity_years(
+            fund_filings.Holdings(found.as_of, found.rows)
+        )
+    except ValueError:
+        return None
+
+
+def etf_countries(found: etf.Composition) -> dict[str, float]:
+    """N-PORT 전체 보유 내역에서 국가별 투자 비중을 집계한다."""
+    if not found.full:
+        return {}
+    raw = fund_filings.countries(found.rows)
+    if not raw:
+        return {}
+    merged: dict[str, float] = {}
+    for code, weight in raw.items():
+        label = COUNTRY_LABELS.get(code, code)
+        merged[label] = merged.get(label, 0.0) + weight
+    ordered = sorted(merged.items(), key=lambda item: item[1], reverse=True)
+    if len(ordered) <= COUNTRY_LIMIT:
+        return dict(ordered)
+    head = dict(ordered[:COUNTRY_LIMIT])
+    rest = sum(weight for _, weight in ordered[COUNTRY_LIMIT:])
+    if rest > 0:
+        head["기타"] = head.get("기타", 0.0) + rest
+    return head
+
+
 def _fund(
-    ctx: EtfContext, ticker: str, cells: Mapping[str, etf.Cell], own: pd.DataFrame
+    ctx: EtfContext,
+    ticker: str,
+    cells: Mapping[str, etf.Cell],
+    own: pd.DataFrame,
+    maturity: float | None = None,
 ) -> None:
     family, inception = cells.get("family"), cells.get("inception")
     nav, close = cells.get("nav"), cells.get("previous_close")
@@ -902,6 +906,14 @@ def _fund(
             border=True,
             height="stretch",
         )
+        if maturity is not None:
+            st.metric(
+                "평균 만기",
+                f"{maturity:.1f}년",
+                help=MATURITY_HELP,
+                border=True,
+                height="stretch",
+            )
 
 
 def _composition(
@@ -913,6 +925,7 @@ def _composition(
         for title, name, label, asset in SPREADS
         if (cell := cells.get(name)) is not None and mix.get(asset, 0) >= MAJORITY
     ]
+    lands = etf_countries(found)
     chosen = None
     left, right = st.columns([1, 2])
     if mix:
@@ -923,9 +936,12 @@ def _composition(
         for title, as_of, weights in spreads:
             st.markdown(f"**{title}** · 기준일 {as_of}")
             st.altair_chart(_weights(weights))
-        if found.rows and not spreads:
+        if lands:
+            st.markdown(f"**국가 비중** · 기준일 {found.as_of}", help=COUNTRY_HELP)
+            st.altair_chart(_weights(lands))
+        if found.rows and not spreads and not lands:
             chosen = _holdings(ticker, found)
-    if found.rows and spreads:
+    if found.rows and (spreads or lands):
         chosen = _holdings(ticker, found)
     return chosen
 
@@ -944,7 +960,7 @@ def _detail(
         if found is not None:
             memo[ticker] = found
     cells = {**funds, **ctx.funds().get(ticker, {})}
-    _fund(ctx, ticker, cells, own)
+    _fund(ctx, ticker, cells, own, etf_maturity(found))
     if found is None:
         components.empty("구성 데이터 없음")
         return

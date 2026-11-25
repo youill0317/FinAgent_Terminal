@@ -14,7 +14,7 @@ import pandas as pd
 from finagent import etf, fund_filings
 from finagent.demo import SHARE, VALUE
 from finagent.etf_universe import DEFAULTS
-from finagent.fundamentals import ANNUAL_COLUMNS, Company
+from finagent.fundamentals import ANNUAL_COLUMNS, Company, FilingRow
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -130,3 +130,20 @@ def annual() -> dict[str, object]:
 
 def stock_rows(symbol: str) -> pd.DataFrame:
     return rows([symbol])
+
+
+def filings(ticker: str) -> tuple[FilingRow, ...]:
+    day = _today()
+    return tuple(
+        FilingRow(
+            form=form,
+            accession=f"0000000000-26-00000{index}",
+            filed=day,
+            items=items,
+            primary=f"{ticker.lower()}-{form.lower()}.htm",
+            url="https://www.sec.gov/",
+        )
+        for index, (form, items) in enumerate(
+            (("10-K", ""), ("10-Q", ""), ("8-K", "2.02, 9.01")), 1
+        )
+    )

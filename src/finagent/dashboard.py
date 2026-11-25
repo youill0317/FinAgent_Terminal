@@ -58,6 +58,7 @@ SOURCE_NAMES: Final[tuple[tuple[SourceId, str], ...]] = (
     ("BIS", "BIS"),
     ("OECD", "OECD"),
     ("ALPACA", "Alpaca·Yahoo"),
+    ("YAHOO", "Yahoo"),
 )
 
 type Outcome = Series | SourceError
@@ -70,6 +71,7 @@ POLICY_BANKS: Final[tuple[tuple[str, Area, str], ...]] = (
     ("kr_policy_rate_bis", "KR", "한국은행"),
 )
 POLICY_CHANGE_WINDOW_DAYS: Final = 365
+RECENT_RELEASE_DAYS: Final = 14
 FOMC_RELEASE_SERIES: Final = "FEDTARMD"
 FOMC_HORIZON_DAYS: Final = 365
 CONTEXT_PAGE: Final = "overview"
@@ -190,12 +192,16 @@ async def build_dashboard(  # noqa: PLR0913
     progress.extra = "run"
     (
         (calendar, calendar_message),
+        recent_releases,
         projections,
         (fomc_dates, fomc_message),
     ) = await asyncio.gather(
         _calendar(ctx, today)
         if previous is None or "calendar" in extras
         else _kept((previous.calendar, previous.calendar_message)),
+        _recent_releases(ctx, today)
+        if previous is None or "calendar" in extras
+        else _kept(previous.recent_releases),
         _projections(ctx, today)
         if previous is None or "projections" in extras
         else _kept(previous.projections),
@@ -217,6 +223,7 @@ async def build_dashboard(  # noqa: PLR0913
         calendar=calendar,
         policy_changes=_policy_changes(shown, today),
         fomc_dates=fomc_dates,
+        recent_releases=recent_releases,
         calendar_message=calendar_message,
         fomc_message=fomc_message,
     )
@@ -630,18 +637,31 @@ def _by_year(vintage: Vintage) -> dict[int, float]:
     return {day.year: value for day, value in vintage.series}
 
 
-async def _calendar(
-    ctx: FetchContext, today: date
+async def _release_window(
+    ctx: FetchContext, start: date, end: date
 ) -> tuple[tuple[CalendarEntry, ...], str | None]:
     if not ctx.has_key(FRED_KEY_ENV):
         return (), None
     try:
-        releases = await fred_release_dates(
-            ctx, today, today + timedelta(days=catalog.CALENDAR_DAYS)
-        )
+        releases = await fred_release_dates(ctx, start, end)
     except SourceError as error:
         return (), str(error)
     return tuple(_calendar_entries(releases)), None
+
+
+async def _calendar(
+    ctx: FetchContext, today: date
+) -> tuple[tuple[CalendarEntry, ...], str | None]:
+    return await _release_window(
+        ctx, today, today + timedelta(days=catalog.CALENDAR_DAYS)
+    )
+
+
+async def _recent_releases(ctx: FetchContext, today: date) -> tuple[CalendarEntry, ...]:
+    entries, _ = await _release_window(
+        ctx, today - timedelta(days=RECENT_RELEASE_DAYS), today
+    )
+    return entries
 
 
 def _calendar_entries(
