@@ -22,7 +22,7 @@ from tests.test_analysis_service import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from finagent.analysis.providers.base import ProviderEvent, RunRequest
     from finagent.analysis.service import Brief
@@ -68,15 +68,17 @@ class Team(Recorder):
         failing: tuple[str, ...] = (),
         barriers: dict[str, int] | None = None,
         hold: bool = False,
+        held: Callable[[str, int], bool] | None = None,
     ) -> None:
         super().__init__()
         self.call: dict[str, object] = call
+        self.held: Callable[[str, int], bool] | None = held
         self.failing: tuple[str, ...] = failing
         self.barriers: dict[str, asyncio.Barrier] = {
             group: asyncio.Barrier(count) for group, count in (barriers or {}).items()
         }
         self.hold: asyncio.Event = asyncio.Event()
-        if not hold:
+        if not (hold or held):
             self.hold.set()
         self.live: dict[str, int] = {}
         self.results: list[ToolResult] = []
@@ -97,7 +99,9 @@ class Team(Recorder):
         try:
             if (barrier := self.barriers.get(group)) is not None:
                 _ = await barrier.wait()
-            _ = await self.hold.wait()
+            number = len(request.conversation.turns) + 1
+            if self.held is None or self.held(role, number):
+                _ = await self.hold.wait()
         finally:
             self.live[group] -= 1
         if role in self.failing:

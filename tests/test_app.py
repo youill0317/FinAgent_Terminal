@@ -79,10 +79,12 @@ def test_a_report_thread_shows_its_workflow_not_agent_threads(
         assert not [b for b in at.button if (b.key or "").startswith("ai_card_team")]
 
         _ = at.button_group(key="ai_pick_t1_collect").set_value("기술").run()
+        assert not at.exception
         assert "PART V" in [caption.value for caption in at.caption]
 
         at.session_state["ai_thread"] = "t1-2"
         _ = at.run()
+        assert not at.exception
         assert at.session_state["ai_thread"] == "t1"
 
         shared.app.rt.workspace.board = board_of(events)
@@ -93,6 +95,48 @@ def test_a_report_thread_shows_its_workflow_not_agent_threads(
         steps = [e.label for e in at.expander if e.proto.type == STEP]
         assert all(label.endswith("· 완료") for label in steps)
         assert at.button(key="ai_back").proto.help == "메인 대화 복귀"
-        assert isinstance(shared.app.rt.workspace.board, display.Board)
+        assert display.DELIVERED in [caption.value for caption in at.caption]
+        assert not [g for g in at.button_group if g.key == "ai_pick_t1_synth"]
+
+        _ = at.button_group(key="ai_pick_t1_round1").set_value("강세").run()
+        assert not at.exception
+        said = " ".join(str(m.value) for m in at.markdown)
+        assert "bull 1 발언" in said
+        assert "bull 3 발언" not in said
+    finally:
+        shared.app.rt.renew()
+
+
+def test_failed_and_stopped_reports_render_every_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from finagent.ui import shared
+    from tests.test_analysis_workflow import MACRO_CALL, Team, run
+    from tests.test_display_flow import SIDES, board_of, stop_when
+
+    def debating(role: str, number: int) -> bool:
+        return role in SIDES and number >= 2
+
+    runs = {
+        "failed": asyncio.run(run(Team(MACRO_CALL, failing=("bull", "synth")))),
+        "stopped": asyncio.run(stop_when(Team(MACRO_CALL, held=debating), "debate", 2)),
+    }
+    monkeypatch.setattr(sys, "argv", ["app", "--demo"])
+    at = AppTest.from_file(str(APP), default_timeout=60).run()
+    at._page_hash = calc_hash("agent")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    _ = at.run()
+    try:
+        for name, events in runs.items():
+            shared.app.rt.workspace.board = board_of(events)
+            at.session_state["ai_thread"] = "t1"
+            _ = at.run()
+            assert not at.exception, name
+            captions = [caption.value for caption in at.caption]
+            assert any(text.startswith(("실패 · ", "중지 · ")) for text in captions)
+            keys = [g.key for g in at.button_group if g.key]
+            for key in [key for key in keys if key.startswith("ai_pick_t1")]:
+                for option in at.button_group(key=key).options:
+                    _ = at.button_group(key=key).set_value(option).run()
+                    assert not at.exception, (name, key, option)
     finally:
         shared.app.rt.renew()

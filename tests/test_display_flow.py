@@ -9,7 +9,7 @@ from finagent import display
 from finagent.analysis import agents
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.display import Board, FlowView
-from tests.test_analysis_service import analysis, until
+from tests.test_analysis_service import analysis, ended, of_type, until
 from tests.test_analysis_workflow import MACRO_CALL, Team, prepared, run
 
 if TYPE_CHECKING:
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 type Event = dict[str, object]
 
+SIDES: Final = frozenset({"bull", "bear"})
 WAITING: Final = [
     "토론 1라운드 · 대기",
     "토론 2라운드 · 대기",
@@ -126,6 +127,14 @@ def test_a_failed_debater_skips_the_rounds_it_cut() -> None:
         "토론 3라운드 · 미실행",
     ]
     assert (flow.state, flow.done, flow.total) == ("done", 7, 7)
+    mid = view(upto(events, "t1-6", "turn"))
+    assert labels(mid)[2:5] == [
+        "토론 1라운드 · :red[실패]",
+        "토론 2라운드 · 미실행",
+        "토론 3라운드 · 미실행",
+    ]
+    assert mid.bar_text == "종합 · 결론 작성 중 · 6/7"
+    assert view(upto(events, "t1-6", "thread")).bar_text == "종합 시작 중 · 6/7"
 
 
 def test_a_failed_synthesis_marks_the_last_step_and_the_report() -> None:
@@ -158,25 +167,67 @@ def test_all_collectors_failing_skips_the_rest() -> None:
     assert flow.activity == "실패 · 수집"
 
 
+async def stop_when(provider: Team, group: str, count: int) -> list[Event]:
+    ws = analysis(provider, prepared).open()
+    events: list[Event] = []
+    await ws.ask("맡겨")
+    await until(ws, events, lambda: provider.live.get(group) == count)
+    await ws.stop("t1")
+    await until(ws, events)
+    assert not ws.busy
+    return events
+
+
 def test_stopping_during_collection_shows_where_it_stopped() -> None:
-    provider = Team(MACRO_CALL, hold=True)
-    service = analysis(provider, prepared)
+    events = asyncio.run(stop_when(Team(MACRO_CALL, hold=True), "collect", 3))
 
-    async def scenario() -> list[Event]:
-        ws = service.open()
-        events: list[Event] = []
-        await ws.ask("맡겨")
-        await until(ws, events, lambda: provider.live.get("collect") == 3)
-        await ws.stop("t1")
-        await until(ws, events)
-        return events
-
-    flow = view(asyncio.run(scenario()))
+    flow = view(events)
 
     assert labels(flow)[1:3] == ["수집 · 중지", "토론 1라운드 · 미실행"]
     assert flow.activity == "중지 · 수집"
     assert flow.end_label == "보고서 · 중지"
     assert flow.short == "중지"
+
+
+def test_stopping_during_the_debate_stops_both_sides_and_skips_the_rest() -> None:
+    team = Team(MACRO_CALL, held=lambda role, number: role in SIDES and number >= 2)
+
+    events = asyncio.run(stop_when(team, "debate", 2))
+
+    assert ended(events, "t1-4")[-1] == ended(events, "t1-5")[-1] == "stopped"
+    assert "종합" not in {e.get("stage") for e in of_type(events, "thread")}
+    flow = view(events)
+    assert labels(flow)[3:] == [
+        "토론 2라운드 · 중지",
+        "토론 3라운드 · 미실행",
+        "종합 · 미실행",
+    ]
+    assert flow.activity == "중지 · 토론 2라운드"
+    assert view(upto(events, "t1", "end")[:-1]).bar_text == "중지 중 · 6/9"
+
+
+def test_stopping_during_the_synthesis_shows_the_synthesis_stopped() -> None:
+    team = Team(MACRO_CALL, held=lambda role, _: role == "synth")
+
+    events = asyncio.run(stop_when(team, "synth", 1))
+
+    assert ended(events, "t1-6") == ["stopped"]
+    flow = view(events)
+    assert flow.steps[-1].label == "종합 · 중지"
+    assert flow.activity == "중지 · 종합"
+
+
+def test_the_last_halted_step_is_the_one_reported() -> None:
+    flow = view(asyncio.run(run(Team(MACRO_CALL, failing=("bull", "synth")))))
+
+    assert flow.activity == "실패 · 종합"
+    assert flow.failed == 2
+    assert labels(flow)[2:] == [
+        "토론 1라운드 · :red[실패]",
+        "토론 2라운드 · 미실행",
+        "토론 3라운드 · 미실행",
+        "종합 · :red[실패]",
+    ]
 
 
 def test_a_failed_preparation_fails_the_first_step() -> None:
