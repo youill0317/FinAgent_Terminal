@@ -126,3 +126,9 @@ def test_debate_requests_name_the_side_its_focus_and_each_round() -> None:
     assert first.endswith("추가 요청:\n금리 경로 위주")
     assert agents.round_request(agents.BULL, 2).startswith("2라운드")
     assert "강세 측 최종 입장" in agents.round_request(agents.BULL, 3)
+
+
+def test_seat_names_are_unique_within_each_workflow() -> None:
+    for flow in agents.WORKFLOWS.values():
+        names = [seat.name for seat in flow.collect]
+        assert len(names) == len(set(names)), flow.kind

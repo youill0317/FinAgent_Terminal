@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Final
 import streamlit as st
 
 from finagent import display, portfolio
-from finagent.analysis import agents, documents, skill
+from finagent.analysis import documents, skill
 from finagent.analysis.briefing import Briefing
 from finagent.analysis.company_tools import universe
 from finagent.analysis.presets import ETF, MACRO, STOCK, Preset
@@ -40,13 +40,26 @@ SLASH: Final = (
     Command("/etf", ETF.title, "티커", ("etf",)),
     Command("/종목", STOCK.title, "티커", ("종목", "stock")),
 )
-DEBATE_STAGE: Final = agents.DEBATE
-STATE_ICON = {
+STATE_ICON: Final[dict[str, str]] = {
     "working": ":material/progress_activity:",
     "done": ":material/check_circle:",
     "failed": ":material/error:",
     "stopped": ":material/stop_circle:",
 }
+STEP_ICON: Final[dict[str, str | None]] = {
+    "pending": None,
+    "working": "spinner",
+    "done": ":material/check_circle:",
+    "failed": ":material/error:",
+    "stopped": ":material/stop_circle:",
+    "skipped": ":material/block:",
+}
+AGENT_ICON: Final[dict[str, str]] = {
+    **STATE_ICON,
+    "pending": ":material/schedule:",
+    "skipped": ":material/block:",
+}
+FLOW_AVATAR: Final = ":material/account_tree:"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -204,18 +217,18 @@ def open_thread(key: str) -> None:
     state.ai_thread = key
 
 
-def card_label(log: display.AnalysisLog) -> str:
-    parts = [log.title]
-    if log.stage == DEBATE_STAGE and log.turns:
-        parts.append(f"{len(log.turns)}라운드")
-    parts.append(display.STATE_TEXT[log.state])
-    return " · ".join(parts)
+def card_label(log: display.AnalysisLog, flow: display.FlowView | None) -> str:
+    working = flow is not None and flow.working
+    status = flow.short if flow is not None and working else None
+    return f"{log.title} · {status or display.STATE_TEXT[log.state]}"
 
 
-def thread_card(key: str, place: str) -> None:
-    log = workspace().board.threads[key]
+def thread_card(key: str, place: str) -> display.FlowView | None:
+    board = workspace().board
+    log = board.threads[key]
+    flow = display.flow_view(board, key)
     st.button(
-        card_label(log),
+        card_label(log, flow),
         icon=STATE_ICON[log.state],
         key=f"ai_card_{place}_{key}",
         on_click=open_thread,
@@ -223,27 +236,19 @@ def thread_card(key: str, place: str) -> None:
         type="tertiary" if place == "turn" else "secondary",
         width="content" if place == "turn" else "stretch",
     )
-    if log.conclusion and place == "list":
-        st.caption(log.conclusion)
+    return flow
 
 
-def team_list(key: str) -> None:
-    board = workspace().board
-    log = board.threads.get(key)
-    if log is not None and log.parent:
-        key, log = log.parent, board.threads[log.parent]
-    if log is None or not log.children:
-        return
-    working = sum(board.threads[child].working for child in log.children)
-    label = f"에이전트 {len(log.children)}개" + (
-        f" · 작업 중 {working}" if working else ""
-    )
-    st.subheader(label, anchor=False)
-    for stage, keys in board.stages(key).items():
-        st.caption(stage)
-        for child in keys:
-            thread_card(child, "team")
-    st.divider()
+def list_card(key: str) -> None:
+    log = workspace().board.threads[key]
+    with st.container(gap="xsmall"):
+        flow = thread_card(key, "list")
+        if flow is not None and flow.working:
+            st.progress(flow.fraction)
+        elif flow is not None and flow.state in display.HALTED:
+            st.caption(flow.activity)
+        if log.conclusion:
+            st.caption(log.conclusion)
 
 
 def thread_list() -> None:
@@ -256,7 +261,7 @@ def thread_list() -> None:
         if keys:
             st.caption(title)
         for key in keys:
-            thread_card(key, "list")
+            list_card(key)
 
 
 def icon_button(icon: str, key: str, label: str, **options: object) -> None:
@@ -316,27 +321,133 @@ def turn_meta(turn: display.TurnView) -> None:
             st.caption(f":red[{summary}" + (f" · {count}회]" if count > 1 else "]"))
 
 
+def reply(turn: display.TurnView, links: dict[str, str], *, live: bool) -> None:
+    if live:
+        step = turn.tools[-1][0] if turn.tools else "작업 중"
+        st.caption(f":shimmer[{step}]")
+        st.markdown(display.live_tail(turn.raw))
+        return
+    if turn.tools:
+        turn_meta(turn)
+    if turn.lines is not None:
+        st.markdown(display.answer_markdown(turn.lines, links))
+    else:
+        st.markdown(display.live_text(turn.raw))
+
+
+def notices(turn: display.TurnView) -> None:
+    for message, error in turn.notices:
+        if error:
+            st.error(message)
+        else:
+            st.caption(message, help=display.STOPPED_HELP)
+
+
 def answer(turn: display.TurnView, links: dict[str, str], *, live: bool) -> None:
     with st.chat_message("assistant", avatar=":material/smart_toy:"):
-        if live:
-            step = turn.tools[-1][0] if turn.tools else "작업 중"
-            st.caption(f":shimmer[{step}]")
-            st.markdown(display.live_tail(turn.raw))
+        reply(turn, links, live=live)
+        notices(turn)
+
+
+def agent_label(agent: display.FlowAgent) -> str:
+    text = f"{AGENT_ICON[agent.state]} {agent.name}"
+    return f":red[{text}]" if agent.state == "failed" else text
+
+
+def agent_pick(
+    flow: display.FlowView, step: display.FlowStep
+) -> display.FlowAgent | None:
+    names = {agent.name: agent for agent in step.agents}
+    picked = st.pills(
+        "에이전트",
+        list(names),
+        format_func=lambda name: agent_label(names[name]),
+        key=f"ai_pick_{flow.key}_{step.key}",
+        label_visibility="collapsed",
+    )
+    return names.get(picked) if picked else None
+
+
+def agent_pane(agent: display.FlowAgent, links: dict[str, str]) -> None:
+    log = workspace().board.threads.get(agent.thread)
+    if log is None or not 0 <= agent.turn < len(log.turns):
+        st.caption(agent.line)
+        return
+    turn = log.turns[agent.turn]
+    with st.container(border=True):
+        if agent.task:
+            st.caption(agent.task)
+        reply(turn, links, live=agent.state == "working")
+        notices(turn)
+
+
+def step_body(
+    flow: display.FlowView,
+    step: display.FlowStep,
+    turn: display.TurnView,
+    links: dict[str, str],
+) -> None:
+    if step.key == "prepare":
+        note = display.PREPARE_NOTE.get(step.state, "")
+        st.caption(f"{note} · {turn.run}" if step.state == "done" else note)
+        for summary, _ in turn.tools:
+            st.caption(summary)
+    elif step.key == "synth":
+        if turn.lines is not None:
+            st.caption(display.DELIVERED)
         else:
-            if turn.tools:
-                turn_meta(turn)
-            if turn.lines is not None:
-                st.markdown(display.answer_markdown(turn.lines, links))
-            else:
-                st.markdown(display.live_text(turn.raw))
-        for message, error in turn.notices:
-            if error:
-                st.error(message)
-            else:
-                st.caption(message, help=display.STOPPED_HELP)
+            agent_pane(step.agents[0], links)
+    elif (picked := agent_pick(flow, step)) is not None:
+        agent_pane(picked, links)
 
 
-def turns(view: View, log: display.AnalysisLog) -> None:
+def flow_steps(
+    flow: display.FlowView, turn: display.TurnView, links: dict[str, str]
+) -> None:
+    for step in flow.steps:
+        with st.expander(
+            step.label,
+            key=f"ai_step_{flow.key}_{step.key}",
+            type="step",
+            icon=STEP_ICON[step.state],
+        ):
+            step_body(flow, step, turn, links)
+    st.expander(
+        flow.end_label,
+        key=f"ai_step_{flow.key}_end",
+        type="step",
+        icon=STEP_ICON[flow.end_state],
+    )
+
+
+def flow_turn(
+    flow: display.FlowView, turn: display.TurnView, links: dict[str, str]
+) -> None:
+    with st.chat_message("assistant", avatar=FLOW_AVATAR):
+        if turn.lines is None:
+            flow_steps(flow, turn, links)
+        else:
+            with st.expander(
+                flow.fold_label(turn.summary), key=f"ai_flow_{flow.key}", type="compact"
+            ):
+                st.caption(turn.run_line, help=display.SUMMARY_HELP)
+                flow_steps(flow, turn, links)
+            st.markdown(display.answer_markdown(turn.lines, links))
+        notices(turn)
+
+
+def flow_head(flow: display.FlowView | None) -> None:
+    if flow is None:
+        return
+    if flow.working:
+        st.progress(flow.fraction, text=flow.bar_text)
+    elif flow.state in display.HALTED:
+        st.caption(flow.activity)
+
+
+def turns(
+    view: View, log: display.AnalysisLog, flow: display.FlowView | None = None
+) -> None:
     links = {
         row: panel
         for row, panel in display.panel_of(view.data).items()
@@ -347,7 +458,9 @@ def turns(view: View, log: display.AnalysisLog) -> None:
         if turn.question:
             with st.chat_message("user", avatar=":material/person:"):
                 st.markdown(display.md(turn.question))
-        if live or not turn.empty:
+        if flow is not None and turn.plan is not None:
+            flow_turn(flow, turn, links)
+        elif live or not turn.empty:
             answer(turn, links, live=live)
         for key in turn.threads:
             thread_card(key, "turn")
@@ -367,30 +480,32 @@ def toggle_wide() -> None:
 
 
 def thread_head(log: display.AnalysisLog) -> None:
-    parent = workspace().board.threads.get(log.parent) if log.parent else None
     with st.container(horizontal=True, vertical_alignment="center"):
         icon_button(
             ":material/arrow_back:",
             "ai_back",
-            "보고서 복귀" if parent is not None else "메인 대화 복귀",
+            "메인 대화 복귀",
             on_click=open_thread,
-            args=(log.parent,),
+            args=("",),
         )
-        title = f"{parent.title} · {log.title}" if parent is not None else log.title
-        st.subheader(title, anchor="analysis")
+        st.subheader(log.title, anchor="analysis")
     if log.conclusion:
         with st.container(key="ai_conclusion"):
             st.markdown(log.conclusion)
 
 
 def conversation_body(view: View, log: display.AnalysisLog) -> None:
+    board = workspace().board
+    flow = display.flow_view(board, state.ai_thread) if state.ai_thread else None
     with st.container(key="ai_page"):
         if state.ai_thread:
             thread_head(log)
-        reading = log.report and len(log.turns) == 1 and not log.working
+            flow_head(flow)
+        single = len(log.turns) == 1
+        reading = single and (flow is not None or (log.report and not log.working))
         outer = "ai_report" if reading else "ai_turns"
         with st.container(key=outer), st.container(key=f"{outer}_inner"):
-            turns(view, log)
+            turns(view, log, flow)
             received_data(log)
         controls(log)
 
@@ -403,8 +518,11 @@ def agent_page(view: View) -> None:
         ws = workspace()
         ws.portfolio = state.get("pf_selected") or ""
         ws.drain()
-        if state.ai_thread not in ws.board.threads:
+        opened = ws.board.threads.get(state.ai_thread)
+        if opened is None:
             state.ai_thread = ""
+        elif opened.parent:
+            state.ai_thread = opened.parent
         if busy != ws.busy and not state.get("settings_open"):
             st.rerun()
         log = conversation()
@@ -415,7 +533,6 @@ def agent_page(view: View) -> None:
         with talk:
             conversation_body(view, log)
         with side, st.container(key="ai_threads"):
-            team_list(state.ai_thread)
             thread_list()
 
     body()

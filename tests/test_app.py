@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 APP = Path(finagent.__file__).parent / "app.py"
 PAGES = ("economy", "monetary", "finance", "schedule", "etf", "agent", "portfolio")
 WITHOUT_CHAT = {"agent", "portfolio"}
+STEP = 2
 
 
 def test_demo_renders_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -39,3 +41,58 @@ def test_demo_renders_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
     for section in at.run().button_group(key="stock_section").options:
         _ = at.button_group(key="stock_section").set_value(section)
         assert not at.run().exception, section
+
+
+def test_a_report_thread_shows_its_workflow_not_agent_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from finagent import display
+    from finagent.ui import shared
+    from tests.test_analysis_workflow import MACRO_CALL, Team, run
+    from tests.test_display_flow import board_of, upto
+
+    events = asyncio.run(run(Team(MACRO_CALL)))
+    monkeypatch.setattr(sys, "argv", ["app", "--demo"])
+    at = AppTest.from_file(str(APP), default_timeout=60).run()
+    at._page_hash = calc_hash("agent")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    _ = at.run()
+    try:
+        shared.app.rt.workspace.board = board_of(upto(events, "t1-3", "turn"))
+        at.session_state["ai_thread"] = "t1"
+        _ = at.run()
+        assert not at.exception
+        progress = at.get("progress")
+        bars = [str(e.proto.text) for e in progress]  # pyright: ignore[reportAny]
+        assert "수집 · 에이전트 3개 작업 중 · 1/11" in bars
+        assert "" in bars
+        steps = [e.label for e in at.expander if e.proto.type == STEP]
+        assert steps == [
+            "준비 · 완료",
+            "수집 · 작업 중 0/3",
+            "토론 1라운드 · 대기",
+            "토론 2라운드 · 대기",
+            "토론 3라운드 · 대기",
+            "종합 · 대기",
+            "보고서 · 대기",
+        ]
+        assert at.button(key="ai_card_list_t1").label == "매크로 분석 · 수집 · 1/11"
+        assert not [b for b in at.button if (b.key or "").startswith("ai_card_team")]
+
+        _ = at.button_group(key="ai_pick_t1_collect").set_value("기술").run()
+        assert "PART V" in [caption.value for caption in at.caption]
+
+        at.session_state["ai_thread"] = "t1-2"
+        _ = at.run()
+        assert at.session_state["ai_thread"] == "t1"
+
+        shared.app.rt.workspace.board = board_of(events)
+        _ = at.run()
+        assert not at.exception
+        assert any(e.label.startswith("작업 과정 · 에이전트 6개") for e in at.expander)
+        assert not at.get("progress")
+        steps = [e.label for e in at.expander if e.proto.type == STEP]
+        assert all(label.endswith("· 완료") for label in steps)
+        assert at.button(key="ai_back").proto.help == "메인 대화 복귀"
+        assert isinstance(shared.app.rt.workspace.board, display.Board)
+    finally:
+        shared.app.rt.renew()

@@ -32,7 +32,7 @@ from finagent.analysis.tools import (
     Toolbox,
     ToolResult,
 )
-from finagent.display import STATE_TEXT, Board
+from finagent.display import Board
 from finagent.limits import INTERACTIVE_WAIT
 from finagent.settings import AnalysisChoice, load_analysis, save_analysis
 
@@ -70,7 +70,6 @@ NO_REPORTS: Final = "수집 에이전트 전원 실패"
 SYNTH_FAILED: Final = "종합 에이전트 실패: {failure}"
 SYNTH_QUESTION: Final = "결론·시나리오·최종 판단 작성"
 ROUND_QUESTION: Final = "{number}라운드"
-STAGE_STEP: Final = "{stage} 시작 · {names}"
 ATTACH_SHAPE: Final = "attach는 {thread, sections}의 목록"
 ATTACH: Final = {
     "type": "array",
@@ -783,6 +782,8 @@ class Workspace:
             else self._workflow(thread, flow, ticker.upper(), task, notes)
         )
         self._begin(thread, task or thread.title, work)
+        if flow is not None:
+            self._emit(thread.id, _plan(flow))
         self._refer(thread, lent)
         return thread
 
@@ -826,7 +827,7 @@ class Workspace:
         self._active += 1
         task = asyncio.create_task(self._guard(thread, work))
         self._tasks[thread.id] = task
-        task.add_done_callback(lambda done: self._close(thread, question, done))
+        task.add_done_callback(lambda done: self._close(thread, done))
         return task
 
     async def _guard(self, thread: Thread, work: Work) -> str:
@@ -857,13 +858,9 @@ class Workspace:
         self._advance()
         self._active -= 1
 
-    def _close(self, thread: Thread, question: str, task: asyncio.Task[str]) -> None:
-        failure = self._ended(thread, task)
+    def _close(self, thread: Thread, task: asyncio.Task[str]) -> None:
+        _ = self._ended(thread, task)
         self._active -= 1
-        summary = f"{thread.title} · {question} · {STATE_TEXT[thread.state]}"
-        if thread.state == "failed":
-            summary = f"{summary}: {failure}"
-        self._note(thread.parent, summary, ok=thread.state == "done")
 
     def _advance(self) -> None:
         if MAIN in self._tasks:
@@ -956,20 +953,21 @@ class Workspace:
         self._emit(parent.id, self._service.opening())
         crew: list[asyncio.Task[str]] = []
         try:
-            return await self._staged(parent, _Order(flow, given, task, notes), crew)
+            failure = await self._staged(parent, _Order(flow, given, task, notes), crew)
         finally:
             running = [job for job in crew if not job.done()]
             for job in running:
                 _ = job.cancel()
             if running:
                 _ = await asyncio.wait(running)
+        if failure:
+            self._emit(parent.id, {"type": "error", "message": failure})
+        return failure
 
     async def _staged(
         self, parent: Thread, order: _Order, crew: list[asyncio.Task[str]]
     ) -> str:
         flow = order.flow
-        names = ", ".join(seat.name for seat in flow.collect)
-        self._note(parent.id, STAGE_STEP.format(stage=agents.COLLECT, names=names))
         seats = [
             (seat, self._child(parent, seat.agent, seat.name, agents.COLLECT))
             for seat in flow.collect
@@ -995,9 +993,6 @@ class Workspace:
         if not attached:
             return NO_REPORTS
         transcript = await self._debate(parent, order, attached, crew)
-        self._note(
-            parent.id, STAGE_STEP.format(stage=agents.SUMMARY, names=SYNTH.title)
-        )
         synth = self._child(parent, SYNTH, SYNTH.title, agents.SUMMARY)
         job = self._spawn(
             synth,
@@ -1024,9 +1019,6 @@ class Workspace:
         sides = ((bull, BULL, bear), (bear, BEAR, bull))
         said: list[str] = []
         for number in range(1, agents.DEBATE_ROUNDS + 1):
-            stage = f"{agents.DEBATE} {ROUND_QUESTION.format(number=number)}"
-            names = f"{BULL.title}, {BEAR.title}"
-            self._note(parent.id, STAGE_STEP.format(stage=stage, names=names))
             heard = {
                 side.id: attached if number == 1 else _said(other, number - 1)
                 for side, _, other in sides
@@ -1104,6 +1096,18 @@ class Workspace:
 
     def _emit(self, thread: str, event: Event) -> None:
         self._events.put({**event, "thread": thread})
+
+
+def _plan(flow: Workflow) -> Event:
+    return {
+        "type": "plan",
+        "collect": [
+            {"name": seat.name, "parts": list(seat.parts)} for seat in flow.collect
+        ],
+        "sides": [BULL.title, BEAR.title],
+        "rounds": agents.DEBATE_ROUNDS,
+        "synth": {"name": SYNTH.title, "parts": list(flow.synth)},
+    }
 
 
 async def _outcomes(jobs: Sequence[asyncio.Task[str]]) -> list[str]:

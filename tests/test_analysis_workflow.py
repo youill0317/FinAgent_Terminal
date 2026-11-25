@@ -225,17 +225,37 @@ def test_the_macro_team_collects_debates_three_rounds_and_reports_once() -> None
     assert "t1-1" not in talk
 
 
-def test_the_report_thread_shows_each_stage_as_it_starts() -> None:
+def test_the_report_announces_its_plan_with_its_turn_and_no_stage_notes() -> None:
     provider = Team(MACRO_CALL)
 
     events = asyncio.run(run(provider))
 
-    steps = [str(e["summary"]) for e in of_type(of_thread(events, "t1"), "tool")]
-    assert steps[0] == "수집 시작 · 매크로, 기술, 센티먼트"
-    assert "기술 · PART V 작성 · 완료" in steps
-    assert "토론 3라운드 시작 · 강세, 약세" in steps
-    assert steps.index("종합 시작 · 종합") > steps.index("약세 · 3라운드 · 완료")
-    assert steps[-1] == "종합 · 결론·시나리오·최종 판단 작성 · 완료"
+    own = of_thread(events, "t1")
+    assert [e["type"] for e in own[:3]] == ["thread", "turn", "plan"]
+    plan = {k: v for k, v in own[2].items() if k not in {"type", "thread"}}
+    assert plan == {
+        "collect": [
+            {"name": "매크로", "parts": ["I", "II", "III", "IV"]},
+            {"name": "기술", "parts": ["V"]},
+            {"name": "센티먼트", "parts": ["VI"]},
+        ],
+        "sides": ["강세", "약세"],
+        "rounds": agents.DEBATE_ROUNDS,
+        "synth": {"name": "종합", "parts": []},
+    }
+    assert of_type(own, "tool") == []
+
+
+def test_all_collectors_failing_is_reported_on_the_report_thread() -> None:
+    provider = Team(MACRO_CALL, failing=("macro", "technical", "sentiment"))
+
+    events = asyncio.run(run(provider))
+
+    assert ended(events, "t1") == ["failed"]
+    errors = [e["message"] for e in of_type(of_thread(events, "t1"), "error")]
+    assert errors == ["수집 에이전트 전원 실패"]
+    stages = {e.get("stage") for e in of_type(events, "thread")}
+    assert stages == {None, "수집"}
 
 
 def test_a_failed_collector_leaves_a_marked_gap_and_the_report_still_lands() -> None:
@@ -278,6 +298,8 @@ def test_a_failed_synthesis_fails_the_report() -> None:
 
     assert ended(events, "t1-6") == ["failed"]
     assert ended(events, "t1") == ["failed"]
+    errors = [e["message"] for e in of_type(of_thread(events, "t1"), "error")]
+    assert errors == ["종합 에이전트 실패: synth 실패"]
     assert final(events) == ""
     woken = [seen for seen in provider.seen if seen.kind == "main"][-1]
     assert "종합 에이전트 실패: synth 실패" in woken.conversation.request_document
@@ -376,3 +398,45 @@ def test_the_demo_team_assembles_each_report_in_part_order(ask: str, kind: str) 
     assert len(children) == len(flow.collect) + 3
     reported = cast("str", of_type(of_thread(events, ""), "text")[-1]["text"])
     assert reported
+
+
+@pytest.mark.parametrize(
+    ("ask", "kind"),
+    [
+        ("매크로 분석 해줘", "macro"),
+        ("AAPL 종목 분석", "stock"),
+        ("QQQ ETF 분석", "etf"),
+    ],
+)
+def test_each_report_starts_exactly_the_agents_its_plan_names(
+    ask: str, kind: str
+) -> None:
+    service = analysis(DemoProvider(delay=0), prepared, fetched=True)
+
+    async def scenario() -> list[Event]:
+        ws = service.open()
+        events: list[Event] = []
+        await ws.ask(ask)
+        await until(ws, events)
+        return events
+
+    events = asyncio.run(scenario())
+
+    plan = of_type(of_thread(events, "t1"), "plan")[0]
+    collect = cast("list[dict[str, object]]", plan["collect"])
+    synth = cast("dict[str, object]", plan["synth"])
+    slots = {("수집", str(seat["name"])) for seat in collect}
+    slots |= {("토론", str(side)) for side in cast("list[object]", plan["sides"])}
+    slots.add(("종합", str(synth["name"])))
+    started = {
+        (str(e["stage"]), str(e["title"]))
+        for e in of_type(events, "thread")
+        if e.get("parent") == "t1"
+    }
+    assert started == slots
+    assert synth["parts"] == list(agents.WORKFLOWS[kind].synth)
+    debaters = [
+        str(e["thread"]) for e in of_type(events, "thread") if e.get("stage") == "토론"
+    ]
+    for key in debaters:
+        assert len(of_type(of_thread(events, key), "turn")) == agents.DEBATE_ROUNDS
