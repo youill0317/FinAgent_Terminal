@@ -482,6 +482,8 @@ def dashboard_page(
 
 state.pop("etf_universe_changed", None)
 palette.scheme_sync()
+st.html(CARDS_CSS)
+st.html(AI_CSS)
 with st.container(horizontal=True, vertical_alignment="center"):
     st.title("FinAgent", anchor=False, width="content")
     if args.demo:
@@ -581,7 +583,5 @@ page.run()
 state.pop("refresh_page", None)
 
 theme_watch()
-st.html(CARDS_CSS)
-st.html(AI_CSS)
 if page_key not in {"agent", "portfolio"}:
     ai_dock(View(data, page_key, page_panels))
