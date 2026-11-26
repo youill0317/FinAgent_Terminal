@@ -1,4 +1,4 @@
-"""AI 분석 서비스·멀티스레드 작업 공간(Workspace) 및 도구·스트림 오케스트레이션."""
+"""AI 분석 서비스·작업 공간(Workspace)·분석 에이전트 팀 워크플로우 오케스트레이션."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from threading import Lock
 from typing import TYPE_CHECKING, Final, Literal, cast, final
 from xml.sax.saxutils import escape, quoteattr
 
-from finagent.analysis import cites, prompt, web
+from finagent.analysis import agents, cites, prompt, web
+from finagent.analysis.agents import BEAR, BULL, POOL, SYNTH, WORKFLOWS, Output
 from finagent.analysis.company_tools import Company, text_arg
 from finagent.analysis.prompt import Conversation, ToolRecord, Turn, system_prompt
 from finagent.analysis.providers import DEFAULT_PROVIDER, registry
@@ -36,9 +37,17 @@ from finagent.limits import INTERACTIVE_WAIT
 from finagent.settings import AnalysisChoice, load_analysis, save_analysis
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping
+    from collections.abc import (
+        AsyncGenerator,
+        Callable,
+        Collection,
+        Coroutine,
+        Mapping,
+        Sequence,
+    )
     from pathlib import Path
 
+    from finagent.analysis.agents import Agent, Seat, Workflow
     from finagent.analysis.context import Document
     from finagent.analysis.providers.base import Provider, ProviderStatus, StepKind
     from finagent.analysis.web import WebSource
@@ -48,14 +57,19 @@ if TYPE_CHECKING:
 type Event = dict[str, object]
 type ThreadState = Literal["working", "done", "failed", "stopped"]
 type Prepare = Callable[[Brief], RunInput]
+type Work = Coroutine[object, object, str]
 MAIN: Final = ""
-MAX_THREADS: Final = 8
 ERROR_LIMIT: Final = 400
 PRESET_TOOL_CALLS: Final = 40
 KINDS: Final = ("macro", "stock", "etf", "research")
 STOPPED: Final = "사용자 중지"
 UNANSWERED: Final = "조정자 응답 없음. 보유 자료로 진행할 것"
 NO_TOOLS: Final = "페이지 챗봇은 도구 미사용"
+UNAVAILABLE: Final = "이 에이전트에 없는 도구"
+NO_REPORTS: Final = "수집 에이전트 전원 실패"
+SYNTH_FAILED: Final = "종합 에이전트 실패: {failure}"
+SYNTH_QUESTION: Final = "결론·시나리오·최종 판단 작성"
+ROUND_QUESTION: Final = "{number}라운드"
 ATTACH_SHAPE: Final = "attach는 {thread, sections}의 목록"
 ATTACH: Final = {
     "type": "array",
@@ -74,6 +88,7 @@ ATTACH: Final = {
         "additionalProperties": False,
     },
 }
+AGENT_CHOICES: Final = ", ".join(f"{agent.id} {agent.title}" for agent in POOL.values())
 SPECS: Final = tuple(ToolSpec(name, text, schema) for name, text, schema in TOOL_SPECS)
 THREAD_SPECS: Final = (
     ToolSpec(
@@ -86,6 +101,11 @@ THREAD_SPECS: Final = (
                 "kind": {"type": "string", "enum": list(KINDS)},
                 "ticker": {"type": "string", "description": "stock, etf의 티커"},
                 "task": {"type": "string", "description": "스레드에 줄 작업 지시"},
+                "agent": {
+                    "type": "string",
+                    "enum": list(POOL),
+                    "description": f"research에 부여할 에이전트 역할 · {AGENT_CHOICES}",
+                },
                 "attach": ATTACH,
             },
             "required": ["title", "kind"],
@@ -138,6 +158,8 @@ ASK_SPECS: Final = (
         },
     ),
 )
+ASKING: Final = frozenset(spec.name for spec in ASK_SPECS)
+DELEGATED: Final = frozenset(spec.name for spec in (*THREAD_SPECS, *ASK_SPECS))
 
 
 @dataclass(slots=True)
@@ -162,6 +184,15 @@ class Thread:
     ids: set[str] = field(default_factory=set)
     received: dict[str, str] = field(default_factory=dict)
     web: dict[str, WebSource] = field(default_factory=dict)
+    parent: str = ""
+    agent: Agent | None = None
+    team: list[Thread] = field(default_factory=list)
+    calls: int = 0
+    searches: int = 0
+
+    @property
+    def answer(self) -> str:
+        return self.turns[-1].answer if self.turns else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +200,7 @@ class RunInput:
     request: str
     document: Document | None = None
     kind: str = ""
+    guide: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +227,31 @@ class _Ask:
     helpers: set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True, slots=True)
+class _Order:
+    flow: Workflow
+    given: RunInput
+    task: str
+    notes: str
+
+    def kind(self, agent: Agent) -> str:
+        return f"{self.flow.kind}:{agent.id}"
+
+    def collect(self, seat: Seat) -> RunInput:
+        request = agents.collect_request(self.flow, seat, self.given.guide, self.task)
+        return RunInput(request, self.given.document, self.kind(seat.agent))
+
+    def round(self, agent: Agent, number: int) -> RunInput:
+        if number > 1:
+            return RunInput(agents.round_request(agent, number), kind=self.kind(agent))
+        request = agents.debate_request(self.flow, agent, self.task)
+        return RunInput(request, self.given.document, self.kind(agent))
+
+    def synth(self) -> RunInput:
+        request = agents.synth_request(self.flow, self.given.guide, self.task)
+        return RunInput(request, self.given.document, self.kind(SYNTH))
+
+
 @dataclass(slots=True)
 class _Job:
     given: RunInput
@@ -218,6 +275,11 @@ class _Job:
     @property
     def searching(self) -> bool:
         return self.thread.id != MAIN
+
+    @property
+    def web(self) -> bool:
+        agent = self.thread.agent
+        return self.searching and (agent is None or agent.web)
 
     @property
     def limit(self) -> int:
@@ -345,6 +407,18 @@ class AnalysisService:
         found = await asyncio.gather(*(self._providers[i].status() for i in ids))
         return dict(zip(ids, found, strict=True))
 
+    async def unready(self) -> str:
+        status = await self._providers[self._choice.provider].status()
+        return "" if status.ready else status.message or status.kind
+
+    def opening(self) -> Event:
+        provider_id = self._choice.provider
+        return {
+            "type": "start",
+            "provider_title": self._providers[provider_id].title,
+            "model": self.model_for(provider_id, thread=True),
+        }
+
     def open(self, *, chat: bool = False) -> Workspace:
         return Workspace(self, chat=chat)
 
@@ -392,9 +466,10 @@ class AnalysisService:
             "provider_title": provider.title,
             "model": model,
         }
+        specs = () if desk.chat else _specs(thread)
         received: dict[str, str] = {}
-        if desk.chat:
-            async for event in self._answer(job, None, desk):
+        if not specs:
+            async for event in self._answer(job, specs, None, desk):
                 yield event
         else:
             async with self._dashboard.fetch_context(max_wait=INTERACTIVE_WAIT) as ctx:
@@ -409,36 +484,41 @@ class AnalysisService:
                     dashboard=dashboard,
                     portfolios=self._portfolios,
                 )
-                async for event in self._answer(job, box, desk):
+                async for event in self._answer(job, specs, box, desk):
                     yield event
             received = box.received
         if not job.completed:
             return
         ids = {*job.ids, *received}
         job.commit(ids, received)
-        async for event in self._finish(job, ids):
-            yield event
+        yield _done(
+            job.answer,
+            job.thread,
+            ids,
+            job.found,
+            counts=(job.trace.data_calls, job.trace.web_steps),
+            report=bool(job.given.kind) and not job.thread.parent,
+        )
 
     async def _answer(
-        self, job: _Job, box: Toolbox | None, desk: Workspace
+        self,
+        job: _Job,
+        specs: tuple[ToolSpec, ...],
+        box: Toolbox | None,
+        desk: Workspace,
     ) -> AsyncGenerator[Event]:
         queue: asyncio.Queue[Event | None] = asyncio.Queue()
         main = job.thread.id == MAIN
-        extra = () if box is None else THREAD_SPECS if main else ASK_SPECS
-        names = {spec.name for spec in extra}
+        names = {spec.name for spec in specs}
 
         async def run_tool(name: str, arguments: Mapping[str, object]) -> ToolResult:
-            delegated = name in names
-            if delegated:
+            delegated = name in DELEGATED
+            if box is None or name not in names:
+                result = _refused(name, NO_TOOLS if desk.chat else UNAVAILABLE)
+            elif delegated:
                 result = await desk.use(job.thread, name, arguments)
-            elif box is not None:
-                result = await box.run(name, arguments)
             else:
-                result = ToolResult(
-                    json.dumps({"error": NO_TOOLS}, ensure_ascii=False),
-                    ok=False,
-                    summary=f"{name} · 실패: {NO_TOOLS}",
-                )
+                result = await box.run(name, arguments)
             if delegated:
                 job.ids |= job.thread.ids
                 job.found.update(job.thread.web)
@@ -455,22 +535,23 @@ class AnalysisService:
             await queue.put(job.trace.step(result.summary, ok=result.ok, kind=kind))
             return result
 
-        limit = WEB_STEP_LIMIT if job.searching else 0
         system = system_prompt(
             self._choice.instructions,
-            web_limit=limit,
-            threads=MAX_THREADS if main and box is not None else 0,
-            asking=not main,
-            chat=box is None,
+            web_limit=WEB_STEP_LIMIT if job.web else 0,
+            coordinator=main and not desk.chat,
+            asking=not main and bool(names & ASKING),
+            team=bool(job.thread.parent),
+            chat=desk.chat,
+            tools=names - DELEGATED,
         )
         request = RunRequest(
             conversation=job.conversation(system),
             model=job.model,
-            tools=() if box is None else (*SPECS, *extra),
+            tools=specs,
             run_tool=run_tool,
-            web=job.searching,
-            max_rounds=0 if box is None else job.limit,
-            kind="chat" if box is None else job.kind,
+            web=job.web,
+            max_rounds=job.limit if specs else 0,
+            kind="chat" if desk.chat else job.kind,
         )
         segments = [""]
         task = asyncio.create_task(self._pump(job, request, queue, segments))
@@ -489,23 +570,6 @@ class AnalysisService:
             return
         job.answer = answer
         job.completed = True
-
-    async def _finish(self, job: _Job, ids: set[str]) -> AsyncGenerator[Event]:
-        yield {
-            "type": "done",
-            "lines": cites.parse(job.answer, ids, job.found),
-            "received": [
-                {"cite": cite, "info": info}
-                for cite, info in job.thread.received.items()
-            ],
-            "data_calls": job.trace.data_calls,
-            "web_steps": job.trace.web_steps,
-            "report": bool(job.given.kind),
-            "sources": [
-                {"url": source.url, "title": source.title}
-                for source in cites.cited_sources(job.answer, job.found)
-            ],
-        }
 
     async def _pump(
         self,
@@ -623,13 +687,7 @@ class Workspace:
                 return ToolResult(body, ok=True, summary=summary)
             lent = self._lent(arguments.get("attach"))
             if name == "start_thread":
-                thread = self._start(
-                    text_arg(arguments, "kind"),
-                    text_arg(arguments, "title"),
-                    text_arg(arguments, "ticker"),
-                    text_arg(arguments, "task"),
-                    lent,
-                )
+                thread = self._start(arguments, lent)
                 summary = f"스레드 시작 · {thread.title}"
             else:
                 thread = self._follow(
@@ -674,7 +732,7 @@ class Workspace:
             if source is None or not source.turns:
                 raise ValueError(f"첨부할 답변이 없는 스레드: {key}")
             names = _names(entry.get("sections"))
-            out.append(_Lent(source, names, _excerpt(source.turns[-1].answer, names)))
+            out.append(_Lent(source, names, _excerpt(source.answer, names)))
         return tuple(out)
 
     def _hand(self, thread: Thread, lent: tuple[_Lent, ...]) -> str:
@@ -694,29 +752,39 @@ class Workspace:
     def _refer(self, thread: Thread, lent: tuple[_Lent, ...]) -> None:
         for item in lent:
             label = " · ".join((item.source.title, *item.names))
-            step = {"type": "tool", "summary": f"참조 · {label}", "ok": True}
-            self._emit(thread.id, {**step, "kind": "thread"})
+            self._note(thread.id, f"참조 · {label}")
+
+    def _note(self, thread: str, summary: str, *, ok: bool = True) -> None:
+        step = {"type": "tool", "summary": summary, "ok": ok}
+        self._emit(thread, {**step, "kind": "thread"})
 
     def _start(
-        self, kind: str, title: str, ticker: str, task: str, lent: tuple[_Lent, ...]
+        self, arguments: Mapping[str, object], lent: tuple[_Lent, ...]
     ) -> Thread:
+        kind = text_arg(arguments, "kind")
+        ticker = text_arg(arguments, "ticker")
+        task = text_arg(arguments, "task")
         if kind not in KINDS:
             raise ValueError(f"kind는 {', '.join(KINDS)} 중 하나")
         if kind in {"stock", "etf"} and not ticker:
             raise ValueError("ticker 필수 입력")
         if kind == "research" and not task:
             raise ValueError("task 필수 입력")
-        self._room()
-        name = title or ticker or kind
-        thread = Thread(f"t{len(self._threads) + 1}", name, kind)
+        agent = _role(kind, text_arg(arguments, "agent"))
+        name = text_arg(arguments, "title") or ticker or kind
+        thread = Thread(f"t{len(self._threads) + 1}", name, kind, agent=agent)
         self._threads[thread.id] = thread
         self._emit(thread.id, {"type": "thread", "title": thread.title})
         notes = self._hand(thread, lent)
-        self._begin(
-            thread,
-            task or thread.title,
-            self._first(thread, ticker.upper(), task, notes),
+        flow = WORKFLOWS.get(kind)
+        work = (
+            self._first(thread, task, notes)
+            if flow is None
+            else self._workflow(thread, flow, ticker.upper(), task, notes)
         )
+        self._begin(thread, task or thread.title, work)
+        if flow is not None:
+            self._emit(thread.id, _plan(flow))
         self._refer(thread, lent)
         return thread
 
@@ -737,19 +805,12 @@ class Workspace:
             raise ValueError(f"{thread.title} 스레드 작업 진행 중")
         if not thread.documents:
             raise ValueError(f"{thread.title} 스레드 미시작 상태")
-        self._room()
         notes = self._hand(thread, lent)
         self._begin(thread, text, self._run(thread, RunInput(text), notes))
         self._refer(thread, lent)
         return thread
 
-    def _room(self) -> None:
-        if len(self._busy()) >= MAX_THREADS:
-            raise ValueError(f"동시 실행 스레드 한도({MAX_THREADS}개) 초과")
-
-    def _begin(
-        self, thread: Thread, question: str, work: Coroutine[object, object, str]
-    ) -> None:
+    def _begin(self, thread: Thread, question: str, work: Work) -> None:
         thread.state = "working"
         self._emit(thread.id, {"type": "turn", "question": question})
         self._active += 1
@@ -761,7 +822,16 @@ class Workspace:
         self._tasks[thread.id] = task
         task.add_done_callback(lambda done: self._settle(thread, done))
 
-    async def _guard(self, thread: Thread, work: Coroutine[object, object, str]) -> str:
+    def _spawn(self, thread: Thread, question: str, work: Work) -> asyncio.Task[str]:
+        thread.state = "working"
+        self._emit(thread.id, {"type": "turn", "question": question})
+        self._active += 1
+        task = asyncio.create_task(self._guard(thread, work))
+        self._tasks[thread.id] = task
+        task.add_done_callback(lambda done: self._close(thread, done))
+        return task
+
+    async def _guard(self, thread: Thread, work: Work) -> str:
         try:
             return await work
         except Exception as error:  # noqa: BLE001  # 스레드 작업 최상위 예외 포착
@@ -769,7 +839,7 @@ class Workspace:
             self._emit(thread.id, {"type": "error", "message": failure})
             return failure
 
-    def _settle(self, thread: Thread, task: asyncio.Task[str]) -> None:
+    def _ended(self, thread: Thread, task: asyncio.Task[str]) -> str:
         del self._tasks[thread.id]
         failure = STOPPED if task.cancelled() else task.result()
         if task.cancelled():
@@ -777,12 +847,20 @@ class Workspace:
         else:
             thread.state = "failed" if failure else "done"
         self._emit(thread.id, {"type": "end", "state": thread.state})
+        return failure
+
+    def _settle(self, thread: Thread, task: asyncio.Task[str]) -> None:
+        failure = self._ended(thread, task)
         if thread.id != MAIN:
-            body = failure or _digest(thread.turns[-1].answer)
+            body = failure or _digest(thread.answer)
             report = _tagged("thread_report", thread, body, state=thread.state)
             self._inbox.append((thread, report))
             self._wake = self._wake or not task.cancelled()
         self._advance()
+        self._active -= 1
+
+    def _close(self, thread: Thread, task: asyncio.Task[str]) -> None:
+        _ = self._ended(thread, task)
         self._active -= 1
 
     def _advance(self) -> None:
@@ -854,20 +932,155 @@ class Workspace:
         rows = (_row(t, waiting=t.id in self._waiting) for t in self._threads.values())
         return "\n".join(("<threads>", *rows, "</threads>"))
 
-    async def _first(self, thread: Thread, ticker: str, task: str, notes: str) -> str:
-        try:
-            given = await self._brief(thread.kind, ticker, task)
-        except Exception as error:
-            raise ProviderError(f"{thread.title} 준비 실패: {error}") from error
-        return await self._run(thread, given, notes)
+    async def _first(self, thread: Thread, task: str, notes: str) -> str:
+        agent = thread.agent
+        request = task if agent is None else agents.research_request(agent, task)
+        return await self._run(thread, RunInput(request), notes)
 
-    async def _brief(self, kind: str, ticker: str, task: str) -> RunInput:
-        if kind == "research":
-            return RunInput(task)
-        given = await self._service.prepare(kind, ticker, self.portfolio, self.company)
-        if not task:
-            return given
-        return replace(given, request=f"{given.request}\n\n추가 요청:\n{task}")
+    async def _workflow(
+        self, parent: Thread, flow: Workflow, ticker: str, task: str, notes: str
+    ) -> str:
+        if failure := await self._service.unready():
+            raise ProviderError(failure)
+        try:
+            given = await self._service.prepare(
+                flow.kind, ticker, self.portfolio, self.company
+            )
+        except Exception as error:
+            raise ProviderError(f"{parent.title} 준비 실패: {error}") from error
+        if given.document is not None:
+            parent.documents.append(given.document)
+            parent.ids |= given.document.ids
+        self._emit(parent.id, self._service.opening())
+        crew: list[asyncio.Task[str]] = []
+        try:
+            failure = await self._staged(parent, _Order(flow, given, task, notes), crew)
+        finally:
+            running = [job for job in crew if not job.done()]
+            for job in running:
+                _ = job.cancel()
+            if running:
+                _ = await asyncio.wait(running)
+        if failure:
+            self._emit(parent.id, {"type": "error", "message": failure})
+        return failure
+
+    async def _staged(
+        self, parent: Thread, order: _Order, crew: list[asyncio.Task[str]]
+    ) -> str:
+        flow = order.flow
+        seats = [
+            (seat, self._child(parent, seat.agent, seat.name, agents.COLLECT))
+            for seat in flow.collect
+        ]
+        jobs = [
+            self._spawn(
+                child,
+                agents.label(seat.parts),
+                self._run(child, order.collect(seat), order.notes),
+            )
+            for seat, child in seats
+        ]
+        crew.extend(jobs)
+        outputs = [
+            Output(seat.name, seat.parts, "" if failure else child.answer, failure)
+            for (seat, child), failure in zip(seats, await _outcomes(jobs), strict=True)
+        ]
+        attached = "\n\n".join(
+            _tagged("attached_report", child, output.answer)
+            for (_, child), output in zip(seats, outputs, strict=True)
+            if output.answer
+        )
+        if not attached:
+            return NO_REPORTS
+        transcript = await self._debate(parent, order, attached, crew)
+        synth = self._child(parent, SYNTH, SYNTH.title, agents.SUMMARY)
+        job = self._spawn(
+            synth,
+            SYNTH_QUESTION,
+            self._run(synth, order.synth(), _joined(attached, transcript)),
+        )
+        crew.append(job)
+        (failure,) = await _outcomes([job])
+        if failure:
+            return SYNTH_FAILED.format(failure=failure)
+        final = Output(SYNTH.title, flow.synth, synth.answer)
+        self._deliver(parent, order.task or parent.title, flow, outputs, final)
+        return ""
+
+    async def _debate(
+        self,
+        parent: Thread,
+        order: _Order,
+        attached: str,
+        crew: list[asyncio.Task[str]],
+    ) -> str:
+        bull = self._child(parent, BULL, BULL.title, agents.DEBATE)
+        bear = self._child(parent, BEAR, BEAR.title, agents.DEBATE)
+        sides = ((bull, BULL, bear), (bear, BEAR, bull))
+        said: list[str] = []
+        for number in range(1, agents.DEBATE_ROUNDS + 1):
+            heard = {
+                side.id: attached if number == 1 else _said(other, number - 1)
+                for side, _, other in sides
+            }
+            jobs = [
+                self._spawn(
+                    side,
+                    ROUND_QUESTION.format(number=number),
+                    self._run(side, order.round(agent, number), heard[side.id]),
+                )
+                for side, agent, _ in sides
+            ]
+            crew.extend(jobs)
+            failures = await _outcomes(jobs)
+            said.extend(
+                _said(side, number)
+                for (side, _, _), failure in zip(sides, failures, strict=True)
+                if not failure
+            )
+            if any(failures):
+                break
+        return "\n\n".join(said)
+
+    def _deliver(
+        self,
+        parent: Thread,
+        question: str,
+        flow: Workflow,
+        outputs: Sequence[Output],
+        final: Output,
+    ) -> None:
+        answer = agents.assemble(flow, outputs, final)
+        for child in parent.team:
+            parent.ids |= child.ids
+            web.collect(parent.web, child.web.values())
+            parent.received.update(child.received)
+        parent.turns.append(Turn(question, answer))
+        counts = (
+            sum(child.calls for child in parent.team),
+            sum(child.searches for child in parent.team),
+        )
+        self._emit(parent.id, {"type": "text", "text": answer})
+        self._emit(
+            parent.id,
+            _done(answer, parent, parent.ids, parent.web, counts=counts, report=True),
+        )
+
+    def _child(self, parent: Thread, agent: Agent, title: str, stage: str) -> Thread:
+        thread = Thread(
+            f"{parent.id}-{len(parent.team) + 1}",
+            title,
+            parent.kind,
+            ids=set(parent.ids),
+            web=dict(parent.web),
+            parent=parent.id,
+            agent=agent,
+        )
+        parent.team.append(thread)
+        event: Event = {"type": "thread", "title": title, "parent": parent.id}
+        self._emit(thread.id, {**event, "stage": stage})
+        return thread
 
     async def _run(self, thread: Thread, given: RunInput, notes: str = "") -> str:
         failure = ""
@@ -875,10 +1088,85 @@ class Workspace:
             self._emit(thread.id, event)
             if event["type"] == "error":
                 failure = str(event["message"])
+            elif event["type"] == "done":
+                thread.calls += cast("int", event["data_calls"])
+                thread.searches += cast("int", event["web_steps"])
+            elif event["type"] == "usage" and thread.parent:
+                self._emit(thread.parent, event)
         return failure
 
     def _emit(self, thread: str, event: Event) -> None:
         self._events.put({**event, "thread": thread})
+
+
+def _plan(flow: Workflow) -> Event:
+    return {
+        "type": "plan",
+        "collect": [
+            {"name": seat.name, "parts": list(seat.parts)} for seat in flow.collect
+        ],
+        "sides": [BULL.title, BEAR.title],
+        "rounds": agents.DEBATE_ROUNDS,
+        "synth": {"name": SYNTH.title, "parts": list(flow.synth)},
+    }
+
+
+async def _outcomes(jobs: Sequence[asyncio.Task[str]]) -> list[str]:
+    _ = await asyncio.wait(jobs)
+    return [STOPPED if job.cancelled() else job.result() for job in jobs]
+
+
+def _specs(thread: Thread) -> tuple[ToolSpec, ...]:
+    agent = thread.agent
+    data = (
+        SPECS
+        if agent is None
+        else tuple(spec for spec in SPECS if spec.name in agent.tools)
+    )
+    if thread.id == MAIN:
+        return (*data, *THREAD_SPECS)
+    return data if thread.parent else (*data, *ASK_SPECS)
+
+
+def _role(kind: str, name: str) -> Agent | None:
+    if not name:
+        return None
+    if kind != "research":
+        raise ValueError("agent는 research에만 지정")
+    agent = POOL.get(name)
+    if agent is None:
+        raise ValueError(f"agent는 {', '.join(POOL)} 중 하나")
+    return agent
+
+
+def _refused(name: str, reason: str) -> ToolResult:
+    body = json.dumps({"error": reason}, ensure_ascii=False)
+    return ToolResult(body, ok=False, summary=f"{name} · 실패: {reason}")
+
+
+def _done(  # noqa: PLR0913  # 답변·스레드·인용 범위·출처·집계·보고서 여부로 완료 이벤트 조립
+    answer: str,
+    thread: Thread,
+    ids: Collection[str],
+    found: Mapping[str, WebSource],
+    *,
+    counts: tuple[int, int],
+    report: bool,
+) -> Event:
+    return {
+        "type": "done",
+        "lines": cites.parse(answer, ids, found),
+        "received": [
+            {"cite": cite, "info": info} for cite, info in thread.received.items()
+        ],
+        "data_calls": counts[0],
+        "web_steps": counts[1],
+        "report": report,
+        "sources": [
+            {"url": source.url, "title": source.title}
+            for source in cites.cited_sources(answer, found)
+        ],
+    }
 
 
 def _row(thread: Thread, *, waiting: bool) -> str:
@@ -892,6 +1180,17 @@ def _tagged(tag: str, thread: Thread, body: str, **more: str) -> str:
     pairs = {"id": thread.id, "title": thread.title, **more}
     attrs = " ".join(f"{name}={quoteattr(value)}" for name, value in pairs.items())
     return f"<{tag} {attrs}>\n{body}\n</{tag}>"
+
+
+def _said(thread: Thread, number: int) -> str:
+    side, round_ = quoteattr(thread.title), quoteattr(str(number))
+    return (
+        f"<debate_round side={side} round={round_}>\n{thread.answer}\n</debate_round>"
+    )
+
+
+def _joined(*blocks: str) -> str:
+    return "\n\n".join(block for block in blocks if block)
 
 
 def _digest(answer: str) -> str:

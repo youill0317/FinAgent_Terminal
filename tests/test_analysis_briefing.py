@@ -60,10 +60,13 @@ def test_prepare_builds_the_macro_stock_and_etf_documents_in_demo(
     data = asyncio.run(service.get())
     company = Company({}, service.today(), demo=True)
 
+    guides: dict[str, str] = {}
+
     def prepared(kind: str, ticker: str = "") -> Document:
-        document = found.prepare(Brief(kind, ticker, "", data, company)).document
-        assert document is not None
-        return document
+        given = found.prepare(Brief(kind, ticker, "", data, company))
+        assert given.document is not None
+        guides[kind] = given.guide
+        return given.document
 
     macro, stock, fund = (
         prepared("macro"),
@@ -79,6 +82,10 @@ def test_prepare_builds_the_macro_stock_and_etf_documents_in_demo(
     assert "포트폴리오: 데모 포트폴리오" in fund.text.split('id="etf_fit"')[1]
     assert "평가액의 10% 편입" in fund.text
     assert stock.base == fund.base != ""
+    assert guides["macro"].startswith("<macro_guide>")
+    assert guides["etf"].startswith("<etf_guide>")
+    assert guides["stock"] == ""
+    assert "<etf_guide>" not in fund.text
     with pytest.raises(ValueError, match="ZZZZ: 티커를 확인하지 못했습니다"):
         _ = prepared("stock", "ZZZZ")
     with pytest.raises(ValueError, match="ZZZZ: 티커를 확인하지 못했습니다"):

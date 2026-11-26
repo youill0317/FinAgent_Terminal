@@ -17,7 +17,6 @@ from finagent.analysis.providers.base import (
 from finagent.analysis.providers.demo import DemoProvider
 from finagent.analysis.service import (
     MAIN,
-    MAX_THREADS,
     AnalysisService,
     RunInput,
 )
@@ -424,19 +423,21 @@ def test_the_demo_page_chat_cites_the_page_it_saw() -> None:
     assert marks(of_type(events, "done")[0]) == [("us_unrate", True)]
 
 
-def test_threads_beyond_the_limit_are_refused_while_the_rest_run() -> None:
-    provider = Delegating([research(f"조사{n}") for n in range(MAX_THREADS + 1)])
+def test_threads_have_no_limit_and_all_run_at_once() -> None:
+    many = 12
+    provider = Delegating([research(f"조사{n}") for n in range(many)])
     service = analysis(provider)
 
     async def scenario() -> None:
         ws = service.open()
         await ws.ask("맡겨")
-        await until(ws, [], lambda: provider.working == MAX_THREADS)
+        await until(ws, [], lambda: provider.working == many)
         provider.gate.set()
         await until(ws, [])
 
     asyncio.run(scenario())
 
-    assert provider.peak == MAX_THREADS
-    assert [result.ok for result in provider.results] == [True] * MAX_THREADS + [False]
-    assert f"한도({MAX_THREADS}개)" in provider.results[-1].text
+    assert provider.peak == many
+    assert [result.ok for result in provider.results] == [True] * many
+    main = next(seen for seen in provider.seen if seen.kind == "main")
+    assert "한도" not in main.conversation.system

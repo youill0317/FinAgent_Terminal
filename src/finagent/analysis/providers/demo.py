@@ -7,7 +7,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Final, cast
 
-from finagent.analysis import prompt
+from finagent.analysis import agents, prompt
 from finagent.analysis.providers.base import (
     ProviderStatus,
     TextDelta,
@@ -43,6 +43,15 @@ INTRO: Final = "데모 공급자 예시 답변 (모델 호출 없는 도구 결�
 CHAT: Final = "데모 페이지 챗봇 예시 답변 (모델 호출 없는 화면 데이터 기반)"
 INDICATOR: Final = re.compile(r'<indicator id="([^"]+)"')
 SUMMARY: Final = "**결론**: 도구 기반 장기 이력 수신 완료"
+ASSIGNED: Final = re.compile(r"<assignment>\n(.*?)\n</assignment>", re.DOTALL)
+ASSIGNED_PART: Final = re.compile(r"^- PART ([IVX]+)\. ", re.MULTILINE)
+SIDES: Final = {agents.BULL.id: agents.BULL.title, agents.BEAR.id: agents.BEAR.title}
+DEBATE: Final = "**{side} {number}라운드**: 데모 {side} 논거 (모델 호출 없는 형식 예시)"
+DEMO_CALL: Final[tuple[str, dict[str, object]]] = ("get_series", {"id": "us_unrate"})
+FALLBACK_CALL: Final[tuple[str, dict[str, object]]] = (
+    "read_dashboard",
+    {"page": "overview"},
+)
 
 
 class DemoProvider:
@@ -61,8 +70,8 @@ class DemoProvider:
             events = self._chat(request)
         elif request.kind == "main":
             events = self._main(request)
-        elif request.kind != "page":
-            events = self._report(request)
+        elif ":" in request.kind:
+            events = self._agent(request)
         else:
             events = self._page(request)
         async for event in events:
@@ -93,11 +102,12 @@ class DemoProvider:
         async for event in self._type(text, CHUNK):
             yield event
 
-    async def _report(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:
-        name = f"demo_{request.kind}.txt"
-        for _ in range(DATA_STEPS):
+    async def _agent(self, request: RunRequest) -> AsyncIterator[ProviderEvent]:
+        names = {spec.name for spec in request.tools}
+        call = DEMO_CALL if DEMO_CALL[0] in names else FALLBACK_CALL
+        for _ in range(DATA_STEPS if names else 0):
             await self._pause()
-            _ = await request.run_tool("get_series", {"id": "us_unrate"})
+            _ = await request.run_tool(*call)
         if request.web:
             sources = _sample_sources()
             yield WebFound(sources)
@@ -106,7 +116,7 @@ class DemoProvider:
                 yield WebStep(f"웹 검색: 데모 이벤트 {round_}")
                 await self._pause()
                 yield WebStep(f"원문 읽기: {sources[0].url}")
-        async for event in self._type(prompt.text(name), REPORT_CHUNK):
+        async for event in self._type(_agent_text(request), REPORT_CHUNK):
             yield event
 
     async def _pause(self) -> None:
@@ -154,6 +164,24 @@ def _delegations(ask: str) -> list[dict[str, object]]:
     if not calls:
         calls.append({"title": ask[:TITLE_LIMIT], "kind": "research", "task": ask})
     return calls
+
+
+def _agent_text(request: RunRequest) -> str:
+    report, _, role = request.kind.partition(":")
+    talk = request.conversation
+    if role in SIDES:
+        return DEBATE.format(side=SIDES[role], number=len(talk.turns) + 1)
+    head, sections = agents.split(prompt.text(f"demo_{report}.txt"))
+    found = ASSIGNED.search(talk.request)
+    listed = cast("list[str]", ASSIGNED_PART.findall(found.group(1))) if found else []
+    wanted = set(listed)
+    synth = role == agents.SYNTH.id
+    kept = [
+        section.body
+        for section in sections
+        if (part := agents.numeral(section.title)) in wanted or (synth and not part)
+    ]
+    return "\n\n".join((head, *kept) if synth else kept)
 
 
 def _sample_sources() -> tuple[WebSource, ...]:
